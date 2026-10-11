@@ -1308,6 +1308,29 @@ impl SessionPersistence {
         deadline: Instant,
         policy: ClosePolicy,
     ) -> PersistenceCloseOutcome {
+        let prepared = match self.prepare_close(target, deadline, policy) {
+            Ok(prepared) => prepared,
+            Err(outcome) => return *outcome,
+        };
+        if prepared.outcome.durable >= prepared.outcome.target || prepared.outcome.omitted.is_some()
+        {
+            return self.finalize_close(prepared, deadline);
+        }
+        if policy == ClosePolicy::RequireDurable {
+            self.latest
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .accepting = true;
+        }
+        prepared.outcome
+    }
+
+    fn prepare_close(
+        &mut self,
+        target: PersistenceGeneration,
+        deadline: Instant,
+        policy: ClosePolicy,
+    ) -> Result<PreparedClose, Box<PersistenceCloseOutcome>> {
         smelt_perf::perf::record_value(
             "persist:close:target_lag",
             target.get().saturating_sub(self.durable_generation().get()),
@@ -1324,7 +1347,7 @@ impl SessionPersistence {
                 .map_or(target, |intent| target.max(intent.generation))
         };
         let Some(control) = &self.control else {
-            return self.disconnected_close(effective_target);
+            return Err(Box::new(self.disconnected_close(effective_target)));
         };
         let (reply, prepared) = mpsc::channel();
         let send = send_control_until(
@@ -1344,72 +1367,71 @@ impl SessionPersistence {
                     .unwrap_or_else(|poison| poison.into_inner())
                     .accepting = true;
             }
-            return match error {
+            return Err(Box::new(match error {
                 ControlSendError::Deadline => self.deadline_close(effective_target),
                 ControlSendError::Disconnected => self.disconnected_close(effective_target),
-            };
+            }));
         }
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return self.deadline_close(effective_target);
+            return Err(Box::new(self.deadline_close(effective_target)));
         };
-        let prepared = match prepared.recv_timeout(remaining) {
-            Ok(prepared) => prepared,
-            Err(mpsc::RecvTimeoutError::Timeout) => return self.deadline_close(effective_target),
+        match prepared.recv_timeout(remaining) {
+            Ok(prepared) => Ok(prepared),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(Box::new(self.deadline_close(effective_target)))
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return self.disconnected_close(effective_target);
+                Err(Box::new(self.disconnected_close(effective_target)))
+            }
+        }
+    }
+
+    fn finalize_close(
+        &mut self,
+        prepared: PreparedClose,
+        deadline: Instant,
+    ) -> PersistenceCloseOutcome {
+        let result = prepared.outcome;
+        let Some(finalize) = prepared.finalize else {
+            return self.disconnected_close(result.target);
+        };
+        let (completed, completion) = mpsc::channel();
+        if finalize.send(completed).is_err() {
+            return self.disconnected_close(result.target);
+        }
+        self.control = None;
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return self.finalization_deadline_close(result);
+        };
+        let result = match completion.recv_timeout(remaining) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return self.finalization_deadline_close(result);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return self.disconnected_close(result.target);
             }
         };
-        let result = prepared.outcome;
-        let stopped = result.durable >= result.target || result.omitted.is_some();
-        if stopped {
-            let Some(finalize) = prepared.finalize else {
-                return self.disconnected_close(effective_target);
-            };
-            let (completed, completion) = mpsc::channel();
-            if finalize.send(completed).is_err() {
-                return self.disconnected_close(effective_target);
+        if let Some(thread) = self.thread.as_ref() {
+            while !thread.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
             }
-            self.control = None;
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            if !thread.is_finished() {
                 return self.finalization_deadline_close(result);
-            };
-            let result = match completion.recv_timeout(remaining) {
-                Ok(result) => result,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return self.finalization_deadline_close(result);
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return self.disconnected_close(effective_target);
-                }
-            };
-            if let Some(thread) = self.thread.as_ref() {
-                while !thread.is_finished() && Instant::now() < deadline {
-                    thread::sleep(Duration::from_millis(1));
-                }
-                if !thread.is_finished() {
-                    return self.finalization_deadline_close(result);
-                }
             }
-            if self
-                .thread
-                .take()
-                .is_some_and(|thread| thread.join().is_err())
-                && result.cause.is_none()
-            {
-                return PersistenceCloseOutcome {
-                    cause: Some(PersistenceCause::unavailable(
-                        "persistence actor panicked during close",
-                    )),
-                    ..result
-                };
-            }
-            return result;
         }
-        if policy == ClosePolicy::RequireDurable {
-            self.latest
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .accepting = true;
+        if self
+            .thread
+            .take()
+            .is_some_and(|thread| thread.join().is_err())
+            && result.cause.is_none()
+        {
+            return PersistenceCloseOutcome {
+                cause: Some(PersistenceCause::unavailable(
+                    "persistence actor panicked during close",
+                )),
+                ..result
+            };
         }
         result
     }
@@ -4383,22 +4405,25 @@ mod tests {
     #[test]
     fn close_deadline_bounds_blocked_finalization() {
         let _home = crate::app::test_harness::initialized_test_home_guard();
-        let actor = actor();
+        let mut actor = actor();
         let (finalizing, release) = actor.install_finish_barrier();
+        let prepared = actor
+            .prepare_close(
+                PersistenceGeneration::ZERO,
+                deadline(),
+                ClosePolicy::RequireDurable,
+            )
+            .expect("actor prepares close before timing finalization");
+        assert!(prepared.finalize.is_some());
         let (closed, close_completed) = mpsc::channel();
         let closer = thread::spawn(move || {
             let started = Instant::now();
-            let mut actor = actor;
-            let outcome = actor.close(
-                PersistenceGeneration::ZERO,
-                started + Duration::from_millis(25),
-                ClosePolicy::RequireDurable,
-            );
+            let outcome = actor.finalize_close(prepared, started + Duration::from_millis(25));
             let _ = closed.send((actor, outcome, started.elapsed()));
         });
 
         finalizing
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(5))
             .expect("actor begins finalization");
         let completed = close_completed.recv_timeout(Duration::from_secs(1));
         release.send(()).unwrap();

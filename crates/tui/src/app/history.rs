@@ -1122,6 +1122,7 @@ impl TuiApp {
             ));
             return;
         }
+        self.conversation.finish_stream_animation();
         let applied_items: Vec<HistoryItem> = self
             .conversation
             .pending_history_appends()
@@ -1254,6 +1255,7 @@ impl TuiApp {
                 return 0;
             }
         };
+        self.conversation.finish_stream_animation();
         let common_len = existing
             .iter()
             .zip(&items)
@@ -5081,7 +5083,7 @@ mod checkpoint_tests {
                     == Some(smelt_core::BlockOrigin::History(FAR_HISTORY_INDEX))
             })
             .expect("far sparse block");
-        app.app.save_session_and_flush();
+        app.save_session_and_flush();
 
         let session_id = app.app.conversation.session().id.clone();
         let expected_record_prefix = lineage_transcript(&lineage_reader(&app, &session_id))

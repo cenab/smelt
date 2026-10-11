@@ -50,6 +50,8 @@ fn response_draft_rejection_removes_only_attempt_output() {
     app.feed_one(SourceEvent::engine(EngineEvent::TextDelta {
         delta: "valid answer".into(),
     }));
+    app.render_to_frame();
+    app.feed_one(SourceEvent::Tick(250));
     assert!(app.render_to_frame().text().contains("valid answer"));
     app.assert_invariants();
 }
@@ -643,26 +645,28 @@ fn fast_streaming_keeps_thinking_before_answer() {
         assert!(
             frames
                 .iter()
-                .any(|frame| frame.contains("The lighthouse stood on the cliff.")),
-            "no frame painted the answer while draining the stream"
+                .any(|frame| frame.lines().any(|line| line.trim() == "T")),
+            "no frame painted the first answer character while draining the stream"
         );
+        frames.push(app.render_to_frame().text());
+        assert!(
+            !frames
+                .last()
+                .unwrap()
+                .contains("The lighthouse stood on the cliff."),
+            "late reasoning completion flushed the answer animation"
+        );
+        app.clock.advance(Duration::from_millis(250));
         frames.push(app.render_to_frame().text());
         assert!(frames
             .last()
             .unwrap()
             .contains("The lighthouse stood on the cliff."));
-        if paint_after_event {
-            assert!(
-                frames
-                    .iter()
-                    .any(|frame| frame.lines().any(|line| line.trim() == "The")),
-                "no frame painted the answer prefix"
-            );
-        }
         for frame in frames {
             let Some(answer_row) = frame.lines().position(|line| {
                 let text = line.trim().trim_start_matches('│').trim_start();
-                text == "The" || text.starts_with("The lighthouse")
+                text.starts_with("The lighthouse")
+                    || (!line.contains('│') && matches!(text, "T" | "The"))
             }) else {
                 continue;
             };
@@ -712,11 +716,14 @@ fn main_transcript_paints_a_selected_delta_before_a_coalesced_turn_completion() 
 
     let streamed_frame = streamed_frame.expect("turn completion should paint the pending delta");
     assert!(
-        streamed_frame.contains("coalesced live transcript marker"),
+        streamed_frame.lines().any(|line| line.trim() == "c"),
         "no frame painted the selected delta: {streamed_frame}"
     );
 
-    app.render_to_frame();
+    assert!(app
+        .render_to_frame()
+        .text()
+        .contains("coalesced live transcript marker"));
     assert!(!app.agent_running(), "turn completion was not dispatched");
 }
 
@@ -742,6 +749,8 @@ fn main_transcript_streams_before_a_busy_engine_queue_completes_the_turn() {
     .expect("queue turn completion");
 
     app.drain_ready_engine_outputs_for_frame_to(&mut std::io::sink(), |_| {});
+    app.render_to_frame();
+    app.feed_one(SourceEvent::Tick(16));
     let frame = app.render_to_frame().text();
     assert!(frame.contains("live transcript marker"), "frame: {frame}");
     assert!(

@@ -14,17 +14,8 @@ impl TuiApp {
         self.conversation.append_block(block)
     }
 
-    pub(crate) fn append_streaming_thinking(&mut self, delta: &str) {
-        self.conversation
-            .append_streaming_thinking(delta.to_string());
-    }
-
     pub(crate) fn flush_streaming_thinking(&mut self) {
         self.conversation.flush_streaming_thinking();
-    }
-
-    pub(crate) fn append_streaming_text(&mut self, delta: &str) {
-        self.conversation.append_streaming_text(delta.to_string());
     }
 
     pub(crate) fn flush_streaming_text(&mut self) {

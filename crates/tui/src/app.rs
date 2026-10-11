@@ -30,6 +30,7 @@ pub(crate) mod session_document;
 pub(crate) mod session_load;
 pub(crate) mod session_preview;
 pub(crate) mod shell_panel;
+mod stream_animation;
 #[cfg(any(test, feature = "harness"))]
 pub mod test_harness;
 pub(crate) mod transcript;

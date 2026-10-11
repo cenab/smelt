@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+use super::stream_animation::{StreamAnimation, StreamKind};
+
 use super::{
     agent::TurnLifecycle, session_document::TuiSessionDocument, transcript::ResumePreviewCache,
     CommittedTranscriptView, SessionAccess, SessionPersistence, SharedSessionState,
@@ -103,6 +105,7 @@ pub(crate) struct ConversationRuntime {
     document: TuiSessionDocument,
     committed_transcript_view: Option<CommittedTranscriptView>,
     parser: smelt_core::content::stream_parser::StreamParser,
+    stream_animation: StreamAnimation,
     response_draft_blocks: Vec<smelt_core::transcript_model::BlockId>,
     /// Earliest canonical suffix whose transcript projection must be rebuilt
     /// after live stream-parser blocks finish.
@@ -139,6 +142,7 @@ impl ConversationRuntime {
             document: TuiSessionDocument::new(transcript),
             committed_transcript_view: None,
             parser: smelt_core::content::stream_parser::StreamParser::new(),
+            stream_animation: StreamAnimation::default(),
             response_draft_blocks: Vec::new(),
             pending_transcript_history_rebuild_from: None,
             resume_preview_cache,
@@ -1204,6 +1208,7 @@ impl ConversationRuntime {
     }
 
     pub(crate) fn append_block(&mut self, block: smelt_core::transcript_model::Block) -> bool {
+        self.finish_stream_animation();
         self.apply_transcript_mutation(super::session_document::TranscriptMutation::AppendBlock {
             block,
         })
@@ -1304,21 +1309,69 @@ impl ConversationRuntime {
         .applied
     }
 
-    pub(crate) fn append_streaming_thinking(&mut self, delta: String) {
-        self.apply_stream_mutation(super::session_document::StreamMutation::AppendThinking {
-            delta,
+    pub(super) fn queue_stream_delta(
+        &mut self,
+        kind: StreamKind,
+        text: String,
+        arrived_at: std::time::Instant,
+    ) -> bool {
+        if text.is_empty() {
+            return self.stream_animation.is_pending();
+        }
+        if self
+            .stream_animation
+            .kind()
+            .is_some_and(|active| active != kind)
+        {
+            self.finish_stream_animation();
+        }
+        let delta = self.stream_animation.push(kind, text, arrived_at);
+        self.apply_animated_delta(kind, delta);
+        self.stream_animation.is_pending()
+    }
+
+    pub(super) fn advance_stream_animation(&mut self, now: std::time::Instant) -> bool {
+        if let Some(kind) = self.stream_animation.kind() {
+            let delta = self.stream_animation.advance(now);
+            self.apply_animated_delta(kind, delta);
+        }
+        self.stream_animation.is_pending()
+    }
+
+    pub(super) fn finish_stream_animation(&mut self) {
+        if let Some((kind, delta)) = self.stream_animation.finish() {
+            self.apply_animated_delta(kind, delta);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_pending_stream_animation(&self) -> bool {
+        self.stream_animation.is_pending()
+    }
+
+    fn apply_animated_delta(&mut self, kind: StreamKind, delta: String) {
+        use super::session_document::StreamMutation;
+
+        if delta.is_empty() {
+            return;
+        }
+        let first = self.response_draft_boundary();
+        self.apply_stream_mutation(match kind {
+            StreamKind::Text => StreamMutation::AppendText { delta },
+            StreamKind::Thinking => StreamMutation::AppendThinking { delta },
         });
+        self.track_response_draft_from(first);
     }
 
     pub(crate) fn flush_streaming_thinking(&mut self) {
+        if self.stream_animation.kind() == Some(StreamKind::Thinking) {
+            self.finish_stream_animation();
+        }
         self.apply_stream_mutation(super::session_document::StreamMutation::FlushThinking);
     }
 
-    pub(crate) fn append_streaming_text(&mut self, delta: String) {
-        self.apply_stream_mutation(super::session_document::StreamMutation::AppendText { delta });
-    }
-
     pub(crate) fn flush_streaming_text(&mut self) {
+        self.finish_stream_animation();
         self.apply_stream_mutation(super::session_document::StreamMutation::FlushText);
     }
 
@@ -1333,6 +1386,7 @@ impl ConversationRuntime {
         start: smelt_core::content::stream_parser::ToolStart,
         now: std::time::Instant,
     ) {
+        self.finish_stream_animation();
         self.apply_stream_mutation(super::session_document::StreamMutation::StartTool {
             start,
             now,
@@ -1463,6 +1517,7 @@ impl ConversationRuntime {
         start: smelt_core::content::stream_parser::ToolStart,
         now: std::time::Instant,
     ) -> bool {
+        self.finish_stream_animation();
         self.apply_stream_mutation(super::session_document::StreamMutation::PromoteToolDraft {
             stream_id,
             start,
@@ -1493,6 +1548,7 @@ impl ConversationRuntime {
     }
 
     pub(crate) fn reject_response_draft(&mut self) {
+        self.stream_animation.clear();
         self.parser.clear_response_output();
         for id in std::mem::take(&mut self.response_draft_blocks)
             .into_iter()
@@ -1521,6 +1577,7 @@ impl ConversationRuntime {
         call_id: Option<String>,
         name: Option<String>,
     ) -> Option<smelt_core::transcript_model::BlockId> {
+        self.finish_stream_animation();
         self.apply_stream_mutation(super::session_document::StreamMutation::StartToolDraft {
             stream_id,
             call_id,
@@ -1536,6 +1593,7 @@ impl ConversationRuntime {
         name: Option<String>,
         delta: String,
     ) -> Option<(smelt_core::transcript_model::BlockId, bool)> {
+        self.finish_stream_animation();
         let change =
             self.apply_stream_mutation(super::session_document::StreamMutation::AppendToolDraft {
                 stream_id,
@@ -1555,6 +1613,7 @@ impl ConversationRuntime {
         name: String,
         arguments: String,
     ) -> Option<smelt_core::transcript_model::BlockId> {
+        self.finish_stream_animation();
         self.apply_stream_mutation(super::session_document::StreamMutation::FinishToolDraft {
             stream_id,
             call_id,
@@ -1595,6 +1654,7 @@ impl ConversationRuntime {
     }
 
     pub(crate) fn start_exec(&mut self, command: String) {
+        self.finish_stream_animation();
         self.apply_stream_mutation(super::session_document::StreamMutation::StartExec { command });
     }
 
@@ -1611,6 +1671,7 @@ impl ConversationRuntime {
     }
 
     pub(crate) fn begin_turn(&mut self) {
+        self.finish_stream_animation();
         self.turn.clear_context_tokens_updated();
         self.response_draft_blocks.clear();
         self.parser.begin_turn();
@@ -1946,6 +2007,7 @@ impl ConversationRuntime {
     }
 
     pub(crate) fn clear_stream_parser(&mut self) {
+        self.stream_animation.clear();
         self.response_draft_blocks.clear();
         self.parser.clear();
     }

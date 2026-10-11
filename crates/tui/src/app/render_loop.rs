@@ -873,6 +873,7 @@ impl TuiApp {
         out: &mut W,
         on_transient_frame: F,
     ) -> bool {
+        let arrived_at = self.core.clock.instant_now();
         if self.render_transient_frame_before_engine_event_to(&ev, out) {
             on_transient_frame(self);
         }
@@ -883,11 +884,11 @@ impl TuiApp {
             _ => self.conversation.has_live_transcript_blocks(),
         };
         if is_engine_continuation(&ev) && continuation_started {
-            self.queue_engine_continuation(ev);
+            self.queue_engine_continuation_at(ev, arrived_at);
             self.request_continuation_render();
             return true;
         }
-        let keep_streaming = self.dispatch_engine_event(ev);
+        let keep_streaming = self.dispatch_engine_event_at(ev, arrived_at);
         self.request_urgent_render();
         keep_streaming
     }
@@ -1006,6 +1007,12 @@ impl TuiApp {
             .begin_frame(self.core.clock.instant_now());
         let _perf = smelt_perf::perf::begin("app:tick_compositor");
         self.apply_pending_transcript_work();
+        if self
+            .conversation
+            .advance_stream_animation(self.core.clock.instant_now())
+        {
+            self.request_continuation_render();
+        }
         self.refresh_pending_tool_draft_summaries();
         if !self.transcript_work.is_empty() && !self.transcript_work.front_waits_for_hydration() {
             self.request_continuation_render();
@@ -1660,8 +1667,12 @@ mod tests {
             };
             content.snapshot()
         }
-        assert_eq!(streamed_text(&app), "first");
+        assert_eq!(streamed_text(&app), "f");
 
+        app.clock.advance(CONTINUATION_FRAME_INTERVAL);
+        assert!(app.app.render_pending_transient_frame_to(&mut sink));
+        assert_eq!(streamed_text(&app), "fir");
+        app.clock.advance(std::time::Duration::from_millis(250));
         assert!(app.app.render_pending_transient_frame_to(&mut sink));
         assert_eq!(streamed_text(&app), "first second third");
     }
@@ -1685,6 +1696,8 @@ mod tests {
                 delta: "valid answer".into(),
             });
         app.app.apply_pending_transcript_work();
+        app.render_to_frame();
+        app.clock.advance(std::time::Duration::from_millis(250));
         let frame = app.render_to_frame().text();
         assert!(frame.contains("valid answer"));
         assert!(!frame.contains("rejected"));

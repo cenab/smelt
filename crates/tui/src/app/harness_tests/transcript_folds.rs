@@ -342,6 +342,7 @@ fn streaming_thinking_honors_peek_and_enter_toggles() {
         )
         .into(),
     });
+    app.feed_one(SourceEvent::Tick(250));
     app.render_silent();
 
     focus_transcript_in_normal_mode(&mut app);

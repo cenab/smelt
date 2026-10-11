@@ -6,6 +6,8 @@ use smelt_core::working::{TurnOutcome, TurnPhase};
 use smelt_core::ConfirmRequest;
 use std::time::Duration;
 
+use super::stream_animation::StreamKind;
+
 struct EngineEventResult {
     control: SessionControl,
     assistant_output_started: bool,
@@ -272,15 +274,24 @@ impl TuiApp {
     /// Shared by the production main loop, the test harness, and the
     /// scenario replay binary so all three drive identical state.
     pub fn dispatch_engine_event(&mut self, ev: EngineEvent) -> bool {
-        let _perf = smelt_perf::perf::begin("tui:dispatch_engine_event");
-        self.dispatch_engine_event_inner(ev)
+        self.dispatch_engine_event_at(ev, self.core.clock.instant_now())
     }
 
+    #[cfg(test)]
     pub(crate) fn queue_engine_continuation(&mut self, event: EngineEvent) {
+        self.queue_engine_continuation_at(event, self.core.clock.instant_now());
+    }
+
+    pub(super) fn queue_engine_continuation_at(
+        &mut self,
+        event: EngineEvent,
+        arrived_at: std::time::Instant,
+    ) {
         if matches!(event, EngineEvent::EngineAskDelta { .. }) {
             self.transcript_work.push_auxiliary_continuation(event);
         } else {
-            self.transcript_work.push_provider_continuation(event);
+            self.transcript_work
+                .push_provider_continuation(event, arrived_at);
         }
     }
 
@@ -301,8 +312,8 @@ impl TuiApp {
         let mut applied = 0u64;
         while let Some(work) = self.transcript_work.pop_front() {
             let stop_at_frame_boundary = match work {
-                TranscriptWork::ProviderContinuation(event) => {
-                    let keep_streaming = self.dispatch_engine_event_now(event);
+                TranscriptWork::ProviderContinuation { event, arrived_at } => {
+                    let keep_streaming = self.dispatch_engine_event_now_at(event, arrived_at);
                     debug_assert!(keep_streaming, "a continuation cannot terminate its turn");
                     self.transcript_work.front_is_tool_output_append()
                 }
@@ -355,7 +366,12 @@ impl TuiApp {
         smelt_perf::perf::record_value("transcript:pending_work:applied", applied);
     }
 
-    fn dispatch_engine_event_inner(&mut self, ev: EngineEvent) -> bool {
+    pub(super) fn dispatch_engine_event_at(
+        &mut self,
+        ev: EngineEvent,
+        arrived_at: std::time::Instant,
+    ) -> bool {
+        let _perf = smelt_perf::perf::begin("tui:dispatch_engine_event");
         if let EngineEvent::EngineAskDraftRejected { id }
         | EngineEvent::EngineAskResponse { id, .. } = &ev
         {
@@ -387,10 +403,18 @@ impl TuiApp {
             self.request_continuation_render();
             return true;
         }
-        self.dispatch_engine_event_now(ev)
+        self.dispatch_engine_event_now_at(ev, arrived_at)
     }
 
     fn dispatch_engine_event_now(&mut self, ev: EngineEvent) -> bool {
+        self.dispatch_engine_event_now_at(ev, self.core.clock.instant_now())
+    }
+
+    fn dispatch_engine_event_now_at(
+        &mut self,
+        ev: EngineEvent,
+        arrived_at: std::time::Instant,
+    ) -> bool {
         if !self.conversation.is_active() {
             self.handle_idle_engine_event(ev);
             return true;
@@ -403,6 +427,7 @@ impl TuiApp {
                     turn.turn_id,
                     turn.submitted_history_idx,
                     &mut turn.pending,
+                    arrived_at,
                 );
                 turn.assistant_output_started |= result.assistant_output_started;
                 app.dispatch_control(result.control, turn)
@@ -461,15 +486,14 @@ impl TuiApp {
         turn_id: u64,
         submitted_history_idx: usize,
         pending: &mut Vec<PendingTool>,
+        arrived_at: std::time::Instant,
     ) -> EngineEventResult {
         let mut assistant_output_started = false;
         let draft_boundary = matches!(
             ev,
-            EngineEvent::TextDelta { .. }
-                | EngineEvent::Text { .. }
+            EngineEvent::Text { .. }
                 | EngineEvent::Reasoning { .. }
                 | EngineEvent::ReasoningPartStarted { .. }
-                | EngineEvent::ReasoningPartDelta { .. }
                 | EngineEvent::ReasoningPartFinished { .. }
                 | EngineEvent::ToolCallDraftStarted { .. }
                 | EngineEvent::ToolCallDraftDelta { .. }
@@ -556,8 +580,14 @@ impl TuiApp {
             EngineEvent::ReasoningPartDelta { kind, delta, .. } => {
                 assistant_output_started = !delta.is_empty();
                 let bytes = delta.len();
-                if kind == protocol::ReasoningKind::Raw {
-                    self.append_streaming_thinking(&delta);
+                if kind == protocol::ReasoningKind::Raw
+                    && self.conversation.queue_stream_delta(
+                        StreamKind::Thinking,
+                        delta.clone(),
+                        arrived_at,
+                    )
+                {
+                    self.request_continuation_render();
                 }
                 self.core.signals.emit_dyn(
                     "stream_delta",
@@ -613,7 +643,12 @@ impl TuiApp {
             EngineEvent::TextDelta { delta } => {
                 assistant_output_started = !delta.is_empty();
                 let bytes = delta.len();
-                self.append_streaming_text(&delta);
+                if self
+                    .conversation
+                    .queue_stream_delta(StreamKind::Text, delta.clone(), arrived_at)
+                {
+                    self.request_continuation_render();
+                }
                 self.core.signals.emit_dyn(
                     "stream_delta",
                     std::rc::Rc::new(smelt_core::signals::StreamDelta {
