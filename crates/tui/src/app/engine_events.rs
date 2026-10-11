@@ -929,6 +929,7 @@ impl TuiApp {
                         turn_id,
                         submitted_history_idx,
                         pending,
+                        arrived_at,
                     );
                 }
             }

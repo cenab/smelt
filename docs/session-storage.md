@@ -228,10 +228,10 @@ changed batches are cheap.
 ## Responsive-runtime validation
 
 The completed runtime and follow-up simplifications passed the full workspace
-nextest run with `smelt-tui/harness`: 6,377 passed, 12 skipped, no failures. The run
+nextest run with `smelt-tui/harness`: 6,439 passed, 12 skipped, no failures. The run
 includes actual terminal resume/rewind and submission interactions, spinner and
 F3/F12 regressions, queue/continuation/background-wakeup ordering, immutable capture
-tests, exact receipt recovery, v3/v4 migration rollback and subprocess crash
+tests, exact receipt recovery, v3/v4/v5 migration rollback and subprocess crash
 boundaries, and all storybook snapshots. Follow-up regressions cover rejection
 preserving hook history and callback display, targeted resume among 8,192 parked
 Lua tasks, bounded timer bursts, cancellation while page readers wait or retain
