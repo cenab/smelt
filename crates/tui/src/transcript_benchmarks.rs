@@ -4852,7 +4852,8 @@ fn run_rewind_delete_hot_path(history_len: usize) -> (HotPathSample, smelt_perf:
                 .flatten()
                 .and_then(|origin| match origin {
                     smelt_core::BlockOrigin::History(history_idx) => Some(history_idx),
-                    smelt_core::BlockOrigin::Checkpoint { .. } => None,
+                    smelt_core::BlockOrigin::Accepted
+                    | smelt_core::BlockOrigin::Checkpoint { .. } => None,
                 })
         })
         .expect("rewind benchmark history requires a user block");
