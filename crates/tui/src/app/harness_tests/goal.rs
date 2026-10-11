@@ -133,9 +133,14 @@ fn goal_creation_while_running_waits_until_its_queued_request_is_consumed() {
                     )
                 )));
                 app.feed_one(SourceEvent::engine(EngineEvent::Steered {
-                    text: command.clone(),
-                    count: 1,
-                    sent_at_ms: 1_742_567_823_000,
+                    turn_id,
+                    delta: protocol::CanonicalHistoryDelta::new(
+                        app.session_message_count(),
+                        vec![
+                            protocol::HistoryItem::user(protocol::Content::text(command.clone()))
+                                .with_sent_at_ms(1_742_567_823_000),
+                        ],
+                    ),
                 }));
                 assert_eq!(app.current_turn_id(), Some(turn_id));
             } else {

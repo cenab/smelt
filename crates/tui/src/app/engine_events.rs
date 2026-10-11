@@ -14,7 +14,8 @@ struct EngineEventResult {
 fn waits_for_pending_transcript_work(event: &EngineEvent) -> bool {
     matches!(
         event,
-        EngineEvent::HistoryAppended { .. }
+        EngineEvent::Steered { .. }
+            | EngineEvent::HistoryAppended { .. }
             | EngineEvent::HistoryUpdated { .. }
             | EngineEvent::TurnComplete { .. }
             | EngineEvent::TurnError { .. }
@@ -527,30 +528,13 @@ impl TuiApp {
                 self.append_active_output_line(invocation_id, line);
                 SessionControl::Continue
             }
-            EngineEvent::Steered {
-                text,
-                count,
-                sent_at_ms,
-            } => {
-                self.flush_streaming_thinking();
-                self.flush_streaming_text();
-                let drained = self.prompt.acknowledge_requests(count);
-                if !drained.is_empty() {
-                    let display = drained
-                        .iter()
-                        .map(crate::app::QueuedInput::display)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let text = if display.is_empty() { text } else { display };
-                    let command = drained
-                        .first()
-                        .is_some_and(crate::app::QueuedInput::is_command);
-                    self.push_block(Block::User {
-                        text,
-                        image_labels: vec![],
-                        command,
-                        sent_at_ms: Some(sent_at_ms),
-                    });
+            EngineEvent::Steered { turn_id: id, delta } => {
+                if id == turn_id {
+                    self.flush_streaming_thinking();
+                    self.flush_streaming_text();
+                    let count =
+                        self.append_engine_history_items(delta.first_index.get(), delta.items);
+                    let drained = self.prompt.acknowledge_requests(count);
                     for queued in &drained {
                         if let crate::app::QueuedInput::Command {
                             line, sent_at_ms, ..
@@ -559,6 +543,7 @@ impl TuiApp {
                             self.run_queued_command_line(line, *sent_at_ms);
                         }
                     }
+                    self.save_session();
                 }
                 SessionControl::Continue
             }

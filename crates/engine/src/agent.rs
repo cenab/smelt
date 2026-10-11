@@ -1202,22 +1202,25 @@ impl<'a> Turn<'a> {
         self.install_system_prompt(std::mem::take(&mut context.system_prompt));
     }
 
-    fn emit_history_appended_from(&mut self, first_index: usize) {
+    fn history_append_delta_from(&mut self, first_index: usize) -> protocol::CanonicalHistoryDelta {
         let start = self.raw_history_index(first_index).min(self.history.len());
-        let items = self.history[start..].to_vec();
-        if items.is_empty() {
-            return;
-        }
         self.next_history_changed_from = self.public_history_len();
-        self.emit(EngineEvent::HistoryAppended {
-            turn_id: self.turn_id,
-            delta: protocol::CanonicalHistoryDelta {
-                first_index: self
-                    .history_coordinates
-                    .canonical_index(protocol::ModelHistoryIndex::new(first_index)),
-                items,
-            },
-        });
+        protocol::CanonicalHistoryDelta {
+            first_index: self
+                .history_coordinates
+                .canonical_index(protocol::ModelHistoryIndex::new(first_index)),
+            items: self.history[start..].to_vec(),
+        }
+    }
+
+    fn emit_history_appended_from(&mut self, first_index: usize) {
+        let delta = self.history_append_delta_from(first_index);
+        if !delta.items.is_empty() {
+            self.emit(EngineEvent::HistoryAppended {
+                turn_id: self.turn_id,
+                delta,
+            });
+        }
     }
 
     fn replace_model_history(
@@ -1523,14 +1526,13 @@ impl<'a> Turn<'a> {
                     .sent_at_ms()
                     .unwrap_or_else(|| crate::clock::unix_time_ms(self.config.clock.as_ref()));
                 let input = input.with_sent_at_ms(sent_at_ms);
-                self.emit(EngineEvent::Steered {
-                    text: input.provider_content().text_content().into_owned(),
-                    count: 1,
-                    sent_at_ms,
-                });
                 let first_index = self.public_history_len();
                 self.push_current_turn_input(input);
-                self.emit_history_appended_from(first_index);
+                let delta = self.history_append_delta_from(first_index);
+                self.emit(EngineEvent::Steered {
+                    turn_id: self.turn_id,
+                    delta,
+                });
                 true
             }
             UiCommand::Unsteer { count } => {

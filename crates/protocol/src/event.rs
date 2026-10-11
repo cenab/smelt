@@ -400,11 +400,10 @@ pub enum EngineEvent {
         arguments: String,
     },
 
-    /// A queued user message was consumed by the engine.
+    /// Queued inputs were consumed and committed to canonical history.
     Steered {
-        text: String,
-        count: usize,
-        sent_at_ms: u64,
+        turn_id: u64,
+        delta: CanonicalHistoryDelta,
     },
 
     /// A tool call has started.

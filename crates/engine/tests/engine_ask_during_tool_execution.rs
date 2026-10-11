@@ -524,9 +524,11 @@ async fn queued_message_during_streamed_tool_call_is_acknowledged_after_tool_fin
                 Some(EngineEvent::ToolFinished { call_id, .. }) if call_id == TOOL_CALL_ID => {
                     lifecycle.push("tool_finished");
                 }
-                Some(EngineEvent::Steered { text, count, .. }) => {
-                    assert_eq!(text, "queued follow-up");
-                    assert_eq!(count, 1);
+                Some(EngineEvent::Steered { delta, .. }) => {
+                    assert!(matches!(delta.items.as_slice(),
+                        [protocol::HistoryItem::User { content, .. }]
+                            if content.text_content() == "queued follow-up"
+                    ));
                     lifecycle.push("steered");
                 }
                 Some(EngineEvent::TurnError { message, .. }) => panic!("turn failed: {message}"),
@@ -545,20 +547,17 @@ async fn queued_message_during_streamed_tool_call_is_acknowledged_after_tool_fin
     );
 
     tokio::time::timeout(TEST_DEADLINE, async {
-        let mut acknowledged = false;
         loop {
             match handle.recv().await {
-                Some(EngineEvent::Steered { sent_at_ms, .. }) => {
-                    assert_eq!(sent_at_ms, 1_742_567_823_000);
-                    acknowledged = true;
-                }
-                Some(EngineEvent::HistoryAppended { delta, .. }) if acknowledged => {
+                Some(EngineEvent::Steered { turn_id, delta }) => {
+                    assert_eq!(turn_id, 1);
                     assert!(matches!(
                         delta.items.as_slice(),
                         [protocol::HistoryItem::User {
+                            content,
                             sent_at_ms: Some(1_742_567_823_000),
                             ..
-                        }]
+                        }] if content.text_content() == "queued follow-up"
                     ));
                     break;
                 }
@@ -663,9 +662,11 @@ async fn queued_message_is_acknowledged_after_all_parallel_tools_finish() {
                     assert!(finished.insert(call_id), "tool finished more than once");
                     lifecycle.push("tool_finished");
                 }
-                Some(EngineEvent::Steered { text, count, .. }) => {
-                    assert_eq!(text, "queued follow-up");
-                    assert_eq!(count, 1);
+                Some(EngineEvent::Steered { delta, .. }) => {
+                    assert!(matches!(delta.items.as_slice(),
+                        [protocol::HistoryItem::User { content, .. }]
+                            if content.text_content() == "queued follow-up"
+                    ));
                     lifecycle.push("steered");
                 }
                 Some(EngineEvent::TurnError { message, .. }) => panic!("turn failed: {message}"),
@@ -1078,9 +1079,11 @@ async fn updates_during_sequential_tool_wait_apply_after_tool_finishes() {
             Some(EngineEvent::ToolFinished { call_id, .. }) if call_id == TOOL_CALL_ID => {
                 lifecycle.push("tool_finished");
             }
-            Some(EngineEvent::Steered { text, count, .. }) => {
-                assert_eq!(text, "queued during tool");
-                assert_eq!(count, 1);
+            Some(EngineEvent::Steered { delta, .. }) => {
+                assert!(matches!(delta.items.as_slice(),
+                    [protocol::HistoryItem::User { content, .. }]
+                        if content.text_content() == "queued during tool"
+                ));
                 lifecycle.push("steered");
             }
             Some(EngineEvent::TurnComplete { .. }) => break,

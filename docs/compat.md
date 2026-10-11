@@ -66,6 +66,20 @@ start of the session. Remove the alias after third-party dialogs have migrated
 to `history_idx` and the old field has passed through a documented deprecation
 window.
 
+## `unlinked-steering-rewind`
+
+Older steering acknowledgements saved user transcript rows without history origins.
+When an exact rewind link is absent, the TUI can recover the selected boundary from
+one unlinked row with the same display, command flag, and submission timestamp.
+Recovery requires a unique match in both canonical history and the transcript.
+It scans at most 1024 history items and 1024 user rows, with 2 MiB content budgets,
+and refuses unsaved document changes, incomplete scans, missing timestamps, or
+ambiguous matches. The normal rewind commit retains the exact stored prefix; it
+does not rebuild old tool output or rewrite retained revisions.
+
+Remove this fallback after affected saved sessions have been retired or repaired
+and support for rewinding their unlinked rows is no longer required.
+
 ## `libfuzzer-shell-argv`
 
 `fuzz/vendor/libfuzzer-sys` contains the published 0.4.13 crate, patched so

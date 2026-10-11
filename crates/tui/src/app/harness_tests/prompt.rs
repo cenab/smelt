@@ -664,9 +664,14 @@ fn queued_request_stays_out_of_transcript_until_all_tools_finish() {
 
     let transcript_blocks_before_ack = app.transcript_block_count();
     app.feed_one(SourceEvent::engine(EngineEvent::Steered {
-        text: "queued follow-up".into(),
-        count: 1,
-        sent_at_ms: 1_742_567_823_000,
+        turn_id: 1,
+        delta: protocol::CanonicalHistoryDelta::new(
+            0,
+            vec![
+                protocol::HistoryItem::user(protocol::Content::text("queued follow-up"))
+                    .with_sent_at_ms(1_742_567_823_000),
+            ],
+        ),
     }));
 
     assert_eq!(app.queued_message_count(), 0);
@@ -682,6 +687,208 @@ fn queued_request_stays_out_of_transcript_until_all_tools_finish() {
         Some(smelt_core::Block::User { text, sent_at_ms: Some(1_742_567_823_000), .. })
             if text == "queued follow-up"
     )));
+}
+
+#[test]
+fn steering_waits_for_transcript_work_before_acknowledging_input() {
+    for cancel_before_apply in [false, true] {
+        let mut app = TestApp::builder().build();
+        app.start_submitted_turn("initial request");
+        let before = app.session_message_count();
+        app.type_text("keep this visible");
+        app.press_mod(KeyCode::Enter, KeyModifiers::CONTROL);
+        app.app.queue_engine_continuation(EngineEvent::TextDelta {
+            delta: "earlier output".into(),
+        });
+        app.app.dispatch_engine_event(EngineEvent::Steered {
+            turn_id: app.current_turn_id().expect("active turn"),
+            delta: protocol::CanonicalHistoryDelta::new(
+                before,
+                vec![
+                    protocol::HistoryItem::user(protocol::Content::text("keep this visible"))
+                        .with_sent_at_ms(1_742_567_823_000),
+                ],
+            ),
+        });
+        assert_eq!(app.state().queued_inputs, vec!["keep this visible"]);
+        assert_eq!(app.session_message_count(), before);
+        if cancel_before_apply {
+            app.cancel();
+            assert!(app.state().queued_inputs.is_empty());
+            assert_eq!(app.state().prompt_text, "keep this visible");
+            assert_eq!(app.session_message_count(), before);
+            assert!(app.render_to_frame().text().contains("keep this visible"));
+        } else {
+            app.app.apply_pending_transcript_work();
+            assert!(app.state().queued_inputs.is_empty());
+            assert_eq!(app.session_message_count(), before + 1);
+            let frame = app.render_to_frame().text();
+            assert!(frame.contains("keep this visible"), "{frame}");
+            assert!(frame.contains("earlier output"), "{frame}");
+        }
+    }
+}
+
+#[test]
+fn replayed_stale_or_invalid_steering_keeps_the_next_request_queued() {
+    let mut app = TestApp::builder().build();
+    app.start_submitted_turn("initial request");
+    let turn_id = app.current_turn_id().expect("active turn");
+    let first_index = app.session_message_count();
+    app.type_text("first follow-up");
+    app.press_mod(KeyCode::Enter, KeyModifiers::CONTROL);
+    let delta = protocol::CanonicalHistoryDelta::new(
+        first_index,
+        vec![
+            protocol::HistoryItem::user(protocol::Content::text("first follow-up"))
+                .with_sent_at_ms(1_742_567_823_000),
+        ],
+    );
+    app.feed_one(SourceEvent::engine(EngineEvent::Steered {
+        turn_id,
+        delta: delta.clone(),
+    }));
+    app.type_text("next follow-up");
+    app.press_mod(KeyCode::Enter, KeyModifiers::CONTROL);
+    let block_count = app.transcript_block_count();
+    for event in [
+        EngineEvent::Steered {
+            turn_id,
+            delta: delta.clone(),
+        },
+        EngineEvent::Steered {
+            turn_id: turn_id + 1,
+            delta: protocol::CanonicalHistoryDelta::new(first_index + 1, delta.items.clone()),
+        },
+        EngineEvent::Steered {
+            turn_id,
+            delta: protocol::CanonicalHistoryDelta::new(first_index + 2, delta.items),
+        },
+    ] {
+        app.feed_one(SourceEvent::engine(event));
+        assert_eq!(app.state().queued_inputs, vec!["next follow-up"]);
+        assert_eq!(app.session_message_count(), first_index + 1);
+        assert_eq!(app.transcript_block_count(), block_count);
+        assert!(app.render_to_frame().text().contains("next follow-up"));
+    }
+}
+
+#[test]
+fn rewind_steered_message_restores_input_and_preserves_prior_transcript() {
+    for rewind_state in ["live", "saved", "resumed"] {
+        let mut app = TestApp::builder().build();
+        app.start_submitted_turn("initial request");
+        let turn_id = app.current_turn_id().expect("active turn");
+        let assistant_idx = app.session_history().len();
+        app.feed_one(SourceEvent::engine(EngineEvent::TextDelta {
+            delta: "work before follow-up".into(),
+        }));
+        app.feed_one(SourceEvent::engine(EngineEvent::HistoryAppended {
+            turn_id,
+            delta: protocol::CanonicalHistoryDelta::new(
+                assistant_idx,
+                vec![protocol::HistoryItem::Assistant(
+                    protocol::AssistantStep::terminal(
+                        Some(protocol::Content::text("work before follow-up")),
+                        None,
+                        Vec::new(),
+                    ),
+                )],
+            ),
+        }));
+        let history_idx = app.session_history().len();
+        app.type_text("changed my mind");
+        app.press_mod(KeyCode::Enter, KeyModifiers::CONTROL);
+        let appended = EngineEvent::Steered {
+            turn_id,
+            delta: protocol::CanonicalHistoryDelta::new(
+                history_idx,
+                vec![
+                    protocol::HistoryItem::user(protocol::Content::text("changed my mind"))
+                        .with_sent_at_ms(1_742_567_823_000),
+                ],
+            ),
+        };
+        app.feed_one(SourceEvent::engine(appended.clone()));
+        let block_count = app.transcript_block_count();
+        app.feed_one(SourceEvent::engine(appended));
+        assert_eq!(app.transcript_block_count(), block_count);
+        let history = app.conversation_probe().transcript().history();
+        assert_eq!(
+            history.block_origin_at(history.len() - 1),
+            Some(smelt_core::BlockOrigin::History(history_idx))
+        );
+        if rewind_state != "live" {
+            app.save_session_and_flush();
+            if rewind_state == "resumed" {
+                app.cancel();
+                app.save_session_and_flush();
+                let session_id = app.session_snapshot().id;
+                assert!(app.resume_session(&session_id));
+            }
+        }
+
+        assert!(app.run_lua("smelt.cmd.run('rewind')"));
+        drive_lua_tasks(&mut app);
+        app.press(KeyCode::Up);
+        app.press(KeyCode::Enter);
+        drive_lua_tasks(&mut app);
+
+        let frame = app.render_to_frame().text();
+        assert_eq!(app.state().prompt_text, "changed my mind", "{frame}");
+        assert_eq!(app.session_message_count(), history_idx, "{rewind_state}");
+        assert!(frame.contains("work before follow-up"), "{frame}");
+        assert!(!app.transcript_buffer_text().contains("changed my mind"));
+        assert!(!frame.contains("cannot rewind session"), "{frame}");
+        assert!(!app.agent_running());
+    }
+}
+
+#[test]
+fn engine_append_keeps_staged_user_row_and_links_each_new_user() {
+    let mut app = TestApp::builder().build();
+    app.start_submitted_turn("initial request");
+    let mut items = app.session_history().to_vec();
+    let initial_history_len = items.len();
+    let initial_block_count = app.transcript_block_count();
+    let initial_block_id = app.conversation_probe().transcript().history().order[0];
+    let command = protocol::HistoryItem::User {
+        content: protocol::Content::text("expanded command prompt"),
+        display: Some("/review".into()),
+        command: true,
+        sent_at_ms: Some(1_742_567_823_000),
+        image_placement: None,
+    };
+    let follow_up = protocol::HistoryItem::user(protocol::Content::text("second follow-up"));
+    items.extend([command, follow_up]);
+    let appended = EngineEvent::HistoryAppended {
+        turn_id: app.current_turn_id().expect("active turn"),
+        delta: protocol::CanonicalHistoryDelta::new(0, items),
+    };
+    app.feed_one(SourceEvent::engine(appended.clone()));
+    app.feed_one(SourceEvent::engine(appended));
+
+    assert_eq!(app.session_message_count(), initial_history_len + 2);
+    let history = app.conversation_probe().transcript().history();
+    assert_eq!(history.len(), initial_block_count + 2);
+    assert_eq!(history.order[0], initial_block_id);
+    for offset in 0..2 {
+        assert_eq!(
+            history.block_origin_at(initial_block_count + offset),
+            Some(smelt_core::BlockOrigin::History(
+                initial_history_len + offset
+            ))
+        );
+    }
+    assert!(matches!(
+        history.block(history.order[initial_block_count]),
+        Some(smelt_core::Block::User { text, command: true, sent_at_ms: Some(1_742_567_823_000), .. })
+            if text == "/review"
+    ));
+    app.rewind_to_history_index(Some(initial_history_len + 1), false);
+    assert_eq!(app.state().prompt_text, "second follow-up");
+    assert_eq!(app.session_message_count(), initial_history_len + 1);
+    assert_eq!(app.transcript_block_count(), initial_block_count + 1);
 }
 
 #[test]
@@ -723,9 +930,14 @@ fn steering_during_streamed_tool_call_leaves_one_completed_transcript_row() {
         Some(10),
     );
     app.feed_one(SourceEvent::engine(EngineEvent::Steered {
-        text: "queued follow-up".into(),
-        count: 1,
-        sent_at_ms: 1_742_567_823_000,
+        turn_id: 1,
+        delta: protocol::CanonicalHistoryDelta::new(
+            0,
+            vec![
+                protocol::HistoryItem::user(protocol::Content::text("queued follow-up"))
+                    .with_sent_at_ms(1_742_567_823_000),
+            ],
+        ),
     }));
 
     let transcript = app.render_to_frame().text();

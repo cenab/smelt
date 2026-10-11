@@ -249,8 +249,8 @@ pub enum FuzzOp {
     /// Emit `TurnError`. Active-turn dispatch ends the turn; idle dispatch
     /// surfaces a notification.
     EngineTurnError(String),
-    /// Emit `Steered { text, count }`. Active-turn dispatch flushes both
-    /// streams and drains up to `count` request-queued messages.
+    /// Emit a canonical steering delta with `count` user items. Active-turn
+    /// dispatch commits their transcript rows before acknowledging queued inputs.
     EngineSteered {
         text: String,
         count: u8,
@@ -1941,10 +1941,14 @@ fn plan(app: &TestApp, op: FuzzOp) -> (Option<SourceEvent>, PostCheck) {
         }
         FuzzOp::EngineSteered { text, count } => {
             let n = usize::from(count);
+            let item = protocol::HistoryItem::user(protocol::Content::text(text))
+                .with_sent_at_ms(1_742_567_823_000);
             let ev = SourceEvent::engine(EngineEvent::Steered {
-                text,
-                count: n,
-                sent_at_ms: 1_742_567_823_000,
+                turn_id: app.current_turn_id().unwrap_or(0),
+                delta: protocol::CanonicalHistoryDelta::new(
+                    app.session_message_count(),
+                    vec![item; n],
+                ),
             });
             (Some(ev), PostCheck::Steered { count: n })
         }

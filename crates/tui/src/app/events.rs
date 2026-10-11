@@ -3383,9 +3383,14 @@ mod tests {
 
         app.feed_one(crate::app::test_harness::SourceEvent::engine(
             protocol::EngineEvent::Steered {
-                text: "request now".to_string(),
-                count: 1,
-                sent_at_ms: 1_742_567_823_000,
+                turn_id: 1,
+                delta: protocol::CanonicalHistoryDelta::new(
+                    app.session_message_count(),
+                    vec![
+                        protocol::HistoryItem::user(protocol::Content::text("request now"))
+                            .with_sent_at_ms(1_742_567_823_000),
+                    ],
+                ),
             },
         ));
 

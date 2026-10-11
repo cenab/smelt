@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 const REWIND_HISTORY_SCAN_CHUNK_ITEMS: usize = 256;
+const LEGACY_REWIND_MAX_ITEMS: usize = 1024;
+const LEGACY_REWIND_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RewindTurn {
@@ -598,7 +600,19 @@ fn push_user_block(
     command: bool,
     sent_at_ms: Option<u64>,
 ) {
-    let record = match protocol::classify_user_history_content(content) {
+    let block = user_history_to_block(lua, content, display, command, sent_at_ms);
+    transcript
+        .push_hydrated_block_with_origin(block, smelt_core::BlockOrigin::History(history_index));
+}
+
+fn user_history_to_block(
+    lua: &smelt_core::lua::LuaRuntime,
+    content: &Content,
+    display: Option<&str>,
+    command: bool,
+    sent_at_ms: Option<u64>,
+) -> Block {
+    match protocol::classify_user_history_content(content) {
         protocol::UserHistoryContent::CompactionSummary { summary } => Block::Compacted { summary },
         protocol::UserHistoryContent::ModeChange { text } => {
             crate::lua::mode_block(lua, None, &text)
@@ -627,9 +641,32 @@ fn push_user_block(
                 sent_at_ms,
             }
         }
+    }
+}
+
+fn legacy_steering_block(lua: &smelt_core::lua::LuaRuntime, item: &HistoryItem) -> Option<Block> {
+    let HistoryItem::User {
+        content,
+        display,
+        command,
+        sent_at_ms: Some(sent_at_ms),
+        ..
+    } = item
+    else {
+        return None;
     };
-    transcript
-        .push_hydrated_block_with_origin(record, smelt_core::BlockOrigin::History(history_index));
+    rewindable_user(item)?;
+    let mut block = user_history_to_block(
+        lua,
+        content,
+        display.as_deref(),
+        *command,
+        Some(*sent_at_ms),
+    );
+    if let Block::User { image_labels, .. } = &mut block {
+        image_labels.clear();
+    }
+    Some(block)
 }
 
 fn push_assistant_blocks(
@@ -1189,12 +1226,12 @@ impl TuiApp {
         &mut self,
         first_index: usize,
         items: Vec<HistoryItem>,
-    ) {
+    ) -> usize {
         if items.is_empty() {
-            return;
+            return 0;
         }
         if self.block_read_only_mutation("append to read-only session history") {
-            return;
+            return 0;
         }
 
         smelt_perf::perf::record_value("tui:history_appended:items", items.len() as u64);
@@ -1204,31 +1241,53 @@ impl TuiApp {
             self.notify_session_error_sticky(format!(
                 "invalid canonical history append: start {first_index} exceeds length {current_len}"
             ));
-            return;
+            return 0;
         }
 
-        let already_present = if first_index.saturating_add(items.len()) <= current_len {
-            match self.session_history_range(first_index..first_index.saturating_add(items.len())) {
-                Ok(existing) => existing == items,
-                Err(err) => {
-                    self.notify_session_error_sticky(format!(
-                        "failed to read canonical session history: {err}"
-                    ));
-                    return;
-                }
+        let overlap_end = first_index.saturating_add(items.len()).min(current_len);
+        let existing = match self.session_history_range(first_index..overlap_end) {
+            Ok(existing) => existing,
+            Err(err) => {
+                self.notify_session_error_sticky(format!(
+                    "failed to read canonical session history: {err}"
+                ));
+                return 0;
             }
-        } else {
-            false
         };
+        let common_len = existing
+            .iter()
+            .zip(&items)
+            .take_while(|(existing, appended)| existing == appended)
+            .count();
 
-        if already_present {
+        if common_len == items.len() {
             smelt_perf::perf::record_value("tui:history_appended:already_present", 1);
         } else {
-            if first_index < self.session_history_len() {
-                self.session_truncate_from(first_index);
+            let dirty_from = first_index.saturating_add(common_len);
+            if dirty_from < current_len {
+                self.session_truncate_from(dirty_from);
             }
-            for item in items.iter().cloned() {
-                self.session_append_history(item);
+            for item in items.iter().skip(common_len).cloned() {
+                if let HistoryItem::User {
+                    content,
+                    display,
+                    command,
+                    sent_at_ms,
+                    ..
+                } = &item
+                {
+                    let block = user_history_to_block(
+                        &self.lua,
+                        content,
+                        display.as_deref(),
+                        *command,
+                        *sent_at_ms,
+                    );
+                    // Keep the canonical item and its rewind boundary in the same mutation.
+                    self.commit_request_history_item_to_document(item, Some(block), None);
+                } else {
+                    self.session_append_history(item);
+                }
             }
         }
 
@@ -1237,6 +1296,7 @@ impl TuiApp {
         }
         self.sync_session_snapshot();
         self.publish_history_delta(HistoryDeltaKind::Append);
+        items.len() - common_len
     }
 
     pub(crate) fn publish_history_delta(&mut self, kind: HistoryDeltaKind) {
@@ -2397,9 +2457,97 @@ impl TuiApp {
         Ok(Some(history))
     }
 
+    // COMPAT(unlinked-steering-rewind): old acknowledgements saved user rows without origins.
+    fn legacy_steering_rewind_record(
+        &self,
+        reader: &smelt_store::LineageSessionReader,
+        history_idx: usize,
+        item: &HistoryItem,
+    ) -> Result<Option<usize>, String> {
+        let Some(expected) = legacy_steering_block(&self.lua, item) else {
+            return Ok(None);
+        };
+        let history_len = self.session_history_len();
+        let head = reader
+            .store_head()
+            .map_err(|err| format!("read legacy rewind head: {err}"))?;
+        if self.conversation.has_document_work() || head.history_len.get() != history_len as u64 {
+            return Err("save the session before recovering an unlinked rewind boundary".into());
+        }
+        let history = reader
+            .history_tail(
+                history_len,
+                LEGACY_REWIND_MAX_ITEMS,
+                Some(LEGACY_REWIND_MAX_BYTES),
+            )
+            .map_err(|err| format!("read legacy rewind history: {err}"))?;
+        if history.len() != history_len {
+            return Err("legacy rewind recovery exceeds the history scan budget".into());
+        }
+        if history.get(history_idx) != Some(item) {
+            return Err("save the session before recovering an unlinked rewind boundary".into());
+        }
+        if history
+            .iter()
+            .filter_map(|item| legacy_steering_block(&self.lua, item))
+            .filter(|block| block == &expected)
+            .count()
+            != 1
+        {
+            return Err("legacy rewind boundary is ambiguous in canonical history".into());
+        }
+        let mut cursor = 0;
+        let mut found = None;
+        let mut bytes = 0u64;
+        let mut previous_history_idx = None;
+        for scanned in 0..=LEGACY_REWIND_MAX_ITEMS {
+            let Some(nav) = reader
+                .transcript_record_after_kind("user", cursor)
+                .map_err(|err| format!("find legacy user row: {err}"))?
+            else {
+                return Ok(found);
+            };
+            if scanned == LEGACY_REWIND_MAX_ITEMS {
+                return Err("legacy rewind recovery exceeds the transcript scan budget".into());
+            }
+            let index = nav.record_index.get();
+            cursor = index.saturating_add(1);
+            if let Some(origin) = nav.profile.history_idx {
+                if found.is_some() && origin <= history_idx as u64 {
+                    return Err("legacy rewind boundary conflicts with transcript order".into());
+                }
+                previous_history_idx =
+                    Some(previous_history_idx.map_or(origin, |previous: u64| previous.max(origin)));
+                continue;
+            }
+            bytes = bytes.saturating_add(nav.profile.estimated_text_bytes);
+            if bytes > LEGACY_REWIND_MAX_BYTES as u64 {
+                return Err("legacy rewind recovery exceeds the transcript scan budget".into());
+            }
+            let rows = reader
+                .transcript_object_backed_range(index as u64, cursor as u64)
+                .map_err(|err| format!("read legacy user row: {err}"))?;
+            let row = rows
+                .first()
+                .ok_or_else(|| "legacy user row is missing".to_string())?;
+            let block: Block = serde_json::from_str(&row.block_json)
+                .map_err(|err| format!("decode legacy user row: {err}"))?;
+            if row.origin_json.is_none() && block == expected {
+                if previous_history_idx.is_some_and(|origin| origin >= history_idx as u64) {
+                    return Err("legacy rewind boundary conflicts with transcript order".into());
+                }
+                if found.replace(index).is_some() {
+                    return Err("legacy rewind boundary is ambiguous in the transcript".into());
+                }
+            }
+        }
+        Err("legacy rewind recovery exceeds the transcript scan budget".into())
+    }
+
     fn transcript_rewind_target(
         &self,
         history_idx: usize,
+        item: &HistoryItem,
     ) -> Result<TranscriptRewindTarget, String> {
         let transcript = self.conversation.transcript().history();
         let loaded_block_idx = transcript
@@ -2428,10 +2576,15 @@ impl TuiApp {
             &store.session_id,
         )
         .map_err(|err| format!("open session transcript: {err}"))?;
-        let record_count = reader
+        let record_count = match reader
             .transcript_record_index_for_history_idx(history_idx as u64)
             .map_err(|err| format!("find transcript rewind boundary: {err}"))?
-            .ok_or_else(|| "transcript has no record for this history item".to_string())?;
+        {
+            Some(index) => index,
+            None => self
+                .legacy_steering_rewind_record(&reader, history_idx, item)?
+                .ok_or_else(|| "transcript has no record for this history item".to_string())?,
+        };
         let address = crate::app::transcript::TranscriptStoreAddress::new(
             store.sessions_root.clone(),
             store.session_id.clone(),
@@ -2484,7 +2637,7 @@ impl TuiApp {
             self.notify_error("cannot rewind to this history item".into());
             return None;
         };
-        let transcript_target = match self.transcript_rewind_target(history_idx) {
+        let transcript_target = match self.transcript_rewind_target(history_idx, &rewind_item[0]) {
             Ok(target) => target,
             Err(err) => {
                 smelt_perf::perf::record_value("rewind:transcript_boundary_error", 1);
@@ -2622,6 +2775,165 @@ mod checkpoint_tests {
         reader
             .transcript_range(0, state.transcript_len)
             .expect("read canonical transcript")
+    }
+
+    fn saved_unlinked_steering_app(
+        prepare: impl FnOnce(&mut session::Session, &mut Vec<smelt_core::TranscriptBlockRecordWithId>),
+    ) -> crate::app::test_harness::TestApp {
+        let mut app = crate::app::test_harness::TestApp::builder().build();
+        let mut saved = session::Session::new(app.app.core.env.pid(), app.app.core.env.cwd());
+        saved.first_user_message = Some("initial request".into());
+        saved.history = vec![
+            user("initial request").with_sent_at_ms(100),
+            assistant("prior output"),
+            user("old follow-up").with_sent_at_ms(200),
+        ];
+        let transcript = build_transcript_from_session(&app.app.lua, &saved);
+        let mut records = transcript.history.block_records_with_ids_from(0);
+        records[1].record.block = Block::Text {
+            content: "exact rendered prior output".into(),
+        };
+        records[2].record.origin = None;
+        prepare(&mut saved, &mut records);
+        for record in &mut records {
+            record.record.content_hash = record.record.block.content_hash();
+        }
+        let mut command = smelt_core::session::initial_store_commit_from_session(&saved).unwrap();
+        command.transcript_records = Some(smelt_store::TranscriptRecordSuffix {
+            start: smelt_store::TranscriptRecordIndex::ZERO,
+            records: records
+                .iter()
+                .enumerate()
+                .map(|(index, record)| {
+                    smelt_core::transcript_model::transcript_block_row_with_block_idx(
+                        index,
+                        index as u64,
+                        &record.record,
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        });
+        let mut writer =
+            smelt_store::OwnedLineageWriter::open(app.app.core.sessions.sessions_dir(), &saved.id)
+                .unwrap();
+        writer.commit_session(&command).unwrap();
+        writer.release().unwrap();
+        assert!(app.resume_session(&saved.id));
+        app
+    }
+
+    #[test]
+    fn saved_unlinked_steering_row_can_be_rewound_without_rebuilding_prior_output() {
+        let mut app = saved_unlinked_steering_app(|_, _| {});
+        let id = app.session_snapshot().id;
+        let before = app.render_to_frame().text();
+        assert!(before.contains("exact rendered prior output"), "{before}");
+        app.rewind_to_history_index(Some(2), false);
+
+        assert_eq!(app.state().prompt_text, "old follow-up");
+        assert_eq!(app.session_message_count(), 2);
+        let frame = app.render_to_frame().text();
+        assert!(frame.contains("exact rendered prior output"), "{frame}");
+        app.save_session_and_flush();
+        let records = lineage_transcript(&lineage_reader(&app, &id));
+        assert_eq!(records.len(), 2);
+        assert!(records[1]
+            .block_json
+            .contains("exact rendered prior output"));
+    }
+
+    #[test]
+    fn legacy_steering_rewind_refuses_unsaved_same_length_history_changes() {
+        let mut app = saved_unlinked_steering_app(|_, _| {});
+        let target = user("old follow-up").with_sent_at_ms(200);
+        app.app.session_truncate_from(0);
+        for item in [target.clone(), assistant("changed prior output"), target] {
+            app.app.session_append_history(item);
+        }
+        let before = app.session_history().to_vec();
+        app.rewind_to_history_index(Some(2), false);
+        assert_eq!(app.session_message_count(), 3);
+        assert_eq!(app.session_history(), before);
+        assert_eq!(app.state().prompt_text, "");
+    }
+
+    #[test]
+    fn legacy_steering_rewind_refuses_ambiguous_mismatched_or_unbounded_recovery() {
+        for case in [
+            "duplicate history",
+            "duplicate transcript",
+            "missing timestamp",
+            "wrong timestamp",
+            "wrong command",
+            "earlier conflicting origin",
+            "later conflicting origin",
+            "history item budget",
+            "history byte budget",
+            "transcript item budget",
+            "transcript byte budget",
+        ] {
+            let mut app = saved_unlinked_steering_app(|saved, records| match case {
+                "duplicate history" => saved.history.push(saved.history[2].clone()),
+                "duplicate transcript" => records.push(records[2].clone()),
+                "missing timestamp" => {
+                    if let HistoryItem::User { sent_at_ms, .. } = &mut saved.history[2] {
+                        *sent_at_ms = None;
+                    }
+                }
+                "wrong timestamp" => {
+                    if let Block::User { sent_at_ms, .. } = &mut records[2].record.block {
+                        *sent_at_ms = Some(201);
+                    }
+                }
+                "wrong command" => {
+                    if let Block::User { command, .. } = &mut records[2].record.block {
+                        *command = true;
+                    }
+                }
+                "earlier conflicting origin" => {
+                    saved
+                        .history
+                        .push(user("later request").with_sent_at_ms(300));
+                    records[0].record.origin = Some(smelt_core::BlockOrigin::History(3));
+                }
+                "later conflicting origin" => records.push(records[0].clone()),
+                "history item budget" => saved.history.extend(std::iter::repeat_n(
+                    assistant("other output"),
+                    LEGACY_REWIND_MAX_ITEMS,
+                )),
+                "history byte budget" => saved
+                    .history
+                    .push(assistant(&"x".repeat(LEGACY_REWIND_MAX_BYTES + 1))),
+                "transcript item budget" => {
+                    let mut other = records[0].clone();
+                    other.record.origin = None;
+                    records.extend(std::iter::repeat_n(other, LEGACY_REWIND_MAX_ITEMS));
+                }
+                "transcript byte budget" => {
+                    let mut oversized = records[2].clone();
+                    oversized.record.block = Block::User {
+                        text: "x".repeat(LEGACY_REWIND_MAX_BYTES + 1),
+                        image_labels: vec![],
+                        command: false,
+                        sent_at_ms: Some(300),
+                    };
+                    records.push(oversized);
+                }
+                _ => unreachable!(),
+            });
+            let id = app.session_snapshot().id;
+            let reader = lineage_reader(&app, &id);
+            let before_history = lineage_history(&reader);
+            let before_transcript = lineage_transcript(&reader);
+            let history_len = app.session_message_count();
+            assert!(app.rewind_to_history(2).is_none(), "{case}");
+            assert_eq!(app.session_message_count(), history_len, "{case}");
+            app.save_session_and_flush();
+            let reader = lineage_reader(&app, &id);
+            assert_eq!(lineage_history(&reader), before_history, "{case}");
+            assert_eq!(lineage_transcript(&reader), before_transcript, "{case}");
+        }
     }
 
     #[test]
