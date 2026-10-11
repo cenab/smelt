@@ -982,6 +982,16 @@ impl TuiApp {
         if !self.prompt.queue_is_empty() {
             return false;
         }
+        if let Some(input) = self.preparing_input_for_rewind() {
+            self.cancel_turn_work();
+            self.working
+                .finish(smelt_core::working::TurnOutcome::Cancelled);
+            self.cancel_pending_turn_submission(
+                crate::app::agent::PendingTurnCancellation::Rewound,
+            );
+            self.restore_rewind_input(input, restore_vim_insert);
+            return true;
+        }
         let history_idx = match self.conversation.active() {
             Some(turn) if !turn.assistant_output_started => turn.rewind_history_idx,
             Some(_) => None,
@@ -1010,6 +1020,7 @@ impl TuiApp {
         restore_vim_insert: bool,
     ) {
         self.cancel_live_search(false);
+        self.cancel_pending_rewind();
         if self.conversation.is_active() {
             self.cancel_agent();
             self.conversation.clear_active();
@@ -1022,29 +1033,26 @@ impl TuiApp {
             );
         }
         if let Some(history_idx) = history_idx {
-            let rewound = if let Some(input) = self.rewind_to_history_with_placement(history_idx) {
-                self.clear_prompt_prediction();
-                let mut pctx = crate::input::prompt_ctx_mut(&mut self.ui);
-                self.prompt.restore_from_rewind(
-                    &mut pctx,
-                    input.text,
-                    input.images,
-                    input.placement,
-                );
-                true
-            } else {
-                false
-            };
-            while self.core.engine.try_recv().is_ok() {}
-            if rewound {
-                self.finish_rewind(restore_vim_insert);
-            }
+            self.request_rewind(history_idx, restore_vim_insert);
         } else {
             self.clear_prompt_prediction();
             self.rewind_to_start();
             while self.core.engine.try_recv().is_ok() {}
             self.finish_rewind(restore_vim_insert);
         }
+    }
+
+    pub(super) fn restore_rewind_input(
+        &mut self,
+        input: super::history::RewindInput,
+        restore_vim_insert: bool,
+    ) {
+        self.clear_prompt_prediction();
+        let mut pctx = crate::input::prompt_ctx_mut(&mut self.ui);
+        self.prompt
+            .restore_from_rewind(&mut pctx, input.text, input.images, input.placement);
+        while self.core.engine.try_recv().is_ok() {}
+        self.finish_rewind(restore_vim_insert);
     }
 
     fn finish_rewind(&mut self, restore_vim_insert: bool) {

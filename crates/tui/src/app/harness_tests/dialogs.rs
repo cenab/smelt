@@ -3525,6 +3525,16 @@ fn ask_user_question_custom_input_accepts_question_mark() {
 
 #[test]
 fn ask_user_question_multiple_questions_wakes_between_dialogs() {
+    fn drain_wakeups(app: &mut TestApp) {
+        for _ in 0..64 {
+            if !app.try_receive_lua_wakeup() {
+                return;
+            }
+            app.feed_one(SourceEvent::LuaWakeup);
+        }
+        panic!("dialog Lua work did not settle");
+    }
+
     let mut app = TestApp::builder().with_vim(false).build();
     app.start_turn(1);
 
@@ -3560,6 +3570,7 @@ fn ask_user_question_multiple_questions_wakes_between_dialogs() {
         tool_name: "ask_user_question".into(),
         args,
     }));
+    drain_wakeups(&mut app);
 
     let first = app
         .state()
@@ -3572,6 +3583,7 @@ fn ask_user_question_multiple_questions_wakes_between_dialogs() {
         "resolving the first dialog should wake the Lua task runtime"
     );
     app.feed_one(SourceEvent::LuaWakeup);
+    drain_wakeups(&mut app);
 
     let second = app
         .state()
@@ -3585,6 +3597,7 @@ fn ask_user_question_multiple_questions_wakes_between_dialogs() {
         "resolving the final dialog should wake the Lua task runtime"
     );
     app.feed_one(SourceEvent::LuaWakeup);
+    drain_wakeups(&mut app);
 
     assert!(app.state().active_modal.is_none());
     let result = app

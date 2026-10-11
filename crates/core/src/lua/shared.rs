@@ -2,7 +2,7 @@
 
 use super::hooks::HookRegistry;
 use super::{LuaHandle, LuaHandleLedger, LuaTaskRuntime, TaskEvent};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -174,6 +174,33 @@ impl TranscriptGroupRegistry {
     }
 }
 
+pub const MAX_LUA_WORK_PER_PUMP: usize = 256;
+pub const LUA_WORK_BATCH: usize = 64;
+const LUA_PUMP_TIME: std::time::Duration = std::time::Duration::from_millis(8);
+
+struct LuaWorkQuota {
+    remaining: usize,
+    deadline: std::time::Instant,
+}
+
+/// Nested drivers share one quota; only the root driver resets it on return.
+pub struct LuaWorkGuard {
+    shared: Arc<LuaShared>,
+    pub root: bool,
+}
+
+impl Drop for LuaWorkGuard {
+    fn drop(&mut self) {
+        if self.root {
+            *self
+                .shared
+                .work_quota
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+        }
+    }
+}
+
 /// All shared state between Lua closures and the app loop.
 pub struct LuaShared {
     pub commands: Mutex<HashMap<String, RegisteredCommand>>,
@@ -219,10 +246,11 @@ pub struct LuaShared {
     /// can mint an id without re-entering the `tasks` mutex.
     pub next_external_id: AtomicU64,
     pub tasks: Mutex<LuaTaskRuntime>,
+    work_quota: Mutex<Option<LuaWorkQuota>>,
     /// Resume-events for Lua coroutines; pumped on wakeup/tick.
-    pub task_inbox: Mutex<Vec<TaskEvent>>,
+    pub task_inbox: Mutex<VecDeque<TaskEvent>>,
     /// Cross-thread inbox: tokio tasks push `(external_id, json)`; main loop drains to `task_inbox`.
-    pub json_inbox: Arc<Mutex<Vec<(u64, serde_json::Value)>>>,
+    pub json_inbox: Arc<Mutex<VecDeque<(u64, serde_json::Value)>>>,
     /// Session-long HTTP transport shared by replacement Lua generations.
     pub(crate) http_client: Arc<crate::http::Client>,
     /// Wakes the main loop when a coroutine resume payload is queued.
@@ -407,8 +435,9 @@ impl Default for LuaShared {
             next_buf_id: Arc::new(AtomicU64::new(LUA_BUF_ID_BASE)),
             next_external_id: AtomicU64::new(1),
             tasks: Mutex::new(LuaTaskRuntime::new()),
-            task_inbox: Mutex::new(Vec::new()),
-            json_inbox: Arc::new(Mutex::new(Vec::new())),
+            work_quota: Mutex::new(None),
+            task_inbox: Mutex::new(VecDeque::new()),
+            json_inbox: Arc::new(Mutex::new(VecDeque::new())),
             http_client: Arc::new(crate::http::Client::default()),
             wakeup_tx: std::sync::OnceLock::new(),
             providers: Mutex::new(Vec::new()),
@@ -444,6 +473,47 @@ impl Default for LuaShared {
 }
 
 impl LuaShared {
+    pub fn begin_work(self: &Arc<Self>) -> LuaWorkGuard {
+        let mut quota = self
+            .work_quota
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = quota.is_none();
+        if root {
+            *quota = Some(LuaWorkQuota {
+                remaining: MAX_LUA_WORK_PER_PUMP,
+                deadline: std::time::Instant::now() + LUA_PUMP_TIME,
+            });
+        }
+        LuaWorkGuard {
+            shared: Arc::clone(self),
+            root,
+        }
+    }
+
+    pub fn has_work_budget(&self) -> bool {
+        self.work_quota
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(|quota| quota.remaining > 0 && std::time::Instant::now() < quota.deadline)
+    }
+
+    pub fn claim_work(&self) -> bool {
+        let mut quota = self
+            .work_quota
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(quota) = quota.as_mut() else {
+            return false;
+        };
+        if quota.remaining == 0 || std::time::Instant::now() >= quota.deadline {
+            return false;
+        }
+        quota.remaining -= 1;
+        true
+    }
+
     pub fn with_host_services(host: LuaHostServices) -> Self {
         Self {
             lsp: host.lsp,
@@ -741,6 +811,19 @@ impl LuaShared {
 }
 
 impl LuaShared {
+    pub fn has_pending_task_events(&self) -> bool {
+        !self
+            .task_inbox
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty()
+            || !self
+                .json_inbox
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+    }
+
     /// `Send`-safe handle for pushing JSON resume payloads from tokio tasks.
     /// `Arc<LuaShared>` is `!Send` (owns `mlua::Thread`s); this is the narrowest cross-thread surface.
     pub fn resume_sink(&self) -> LuaResumeSink {
@@ -754,14 +837,14 @@ impl LuaShared {
 /// `Send`-safe handle for resuming a parked Lua coroutine from a tokio task.
 #[derive(Clone)]
 pub struct LuaResumeSink {
-    inbox: Arc<Mutex<Vec<(u64, serde_json::Value)>>>,
+    inbox: Arc<Mutex<VecDeque<(u64, serde_json::Value)>>>,
     wakeup: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 impl LuaResumeSink {
     pub fn resolve_json(&self, external_id: u64, value: serde_json::Value) {
         if let Ok(mut inbox) = self.inbox.lock() {
-            inbox.push((external_id, value));
+            inbox.push_back((external_id, value));
         }
         if let Some(ref tx) = self.wakeup {
             let _ = tx.send(());

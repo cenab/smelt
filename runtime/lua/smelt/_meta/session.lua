@@ -113,7 +113,7 @@ session.reset = nil
 ---@type fun(): boolean
 session.retry_persistence = nil
 
---- Rewind the session to a prior user turn. `history_idx = nil` rewinds to before the first turn; `opts.restore_vim_insert = true` re-enters vim insert mode after the rewind.
+--- Rewind the session to a prior user turn. Stored targets prepare in the background and apply only if the session and draft remain unchanged. `history_idx = nil` rewinds to before the first turn; `opts.restore_vim_insert = true` re-enters vim insert mode after the rewind.
 ---@type fun(history_idx: integer?, opts: table?): nil
 session.rewind_to = nil
 
@@ -175,6 +175,13 @@ session.tree = nil
 --- Return rewindable user turns as `{ history_idx, block_idx, label }` rows where `history_idx` is the canonical rewind coordinate, deprecated `block_idx` is its compatibility alias, and `label` is the first line of the user message.
 ---@type fun(): table
 session.turns = nil
+
+--- Read a bounded page of rewindable user turns off the UI thread, newest
+--- page first and each page in chronological order. Uses the transcript
+--- index without decoding assistant output. Returns `{ turns, next_before? }`;
+--- pass `next_before` to read older turns. Must run in a yieldable task.
+---@type fun(before?: integer): table
+session.turns_page = nil
 
 --- List managed worktrees off the UI thread. Must run in `smelt.spawn`, a
 --- command, or a tool. Returns sorted `{ name, branch, path, base, current }` rows.

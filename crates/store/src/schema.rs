@@ -4,13 +4,15 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{Result, StoreError};
 
-pub const LINEAGE_SCHEMA_VERSION: i32 = 5;
+pub const LINEAGE_SCHEMA_VERSION: i32 = 6;
 
 const LINEAGE_SCHEMA: &str = include_str!("lineage_schema.sql");
 // COMPAT(lineage-schema-v3): retained databases migrate atomically; reads remain write-free.
 const LINEAGE_SCHEMA_V3: &str = include_str!("lineage_v3.sql");
-// COMPAT(lineage-schema-v4): retained databases keep their original response roles.
+// COMPAT(lineage-schema-v4): preserve the deployed layout for read-only validation.
 const LINEAGE_SCHEMA_V4: &str = include_str!("lineage_v4.sql");
+// COMPAT(lineage-schema-v5): preserve response diagnostics before count-index migration.
+const LINEAGE_SCHEMA_V5: &str = include_str!("lineage_v5.sql");
 
 // COMPAT(lineage-schema-v3): shared storage was introduced in v4.
 pub(crate) fn has_shared_storage(conn: &Connection) -> Result<bool> {
@@ -46,9 +48,9 @@ pub(crate) fn initialize_lineage_schema(conn: &mut Connection) -> Result<()> {
                 set_user_version(&tx, LINEAGE_SCHEMA_VERSION)?;
                 write_store_meta(&tx)?;
             }
-            4 => {
-                validate_schema_shape(&tx, lineage_schema_shape(4)?)?;
-                migrate_lineage_schema_v4(&tx)?;
+            version @ (4 | 5) => {
+                validate_schema_shape(&tx, lineage_schema_shape(version)?)?;
+                migrate_shared_lineage_schema(&tx)?;
                 set_user_version(&tx, LINEAGE_SCHEMA_VERSION)?;
                 write_store_meta(&tx)?;
             }
@@ -80,7 +82,7 @@ pub(crate) fn initialize_lineage_schema(conn: &mut Connection) -> Result<()> {
 
 pub(crate) fn validate_lineage_schema(conn: &Connection) -> Result<()> {
     let version = user_version(conn)?;
-    if !matches!(version, 3 | 4 | LINEAGE_SCHEMA_VERSION) {
+    if !matches!(version, 3 | 4 | 5 | LINEAGE_SCHEMA_VERSION) {
         return Err(StoreError::UnsupportedSchema {
             found: version,
             expected: LINEAGE_SCHEMA_VERSION,
@@ -101,6 +103,7 @@ fn migrate_lineage_schema_v3(conn: &Connection) -> Result<()> {
     let guards = [
         "lineage_sequence_entry_insert",
         "lineage_sequence_root_insert",
+        "lineage_revision_insert",
     ];
     let mut migration = String::new();
     for name in tables {
@@ -125,11 +128,43 @@ fn migrate_lineage_schema_v3(conn: &Connection) -> Result<()> {
     crate::lineage::backfill_history_indexes(conn)
 }
 
-fn migrate_lineage_schema_v4(conn: &Connection) -> Result<()> {
-    let tables = ["request_object_refs"];
-    let migration =
-        replacement_table_sql(lineage_schema_shape(LINEAGE_SCHEMA_VERSION)?, tables[0])?;
-    replace_lineage_tables(conn, &migration, &tables, &[])
+fn migrate_shared_lineage_schema(conn: &Connection) -> Result<()> {
+    let current = lineage_schema_shape(LINEAGE_SCHEMA_VERSION)?;
+    let table = current
+        .tables
+        .iter()
+        .find(|table| table.name == "lineage_history_semantic_roots")
+        .ok_or_else(|| {
+            StoreError::Integrity("canonical history index mapping is missing".into())
+        })?;
+    let replaced = [
+        "lineage_history_index_delete",
+        "lineage_history_index_insert",
+        "lineage_history_index_replace",
+        "lineage_history_index_update",
+        "lineage_revision_insert",
+        "lineage_history_indexes_node_idx",
+    ];
+    let mut migration = replacement_table_sql(current, "request_object_refs")?;
+    migration.push_str(&format!(
+        "{}; DROP TABLE lineage_history_indexes;\n",
+        table.sql
+    ));
+    for object in &current.objects {
+        if replaced.contains(&object.name.as_str())
+            || object.name == "lineage_history_semantic_roots_node_idx"
+        {
+            migration.push_str(&object.sql);
+            migration.push_str(";\n");
+        }
+    }
+    replace_lineage_tables(
+        conn,
+        &migration,
+        &["request_object_refs", "lineage_history_indexes"],
+        &replaced,
+    )?;
+    crate::lineage::backfill_history_indexes(conn)
 }
 
 fn replacement_table_sql(shape: &SchemaShape, name: &str) -> Result<String> {
@@ -340,10 +375,12 @@ struct SchemaShape {
 fn lineage_schema_shape(version: i32) -> Result<&'static SchemaShape> {
     static LEGACY: OnceLock<std::result::Result<SchemaShape, String>> = OnceLock::new();
     static V4: OnceLock<std::result::Result<SchemaShape, String>> = OnceLock::new();
+    static V5: OnceLock<std::result::Result<SchemaShape, String>> = OnceLock::new();
     static CURRENT: OnceLock<std::result::Result<SchemaShape, String>> = OnceLock::new();
     let cache = match version {
         3 => &LEGACY,
         4 => &V4,
+        5 => &V5,
         LINEAGE_SCHEMA_VERSION => &CURRENT,
         found => {
             return Err(StoreError::UnsupportedSchema {
@@ -365,6 +402,7 @@ fn load_lineage_schema_shape(version: i32) -> std::result::Result<SchemaShape, S
     let sql = match version {
         3 => LINEAGE_SCHEMA_V3,
         4 => LINEAGE_SCHEMA_V4,
+        5 => LINEAGE_SCHEMA_V5,
         LINEAGE_SCHEMA_VERSION => LINEAGE_SCHEMA,
         found => return Err(format!("unsupported canonical schema version {found}")),
     };
@@ -523,6 +561,28 @@ pub(crate) mod tests {
         conn
     }
 
+    pub(crate) fn v5_connection() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch(LINEAGE_SCHEMA_V5).unwrap();
+        set_user_version(&conn, 5).unwrap();
+        conn.execute(
+            "INSERT INTO store_meta (key, value, updated_at) VALUES ('schema_version', '5', 1)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn historical_connection(version: i32) -> Connection {
+        match version {
+            3 => v3_connection(),
+            4 => v4_connection(),
+            5 => v5_connection(),
+            _ => panic!("unsupported historical schema {version}"),
+        }
+    }
+
     fn current_connection() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
@@ -611,7 +671,7 @@ pub(crate) mod tests {
                 table_name: "lineage_completed_sequence_nodes",
             } => Some("completed_nodes".into()),
             AuthAction::Insert {
-                table_name: "lineage_history_indexes",
+                table_name: "lineage_history_semantic_roots",
             } => Some("history_index".into()),
             AuthAction::Insert {
                 table_name: "store_meta",
@@ -807,6 +867,7 @@ pub(crate) mod tests {
             ObjectCompression::none(),
         )
         .unwrap();
+        lineage::backfill_shared_fixture_indexes(&conn).unwrap();
         let hash = crate::object::put_object(&conn, b"{}", ObjectCompression::none())
             .unwrap()
             .hash()
@@ -853,33 +914,21 @@ pub(crate) mod tests {
         assert_eq!(user_version(&corrupt).unwrap(), 4);
     }
 
-    fn v4_migration_boundaries() -> Vec<String> {
-        [
-            "table:request_object_refs_migration",
-            "drop:request_object_refs",
-            "rename:request_object_refs_migration",
-            "published",
-            "store_meta",
-            "foreign_key_check",
-            "commit",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
-    }
-
     #[test]
-    fn v4_migration_preserves_shared_archives_response_roles_and_external_guards() {
+    fn shared_migration_preserves_archives_response_roles_and_external_guards() {
         use crate::compression::ObjectCompression;
         use crate::lineage::{self, BranchId, LineageId};
         use rusqlite::hooks::{AuthContext, Authorization};
-        for foreign_keys in [false, true] {
-            for stage in v4_migration_boundaries().into_iter().chain([
+        for (version, foreign_keys) in [4, 5]
+            .into_iter()
+            .flat_map(|version| [false, true].map(|keys| (version, keys)))
+        {
+            for stage in shared_migration_boundaries().into_iter().chain([
                 "index:audit role index".into(),
                 "trigger:audit guard".into(),
                 "success".into(),
             ]) {
-                let mut conn = v4_connection();
+                let mut conn = historical_connection(version);
                 let lineage = LineageId::from_hex("1".repeat(32)).unwrap();
                 let branch = BranchId::new("a".repeat(64)).unwrap();
                 lineage::create_lineage(&conn, &lineage, 1).unwrap();
@@ -892,6 +941,7 @@ pub(crate) mod tests {
                     ObjectCompression::none(),
                 )
                 .unwrap();
+                lineage::backfill_shared_fixture_indexes(&conn).unwrap();
                 let hash = crate::object::put_object(&conn, b"{}", ObjectCompression::none())
                     .unwrap()
                     .hash()
@@ -966,7 +1016,7 @@ pub(crate) mod tests {
                 conn.commit_hook(None::<fn() -> bool>).unwrap();
                 if stage != "success" {
                     assert!(result.is_err(), "boundary not reached: {stage}");
-                    assert_eq!(user_version(&conn).unwrap(), 4);
+                    assert_eq!(user_version(&conn).unwrap(), version);
                     assert_eq!(schema_definitions(&conn), definitions);
                     assert_eq!(retained_data(&conn), before);
                     validate_lineage_schema(&conn).unwrap();
@@ -975,7 +1025,7 @@ pub(crate) mod tests {
                     result.unwrap();
                 }
                 assert_eq!(user_version(&conn).unwrap(), LINEAGE_SCHEMA_VERSION);
-                assert_eq!(retained_data(&conn), before);
+                assert_shared_retained_rows(&conn, &before);
                 assert_eq!(
                     conn.pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
                         .unwrap(),
@@ -1006,7 +1056,7 @@ pub(crate) mod tests {
                     );
                 }
                 initialize_lineage_schema(&mut conn).unwrap();
-                assert_eq!(retained_data(&conn), before);
+                assert_shared_retained_rows(&conn, &before);
             }
         }
     }
@@ -1308,22 +1358,17 @@ pub(crate) mod tests {
                 .unwrap()
         }
         let dir = tempfile::tempdir().unwrap();
-        for version in [3, 4] {
-            let boundaries = if version == 3 {
+        for version in [3, 4, 5] {
+            let stages = if version == 3 {
                 migration_boundaries()
             } else {
-                v4_migration_boundaries()
-            };
-            let stages = boundaries
-                .into_iter()
-                .chain(["after_commit".into()])
-                .collect::<Vec<_>>();
+                shared_migration_boundaries()
+            }
+            .into_iter()
+            .chain(["after_commit".into()])
+            .collect::<Vec<_>>();
             for stage in &stages {
-                let mut source = if version == 3 {
-                    v3_connection()
-                } else {
-                    v4_connection()
-                };
+                let mut source = historical_connection(version);
                 let lineage = LineageId::from_hex("1".repeat(32)).unwrap();
                 lineage::create_lineage(&source, &lineage, 1).unwrap();
                 let branch = lineage::BranchId::new("a".repeat(64)).unwrap();
@@ -1349,6 +1394,9 @@ pub(crate) mod tests {
                     ObjectCompression::none(),
                 )
                 .unwrap();
+                if version >= 4 {
+                    lineage::backfill_shared_fixture_indexes(&source).unwrap();
+                }
                 let before_definitions = definitions(&source);
                 let before_objects = objects(&source);
                 let before_data = retained_data(&source);
@@ -1396,7 +1444,11 @@ pub(crate) mod tests {
                     "object drift at v{version}/{stage}"
                 );
                 if stage == "after_commit" {
-                    assert_retained_rows(&conn, &before_data);
+                    if version == 3 {
+                        assert_retained_rows(&conn, &before_data);
+                    } else {
+                        assert_shared_retained_rows(&conn, &before_data);
+                    }
                 } else {
                     assert_eq!(
                         retained_data(&conn),
@@ -1427,7 +1479,11 @@ pub(crate) mod tests {
                 initialize_lineage_schema(&mut conn).unwrap();
                 assert_eq!(user_version(&conn).unwrap(), LINEAGE_SCHEMA_VERSION);
                 assert_eq!(objects(&conn), before_objects);
-                assert_retained_rows(&conn, &before_data);
+                if version == 3 {
+                    assert_retained_rows(&conn, &before_data);
+                } else {
+                    assert_shared_retained_rows(&conn, &before_data);
+                }
                 assert_eq!(
                     lineage::apply_lineage_session_commit(
                         &mut conn,
@@ -1439,7 +1495,11 @@ pub(crate) mod tests {
                     .unwrap(),
                     receipt
                 );
-                assert_retained_rows(&conn, &before_data);
+                if version == 3 {
+                    assert_retained_rows(&conn, &before_data);
+                } else {
+                    assert_shared_retained_rows(&conn, &before_data);
+                }
                 lineage::validate_sequence(&conn, &lineage, &root).unwrap();
                 validate_lineage_schema(&conn).unwrap();
             }
@@ -1629,6 +1689,250 @@ pub(crate) mod tests {
         }
         conn.execute_batch("DELETE FROM lineage_sequence_entries WHERE entry_index = 0")
             .expect_err("completed data sequences must retain immutable entries");
+    }
+
+    pub(crate) fn shared_archived_fixture(
+        version: i32,
+    ) -> (
+        Connection,
+        crate::lineage::LineageId,
+        crate::lineage::BranchId,
+        crate::SessionCommit,
+        crate::SaveReceipt,
+    ) {
+        let mut conn = historical_connection(version);
+        let lineage = crate::lineage::LineageId::from_hex("1".repeat(32)).unwrap();
+        let branch = crate::lineage::BranchId::new("a".repeat(64)).unwrap();
+        crate::lineage::create_lineage(&conn, &lineage, 1).unwrap();
+        let mut command = archived_commit(&branch);
+        command.history.items = vec![
+            protocol::HistoryItem::user(protocol::Content::text("first request")),
+            protocol::HistoryItem::user(protocol::compaction_summary_content("legacy summary")),
+            protocol::HistoryItem::user(protocol::Content::text("second request")),
+        ];
+        command.history.final_len = crate::HistoryLen::new(3);
+        let receipt = crate::lineage::apply_lineage_session_commit(
+            &mut conn,
+            &lineage,
+            &branch,
+            &command,
+            crate::compression::ObjectCompression::None,
+        )
+        .unwrap();
+        crate::lineage::backfill_shared_fixture_indexes(&conn).unwrap();
+        (conn, lineage, branch, command, receipt)
+    }
+
+    fn assert_shared_retained_rows(
+        conn: &Connection,
+        before: &[(String, Vec<Vec<rusqlite::types::Value>>)],
+    ) {
+        let after = retained_data(conn);
+        for (name, rows) in before {
+            if name == "lineage_history_indexes" {
+                continue;
+            }
+            let found = &after.iter().find(|(table, _)| table == name).unwrap().1;
+            if name == "lineage_history_index_nodes" {
+                assert!(
+                    rows.iter().all(|row| found.contains(row)),
+                    "immutable index nodes changed"
+                );
+            } else {
+                assert_eq!(found, rows, "retained rows changed for {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn shared_read_only_counts_and_migration_preserve_canonical_rows_and_receipts() {
+        for (version, foreign_keys) in [4, 5]
+            .into_iter()
+            .flat_map(|version| [false, true].map(|keys| (version, keys)))
+        {
+            let (mut conn, lineage, branch, command, receipt) = shared_archived_fixture(version);
+            let before = retained_data(&conn);
+            let definitions = schema_definitions(&conn);
+            let snapshot =
+                crate::lineage::lineage_session_snapshot(&conn, &lineage, &branch).unwrap();
+            conn.pragma_update(None, "query_only", true).unwrap();
+            validate_lineage_schema(&conn).unwrap();
+            let head = crate::lineage::lineage_session_head(&conn, &lineage, &branch).unwrap();
+            let (count, stats) =
+                crate::lineage::history_user_count(&conn, &lineage, &head.history_root, u64::MAX)
+                    .unwrap();
+            assert_eq!(count, 2);
+            assert_eq!(stats.payloads_read, 3);
+            assert_eq!(retained_data(&conn), before);
+            assert_eq!(schema_definitions(&conn), definitions);
+            conn.pragma_update(None, "query_only", false).unwrap();
+            conn.pragma_update(None, "foreign_keys", foreign_keys)
+                .unwrap();
+            initialize_lineage_schema(&mut conn).unwrap();
+            assert_eq!(user_version(&conn).unwrap(), LINEAGE_SCHEMA_VERSION);
+            assert_shared_retained_rows(&conn, &before);
+            assert_eq!(
+                crate::lineage::lineage_session_snapshot(&conn, &lineage, &branch).unwrap(),
+                snapshot
+            );
+            assert_eq!(
+                crate::lineage::apply_lineage_session_commit(
+                    &mut conn,
+                    &lineage,
+                    &branch,
+                    &command,
+                    crate::compression::ObjectCompression::None
+                )
+                .unwrap(),
+                receipt
+            );
+            let (count, stats) =
+                crate::lineage::history_user_count(&conn, &lineage, &head.history_root, u64::MAX)
+                    .unwrap();
+            assert_eq!(count, 2);
+            assert_eq!(stats.payloads_read, 0);
+            initialize_lineage_schema(&mut conn).unwrap();
+            assert_shared_retained_rows(&conn, &before);
+            assert_eq!(
+                conn.pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
+                    .unwrap(),
+                foreign_keys
+            );
+        }
+    }
+
+    #[test]
+    fn v5_migration_preserves_response_diagnostics_and_receipt_replay() {
+        let (mut conn, lineage, branch, command, receipt) = shared_archived_fixture(5);
+        let hash = crate::object::put_object(
+            &conn,
+            br#"{"error":"synthetic stopped response"}"#,
+            crate::compression::ObjectCompression::None,
+        )
+        .unwrap()
+        .hash()
+        .to_string();
+        conn.execute("INSERT INTO request_attempts (started_at) VALUES (1)", [])
+            .unwrap();
+        let request = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO request_object_refs VALUES (?1, ?2, 'response_diagnostics')",
+            (request, &hash),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO lineage_request_attempts VALUES (?1, ?2, ?3)",
+            (lineage.as_str(), branch.as_str(), request),
+        )
+        .unwrap();
+        let before = retained_data(&conn);
+        let definitions = schema_definitions(&conn);
+        let snapshot = crate::lineage::lineage_session_snapshot(&conn, &lineage, &branch).unwrap();
+        conn.pragma_update(None, "query_only", true).unwrap();
+        validate_lineage_schema(&conn).unwrap();
+        assert_eq!(user_version(&conn).unwrap(), 5);
+        assert_eq!(schema_definitions(&conn), definitions);
+        assert_eq!(retained_data(&conn), before);
+        conn.pragma_update(None, "query_only", false).unwrap();
+        initialize_lineage_schema(&mut conn).unwrap();
+        assert_eq!(user_version(&conn).unwrap(), LINEAGE_SCHEMA_VERSION);
+        assert_shared_retained_rows(&conn, &before);
+        assert_eq!(
+            crate::lineage::lineage_session_snapshot(&conn, &lineage, &branch).unwrap(),
+            snapshot
+        );
+        assert_eq!(
+            crate::lineage::apply_lineage_session_commit(
+                &mut conn,
+                &lineage,
+                &branch,
+                &command,
+                crate::compression::ObjectCompression::None
+            )
+            .unwrap(),
+            receipt
+        );
+        let head = crate::lineage::lineage_session_head(&conn, &lineage, &branch).unwrap();
+        let (count, stats) =
+            crate::lineage::history_user_count(&conn, &lineage, &head.history_root, u64::MAX)
+                .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(stats.payloads_read, 0);
+        assert_shared_retained_rows(&conn, &before);
+    }
+
+    fn shared_migration_boundaries() -> Vec<String> {
+        let legacy = lineage_schema_shape(4).unwrap();
+        let current = lineage_schema_shape(LINEAGE_SCHEMA_VERSION).unwrap();
+        let mut stages = vec![
+            "table:request_object_refs_migration".into(),
+            "drop:request_object_refs".into(),
+            "rename:request_object_refs_migration".into(),
+            "table:lineage_history_semantic_roots".into(),
+            "drop:lineage_history_indexes".into(),
+            "history_index".into(),
+            "published".into(),
+            "store_meta".into(),
+            "foreign_key_check".into(),
+            "commit".into(),
+        ];
+        for object in &current.objects {
+            if object.kind == "trigger" || !legacy.objects.iter().any(|old| old.name == object.name)
+            {
+                stages.push(format!("{}:{}", object.kind, object.name));
+            }
+        }
+        stages
+    }
+
+    #[test]
+    fn shared_migration_errors_restore_exact_schema_data_and_foreign_key_mode() {
+        use rusqlite::hooks::{AuthContext, Authorization};
+        for (version, foreign_keys) in [4, 5]
+            .into_iter()
+            .flat_map(|version| [false, true].map(|keys| (version, keys)))
+        {
+            for stage in shared_migration_boundaries() {
+                let (mut conn, _, _, _, _) = shared_archived_fixture(version);
+                let before = retained_data(&conn);
+                let definitions = schema_definitions(&conn);
+                conn.pragma_update(None, "foreign_keys", foreign_keys)
+                    .unwrap();
+                let boundary = stage.clone();
+                conn.authorizer(Some(move |context: AuthContext<'_>| {
+                    if migration_boundary(context).as_deref() == Some(boundary.as_str()) {
+                        Authorization::Deny
+                    } else {
+                        Authorization::Allow
+                    }
+                }))
+                .unwrap();
+                let deny_commit = stage == "commit";
+                conn.commit_hook(Some(move || deny_commit)).unwrap();
+                assert!(
+                    initialize_lineage_schema(&mut conn).is_err(),
+                    "boundary not reached: {stage}"
+                );
+                conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                    .unwrap();
+                conn.commit_hook(None::<fn() -> bool>).unwrap();
+                assert!(conn.is_autocommit());
+                assert_eq!(user_version(&conn).unwrap(), version);
+                assert_eq!(retained_data(&conn), before, "data drift at {stage}");
+                assert_eq!(
+                    schema_definitions(&conn),
+                    definitions,
+                    "schema drift at {stage}"
+                );
+                assert_eq!(
+                    conn.pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
+                        .unwrap(),
+                    foreign_keys
+                );
+                initialize_lineage_schema(&mut conn).unwrap();
+                assert_shared_retained_rows(&conn, &before);
+            }
+        }
     }
 
     #[test]

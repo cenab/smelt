@@ -634,6 +634,9 @@ impl AgentLuaHost<'_> {
     }
 
     pub(crate) fn cancel_engine_work(&mut self) {
+        if self.app.cancel_session_handoff() {
+            return;
+        }
         if self.app.conversation.turn_pause().is_some() {
             self.app.cancel_turn_work();
         } else if self.app.prompt.queue_is_empty() {
@@ -1491,14 +1494,15 @@ impl SessionLuaHost<'_> {
     }
 
     pub(crate) fn session_info(&mut self) -> Result<SessionInfoSnapshot, String> {
-        let turn_count = self.rewind_turns()?.len();
+        let has_live_session = self.app.conversation.has_live_session();
+        let turn_count = self.app.conversation.history_navigation().user_turn_count();
+        let navigation = self.app.conversation.history_navigation();
         let session = self.app.conversation.session();
         let history_count = self.app.session_history_len();
-        let has_live_session = self.app.conversation.has_live_session();
         let message_count = if has_live_session {
             history_count
         } else {
-            protocol::history_to_messages(&session.history).len()
+            navigation.materialized_message_count(history_count)
         };
         Ok(SessionInfoSnapshot {
             id: session.id.clone(),
@@ -1593,6 +1597,13 @@ impl SessionLuaHost<'_> {
 
     pub(crate) fn model_history_messages(&self) -> Vec<protocol::Message> {
         self.app.model_history_messages()
+    }
+
+    pub(crate) fn rewind_page_request(
+        &self,
+        before: Option<usize>,
+    ) -> crate::app::history::RewindPageRequest {
+        self.app.rewind_page_request(before)
     }
 
     pub(crate) fn rewind_turns(&mut self) -> Result<Vec<crate::app::history::RewindTurn>, String> {

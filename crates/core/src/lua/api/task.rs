@@ -33,7 +33,7 @@ pub(super) fn register(lua: &Lua, smelt: &mlua::Table, shared: &Arc<LuaShared>) 
             move |lua, (id, value): (u64, mlua::Value)| -> LuaResult<()> {
                 let key = lua.create_registry_value(value)?;
                 if let Ok(mut inbox) = s.task_inbox.lock() {
-                    inbox.push(TaskEvent::ExternalResolved {
+                    inbox.push_back(TaskEvent::ExternalResolved {
                         external_id: id,
                         value: key,
                     });

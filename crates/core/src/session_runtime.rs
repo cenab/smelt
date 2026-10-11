@@ -53,19 +53,225 @@ impl LiveStoreReader {
     fn history_any_transcript_visible_before(&self, end: usize) -> smelt_store::Result<bool> {
         self.0.history_any_transcript_visible_before(end as u64)
     }
-
-    fn history_mode_before(&self, end: usize) -> smelt_store::Result<Option<String>> {
-        self.0.history_mode_before(end as u64)
-    }
-
-    fn history_base_mode_range(&self, range: Range<usize>) -> smelt_store::Result<Option<String>> {
-        self.0
-            .history_base_mode_range(range.start as u64..range.end as u64)
-    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct LiveSideTables;
+
+/// A lightweight navigation row, maintained when history changes.
+#[derive(Clone, Debug)]
+pub struct HistoryUserTurn {
+    pub history_idx: usize,
+    pub label: String,
+    ordinal: usize,
+}
+
+pub const REWIND_LABEL_BYTES: usize = 512;
+
+pub fn rewind_label(item: &HistoryItem) -> Option<String> {
+    let HistoryItem::User {
+        content, display, ..
+    } = item
+    else {
+        return None;
+    };
+    if !matches!(
+        protocol::classify_user_history_content(content),
+        protocol::UserHistoryContent::Plain
+    ) {
+        return None;
+    }
+    let text = display
+        .as_deref()
+        .map(std::borrow::Cow::Borrowed)
+        .unwrap_or_else(|| content.text_content());
+    let first_line = smelt_buffer::text::slice(&text, 0..REWIND_LABEL_BYTES)
+        .lines()
+        .next()
+        .unwrap_or("");
+    let images = content.image_labels();
+    let label = if images.is_empty() || text.contains('\n') {
+        first_line.to_owned()
+    } else if first_line.is_empty() {
+        images.join(" ")
+    } else {
+        format!("{first_line} {}", images.join(" "))
+    };
+    Some(smelt_buffer::text::slice(&label, 0..REWIND_LABEL_BYTES).to_owned())
+}
+
+/// Mode preparation separates live lookup from the indexed stored reads it needs.
+#[derive(Clone, Debug)]
+pub enum EffectiveModePlan {
+    Ready(String),
+    Stored {
+        before: usize,
+        base_range: Range<usize>,
+        fallback: String,
+    },
+}
+
+impl EffectiveModePlan {
+    pub fn resolve(self, reader: &smelt_store::LineageSessionReader) -> Result<String, String> {
+        match self {
+            Self::Ready(mode) => Ok(mode),
+            Self::Stored {
+                before,
+                base_range,
+                fallback,
+            } => {
+                if before > 0 {
+                    if let Some(mode) = reader
+                        .history_mode_before(before as u64)
+                        .map_err(|error| format!("read session history mode: {error}"))?
+                    {
+                        return Ok(mode);
+                    }
+                }
+                if !base_range.is_empty() {
+                    if let Some(mode) = reader
+                        .history_base_mode_range(base_range.start as u64..base_range.end as u64)
+                        .map_err(|error| format!("read session history base mode: {error}"))?
+                    {
+                        return Ok(mode);
+                    }
+                }
+                Ok(fallback)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HistoryNavigation {
+    stored_user_count: usize,
+    users: std::collections::BTreeMap<usize, HistoryUserTurn>,
+    extra_message_totals: std::collections::BTreeMap<usize, usize>,
+    modes: std::collections::BTreeMap<usize, String>,
+    base_modes: std::collections::BTreeMap<usize, String>,
+}
+
+impl HistoryNavigation {
+    pub fn from_history(history: &[HistoryItem]) -> Self {
+        let mut index = Self::default();
+        for (coordinate, item) in history.iter().enumerate() {
+            index.append(coordinate, item);
+        }
+        index
+    }
+
+    pub fn user_turn_count(&self) -> usize {
+        self.stored_user_count + self.users.len()
+    }
+
+    /// Exact count for a boundary covered by this navigation index.
+    pub fn user_turn_count_before(&self, end: usize) -> usize {
+        self.users
+            .range(..end)
+            .next_back()
+            .map_or(self.stored_user_count, |(_, turn)| turn.ordinal)
+    }
+
+    /// Exact provider-message count for a navigation index covering materialized history.
+    pub fn materialized_message_count(&self, history_len: usize) -> usize {
+        history_len.saturating_add(
+            self.extra_message_totals
+                .last_key_value()
+                .map_or(0, |(_, count)| *count),
+        )
+    }
+
+    pub fn append(&mut self, coordinate: usize, item: &HistoryItem) {
+        let extra_messages = history_item_message_count(item).saturating_sub(1);
+        if extra_messages > 0 {
+            let total = self
+                .extra_message_totals
+                .last_key_value()
+                .map_or(0, |(_, count)| *count);
+            self.extra_message_totals
+                .insert(coordinate, total.saturating_add(extra_messages));
+        }
+        if let Some(label) = rewind_label(item) {
+            debug_assert!(self
+                .users
+                .last_key_value()
+                .is_none_or(|(last, _)| *last < coordinate));
+            let ordinal = self.user_turn_count() + 1;
+            self.users.insert(
+                coordinate,
+                HistoryUserTurn {
+                    history_idx: coordinate,
+                    label,
+                    ordinal,
+                },
+            );
+        }
+        if let Some(note) = item.as_note() {
+            if let Some(mode) = note.mode() {
+                self.modes.insert(coordinate, mode.to_owned());
+            }
+            if let Some(mode) = note.base_mode() {
+                self.base_modes.insert(coordinate, mode.to_owned());
+            }
+        }
+    }
+
+    pub fn truncate(&mut self, end: usize) {
+        self.users.split_off(&end);
+        self.extra_message_totals.split_off(&end);
+        self.modes.split_off(&end);
+        self.base_modes.split_off(&end);
+    }
+
+    fn compact(&mut self, start: usize) {
+        self.stored_user_count = self.user_turn_count_before(start);
+        self.users = self.users.split_off(&start);
+        self.extra_message_totals = self.extra_message_totals.split_off(&start);
+        self.modes = self.modes.split_off(&start);
+        self.base_modes = self.base_modes.split_off(&start);
+    }
+
+    pub fn user_turns_before(
+        &self,
+        before: usize,
+        limit: usize,
+    ) -> impl Iterator<Item = &HistoryUserTurn> {
+        self.users
+            .range(..before)
+            .rev()
+            .map(|(_, turn)| turn)
+            .take(limit)
+            .inspect(|_| smelt_perf::perf::record_value("session:navigation:user_rows", 1))
+    }
+
+    pub fn effective_mode_plan(
+        &self,
+        end: usize,
+        stored_end: usize,
+        fallback: &str,
+    ) -> EffectiveModePlan {
+        if let Some((_, mode)) = self.modes.range(..end).next_back() {
+            return EffectiveModePlan::Ready(mode.clone());
+        }
+        let fallback = self
+            .base_modes
+            .range(end..)
+            .next()
+            .map_or(fallback, |(_, mode)| mode)
+            .to_owned();
+        let before = end.min(stored_end);
+        let base_range = end.min(stored_end)..stored_end;
+        if before == 0 && base_range.is_empty() {
+            EffectiveModePlan::Ready(fallback)
+        } else {
+            EffectiveModePlan::Stored {
+                before,
+                base_range,
+                fallback,
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct LiveSession {
@@ -73,22 +279,28 @@ pub struct LiveSession {
     pub artifact_dir: PathBuf,
     pub store_address: Option<SessionStoreAddress>,
     pub live_start: usize,
-    pub live_history: Vec<HistoryItem>,
+    live_history: Vec<HistoryItem>,
+    navigation: HistoryNavigation,
     pub side_tables: LiveSideTables,
 }
 
 impl LiveSession {
-    pub fn from_store(header: SessionHeader, store: SessionStoreAddress) -> Self {
+    pub fn from_store(
+        header: SessionHeader,
+        store: SessionStoreAddress,
+        user_turn_count: usize,
+    ) -> Self {
         let artifact_dir =
             smelt_store::SessionStoreLayout::from_sessions_root(&store.sessions_root)
                 .session_artifact_dir(&store.session_id);
-        Self::from_parts(header, artifact_dir, Some(store))
+        Self::from_parts(header, artifact_dir, Some(store), user_turn_count)
     }
 
     pub fn from_parts(
         header: SessionHeader,
         artifact_dir: PathBuf,
         store_address: Option<SessionStoreAddress>,
+        user_turn_count: usize,
     ) -> Self {
         let live_start = header.history_len;
         Self {
@@ -97,6 +309,10 @@ impl LiveSession {
             store_address,
             live_start,
             live_history: Vec::new(),
+            navigation: HistoryNavigation {
+                stored_user_count: user_turn_count,
+                ..Default::default()
+            },
             side_tables: LiveSideTables,
         }
     }
@@ -121,27 +337,64 @@ impl LiveSession {
         self.live_history.len()
     }
 
-    pub fn live_suffix_bytes(&self) -> usize {
-        history_json_bytes(&self.live_history)
-    }
-
     pub fn append_history(&mut self, item: HistoryItem) -> usize {
         let idx = self.history_len();
         if self.live_history.is_empty() {
             self.live_start = idx;
         }
+        self.navigation.append(idx, &item);
         self.live_history.push(item);
         idx
     }
 
-    pub fn truncate_from(&mut self, index: usize) {
+    pub fn live_history(&self) -> &[HistoryItem] {
+        &self.live_history
+    }
+
+    pub fn navigation(&self) -> &HistoryNavigation {
+        &self.navigation
+    }
+
+    /// A count covered by live navigation needs no storage preparation.
+    pub fn local_user_turn_count_before(&self, end: usize) -> Option<usize> {
+        if end == 0 {
+            return Some(0);
+        }
+        (end >= self.live_start).then(|| {
+            self.navigation
+                .user_turn_count_before(end.min(self.history_len()))
+        })
+    }
+
+    /// Explicit synchronous mutations use a bounded stored lookup when the prefix is cold.
+    pub fn user_turn_count_before(&self, end: usize) -> Result<usize, String> {
+        if let Some(count) = self.local_user_turn_count_before(end) {
+            return Ok(count);
+        }
+        let count = self
+            .open_store()?
+            .0
+            .history_user_turn_count_before(end as u64)
+            .map_err(|error| format!("read session user count: {error}"))?;
+        usize::try_from(count).map_err(|_| "session user count exceeds platform limits".into())
+    }
+
+    /// Stored-prefix truncation requires its count prepared before any mutation.
+    pub fn truncate_from(&mut self, index: usize, user_turn_count: Option<usize>) {
         let index = index.min(self.history_len());
+        let count = self
+            .local_user_turn_count_before(index)
+            .or(user_turn_count)
+            .expect("stored truncation requires a prepared user count");
+        self.navigation.truncate(index);
         if index >= self.live_start {
             self.live_history.truncate(index - self.live_start);
         } else {
+            self.navigation.stored_user_count = count;
             self.live_start = index;
             self.live_history.clear();
         }
+        debug_assert_eq!(self.navigation.user_turn_count(), count);
     }
 
     pub fn compact_saved_prefix(
@@ -151,15 +404,11 @@ impl LiveSession {
         checkpoint: Option<&ContextCheckpoint>,
     ) {
         let saved_history_len = saved_history_len.min(self.history_len());
-        if saved_history_len <= self.live_start {
-            self.live_start = saved_history_len;
-            self.live_history.clear();
-            self.header.history_len = saved_history_len;
-            self.header.revision = revision;
-            self.header.meta.history_len = Some(saved_history_len);
-            self.header.meta.checkpoint = checkpoint.cloned();
-            return;
-        }
+        assert!(
+            saved_history_len >= self.live_start,
+            "compaction must not retreat behind the stored prefix"
+        );
+        self.navigation.compact(saved_history_len);
         let drop_count = saved_history_len - self.live_start;
         if drop_count >= self.live_history.len() {
             self.live_history.clear();
@@ -316,53 +565,23 @@ impl LiveSession {
             .any(HistoryItem::is_transcript_visible))
     }
 
+    pub fn effective_mode_plan(&self, hist_idx: usize, fallback: &str) -> EffectiveModePlan {
+        self.navigation.effective_mode_plan(
+            hist_idx.min(self.history_len()),
+            self.live_start,
+            fallback,
+        )
+    }
+
     pub fn effective_mode_at(&self, hist_idx: usize, fallback: &str) -> Result<String, String> {
-        let end = hist_idx.min(self.history_len());
-        let live_end = end.saturating_sub(self.live_start);
-        if let Some(mode) = self.live_history[..live_end]
-            .iter()
-            .rev()
-            .filter_map(HistoryItem::as_note)
-            .find_map(protocol::HistoryNote::mode)
-        {
-            return Ok(mode.to_string());
+        match self.effective_mode_plan(hist_idx, fallback) {
+            EffectiveModePlan::Ready(mode) => Ok(mode),
+            plan => self
+                .open_store()?
+                .0
+                .read_snapshot(|reader| plan.resolve(reader))
+                .map_err(|error| format!("read session mode snapshot: {error}"))?,
         }
-
-        let db = (self.live_start > 0)
-            .then(|| self.open_store())
-            .transpose()?;
-        let stored_end = end.min(self.live_start);
-        if stored_end > 0 {
-            let mode = db
-                .as_ref()
-                .expect("stored history has a database")
-                .history_mode_before(stored_end)
-                .map_err(|err| format!("read session history mode: {err}"))?;
-            if let Some(mode) = mode {
-                return Ok(mode);
-            }
-        }
-
-        if end < self.live_start {
-            let base_mode = db
-                .as_ref()
-                .expect("stored history has a database")
-                .history_base_mode_range(end..self.live_start)
-                .map_err(|err| format!("read session history base mode: {err}"))?;
-            if let Some(base_mode) = base_mode {
-                return Ok(base_mode);
-            }
-        }
-        let live_start = end.saturating_sub(self.live_start);
-        if let Some(base_mode) = self.live_history[live_start..]
-            .iter()
-            .filter_map(HistoryItem::as_note)
-            .find_map(protocol::HistoryNote::base_mode)
-        {
-            return Ok(base_mode.to_string());
-        }
-
-        Ok(fallback.to_string())
     }
 
     pub fn model_history_source(
@@ -540,19 +759,76 @@ pub fn bounded_history_tail(
     Ok(items[selection.start..].to_vec())
 }
 
-fn history_json_bytes(items: &[HistoryItem]) -> usize {
-    items
-        .iter()
-        .map(|item| serde_json::to_vec(item).map_or(0, |json| json.len()))
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use protocol::HistoryAppendPlan;
 
     const SESSION_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn navigation_counts_follow_message_projection_and_suffix_replacement() {
+        let tool_step = HistoryItem::Assistant(protocol::AssistantStep {
+            content: None,
+            reasoning: None,
+            reasoning_blocks: Vec::new(),
+            invocations: (0..3)
+                .map(|index| protocol::ToolInvocation {
+                    call_id: index.to_string(),
+                    name: "test".into(),
+                    arguments: "{}".into(),
+                    result: protocol::ToolOutcome::new("result".into(), false, None),
+                    elapsed_ms: None,
+                    called_at_ms: None,
+                })
+                .collect(),
+        });
+        let history = [
+            HistoryItem::System {
+                content: protocol::Content::text("system"),
+            },
+            HistoryItem::user(protocol::Content::text("user")),
+            tool_step.clone(),
+            HistoryItem::Note(protocol::HistoryNote::context("context")),
+            HistoryItem::Assistant(protocol::AssistantStep::terminal(
+                Some(protocol::Content::text("answer")),
+                None,
+                Vec::new(),
+            )),
+            HistoryItem::user(protocol::compaction_summary_content("summary")),
+            HistoryItem::user(protocol::Content::text("follow-up")),
+        ];
+        let mut navigation = HistoryNavigation::default();
+        for (index, item) in history.iter().enumerate() {
+            navigation.append(index, item);
+            assert_eq!(
+                navigation.materialized_message_count(index + 1),
+                protocol::history_to_messages(&history[..=index]).len()
+            );
+            assert_eq!(
+                navigation.user_turn_count(),
+                history[..=index].iter().filter_map(rewind_label).count()
+            );
+        }
+        for end in 0..=history.len() {
+            let mut retained = navigation.clone();
+            retained.truncate(end);
+            assert_eq!(
+                retained.materialized_message_count(end),
+                protocol::history_to_messages(&history[..end]).len()
+            );
+            assert_eq!(
+                retained.user_turn_count(),
+                history[..end].iter().filter_map(rewind_label).count()
+            );
+        }
+        navigation.truncate(2);
+        navigation.append(2, &tool_step);
+        assert_eq!(navigation.materialized_message_count(3), 6);
+        navigation.truncate(2);
+        navigation.append(2, &history[4]);
+        assert_eq!(navigation.materialized_message_count(3), 3);
+    }
 
     fn seed_store(
         root: &std::path::Path,
@@ -661,8 +937,13 @@ mod tests {
         let mut live = LiveSession::from_store(
             header,
             SessionStoreAddress::new(dir.path().to_path_buf(), SESSION_ID.into(), lineage_id),
+            2,
         );
+        assert_eq!(live.navigation().user_turn_count(), 2);
+        assert_eq!(live.local_user_turn_count_before(1), None);
+        assert_eq!(live.user_turn_count_before(1).unwrap(), 1);
         live.append_history(HistoryItem::user(protocol::Content::text("three")));
+        assert_eq!(live.navigation().user_turn_count(), 3);
 
         let rows = live.history_range(1..3).expect("range");
         assert_eq!(rows.len(), 2);
@@ -717,6 +998,33 @@ mod tests {
                 ..
             } if suffix.is_empty()
         ));
+
+        // A metadata-only publication preserves both the stored count and newer live rows.
+        live.compact_saved_prefix(2, 2, None);
+        assert_eq!(live.live_suffix_len(), 1);
+        assert_eq!(live.navigation().user_turn_count(), 3);
+        live.append_history(HistoryItem::user(protocol::compaction_summary_content(
+            "summary",
+        )));
+        live.append_history(HistoryItem::user(protocol::Content::text("four")));
+        assert_eq!(live.navigation().user_turn_count(), 4);
+        assert_eq!(live.local_user_turn_count_before(4), Some(3));
+        live.compact_saved_prefix(4, 3, None);
+        assert_eq!(live.live_suffix_len(), 1);
+        assert_eq!(live.navigation().user_turn_count(), 4);
+        live.truncate_from(4, None);
+        assert_eq!(live.navigation().user_turn_count(), 3);
+        live.append_history(HistoryItem::user(protocol::Content::text("replacement")));
+        assert_eq!(live.navigation().user_turn_count(), 4);
+        live.truncate_from(1, Some(1));
+        assert_eq!(live.navigation().user_turn_count(), 1);
+        live.append_history(HistoryItem::user(protocol::Content::text("new branch")));
+        assert_eq!(live.navigation().user_turn_count(), 2);
+        live.compact_saved_prefix(2, 4, None);
+        live.compact_saved_prefix(2, 5, None);
+        assert_eq!(live.navigation().user_turn_count(), 2);
+        live.truncate_from(0, None);
+        assert_eq!(live.navigation().user_turn_count(), 0);
     }
 
     #[test]
@@ -758,6 +1066,7 @@ mod tests {
         let live = LiveSession::from_store(
             header,
             SessionStoreAddress::new(dir.path().to_path_buf(), SESSION_ID.into(), lineage_id),
+            2,
         );
 
         assert!(live.any_transcript_visible_before(2).unwrap());
@@ -806,6 +1115,7 @@ mod tests {
         let mut live = LiveSession::from_store(
             header,
             SessionStoreAddress::new(dir.path().to_path_buf(), SESSION_ID.into(), lineage_id),
+            130,
         );
 
         let duplicate_context = protocol::HistoryAppend::set_context(

@@ -643,6 +643,7 @@ pub(crate) fn deserialize_history_items(
     conn: &Connection,
     bytes: Vec<Vec<u8>>,
 ) -> Result<Vec<protocol::HistoryItem>> {
+    smelt_perf::perf::record_value("store:history:decoded_rows", bytes.len() as u64);
     bytes
         .into_iter()
         .map(|bytes| {
@@ -690,6 +691,7 @@ pub(crate) fn lineage_history_tail(
             break;
         }
         crate::history::rehydrate_object_refs(conn, &mut value)?;
+        smelt_perf::perf::record_value("store:history:decoded_rows", 1);
         let item = serde_json::from_value(value)?;
         if !budget.try_prepend(&item)? {
             break;

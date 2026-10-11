@@ -1,43 +1,67 @@
--- Built-in /rewind command. Picks a past user turn and rewinds the transcript to it.
+-- Built-in /rewind command. Reads bounded pages from the transcript index.
 
 smelt.cmd.register("rewind", function(args)
-  local turns = smelt.session.turns()
-  if #turns == 0 then
-    smelt.notify.error("nothing to rewind")
-    return
+  local restore_vim_insert = (args or ""):find("insert", 1, true) ~= nil or (smelt.vim.mode() == "insert")
+  local quiet = (args or ""):find("quiet", 1, true) ~= nil
+  local session = smelt.session.id()
+  local epoch = smelt.signal.get("history_epoch")
+  local guard = smelt.work.guard()
+
+  local function current()
+    return session == smelt.session.id()
+      and epoch == smelt.signal.get("history_epoch")
+      and smelt.work.guard_current(guard)
   end
 
-  -- "insert" arg forces vim Insert restoration after rewind (used by the Esc-Esc keymap).
-  local restore_vim_insert = (args == "insert") or (smelt.vim.mode() == "insert")
-
   smelt.spawn(function()
-    local items = {}
-    for _, t in ipairs(turns) do table.insert(items, t.label or "") end
-    table.insert(items, "(current)")
+    local cursors = {}
+    local before = nil
+    while current() do
+      local busy = smelt.work.busy("loading rewind turns")
+      local ok, page = pcall(smelt.session.turns_page, before)
+      busy:remove()
+      if not current() then return end
+      if not ok then smelt.notify.error(tostring(page)); return end
+      local turns = page.turns
+      if #turns == 0 then
+        if not quiet then smelt.notify.error("nothing to rewind") end
+        return
+      end
 
-    local options_leaf = smelt.dialog.menu(items, {
-      selected = #items,
-      wrap     = true,
-      -- The list often runs longer than nine items and rewinding is
-      -- destructive, so digits only move the cursor - Enter confirms.
-      shortcuts = "select",
-    })
+      local items, actions = {}, {}
+      local function add(label, action)
+        items[#items + 1] = label
+        actions[#actions + 1] = action
+      end
+      if page.next_before then add("(older turns)", "older") end
+      for _, turn in ipairs(turns) do add(turn.label or "", turn.history_idx) end
+      if #cursors > 0 then add("(newer turns)", "newer") end
+      add("(current)", "current")
 
-    local picked = smelt.dialog.open({
-      title      = "rewind",
-      max_height = "100%",
-      min_height = 0,
-      panels     = { { leaf = options_leaf } },
-    })
-
-    if not picked or not picked.index then return end
-
-    if picked.index > #turns then
-      if restore_vim_insert then smelt.vim.set_mode("insert") end
-      return
+      local leaf = smelt.dialog.menu(items, {
+        selected = #items,
+        wrap = true,
+        -- Digits only move the cursor. Enter confirms a destructive rewind.
+        shortcuts = "select",
+      })
+      local picked = smelt.dialog.open({
+        title = "rewind", max_height = "100%", min_height = 0,
+        panels = { { leaf = leaf } },
+      })
+      if not picked or not picked.index or not current() then return end
+      local action = actions[picked.index]
+      if action == "older" then
+        cursors[#cursors + 1] = before or false
+        before = page.next_before
+      elseif action == "newer" then
+        before = table.remove(cursors) or nil
+      elseif action == "current" then
+        if restore_vim_insert then smelt.vim.set_mode("insert") end
+        return
+      else
+        smelt.session.rewind_to(action, { restore_vim_insert = restore_vim_insert })
+        return
+      end
     end
-
-    local history_idx = turns[picked.index].history_idx
-    smelt.session.rewind_to(history_idx, { restore_vim_insert = restore_vim_insert })
   end)
 end, { desc = "rewind to a previous turn" })

@@ -152,7 +152,7 @@ CREATE TABLE lineage_history_index_nodes (
         REFERENCES lineage_history_index_nodes(lineage_id, node_id)
 ) STRICT;
 
-CREATE TABLE lineage_history_indexes (
+CREATE TABLE lineage_history_semantic_roots (
     lineage_id TEXT NOT NULL,
     history_root_id TEXT NOT NULL,
     index_node_id TEXT,
@@ -583,8 +583,8 @@ CREATE INDEX lineage_history_index_left_idx
 CREATE INDEX lineage_history_index_right_idx
     ON lineage_history_index_nodes(lineage_id, right_node_id);
 
-CREATE INDEX lineage_history_indexes_node_idx
-    ON lineage_history_indexes(lineage_id, index_node_id);
+CREATE INDEX lineage_history_semantic_roots_node_idx
+    ON lineage_history_semantic_roots(lineage_id, index_node_id);
 
 CREATE INDEX lineage_payload_nested_objects_global_idx
     ON lineage_payload_nested_object_refs(object_hash);
@@ -851,13 +851,13 @@ BEGIN
 END;
 
 CREATE TRIGGER lineage_history_index_delete
-BEFORE DELETE ON lineage_history_indexes
+BEFORE DELETE ON lineage_history_semantic_roots
 BEGIN
     SELECT RAISE(ABORT, 'history semantic indexes are immutable');
 END;
 
 CREATE TRIGGER lineage_history_index_insert
-BEFORE INSERT ON lineage_history_indexes
+BEFORE INSERT ON lineage_history_semantic_roots
 BEGIN
     SELECT CASE WHEN NOT EXISTS (
         SELECT 1 FROM lineage_sequence_roots
@@ -913,9 +913,9 @@ BEGIN
 END;
 
 CREATE TRIGGER lineage_history_index_replace
-BEFORE INSERT ON lineage_history_indexes
+BEFORE INSERT ON lineage_history_semantic_roots
 WHEN EXISTS (
-    SELECT 1 FROM lineage_history_indexes
+    SELECT 1 FROM lineage_history_semantic_roots
     WHERE lineage_id = NEW.lineage_id AND history_root_id = NEW.history_root_id
 )
 BEGIN
@@ -923,7 +923,7 @@ BEGIN
 END;
 
 CREATE TRIGGER lineage_history_index_update
-BEFORE UPDATE ON lineage_history_indexes
+BEFORE UPDATE ON lineage_history_semantic_roots
 BEGIN
     SELECT RAISE(ABORT, 'history semantic indexes are immutable');
 END;
@@ -954,6 +954,10 @@ BEGIN
         WHERE root.lineage_id = NEW.lineage_id AND root.root_id = NEW.history_root_id
           AND root.root_kind = 'history' AND root.item_count = NEW.history_len
     ) THEN RAISE(ABORT, 'revision history root does not match history length') END;
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM lineage_history_semantic_roots
+        WHERE lineage_id = NEW.lineage_id AND history_root_id = NEW.history_root_id
+    ) THEN RAISE(ABORT, 'revision requires a completed history semantic index') END;
     SELECT CASE WHEN NOT EXISTS (
         SELECT 1 FROM lineage_sequence_roots root
         WHERE root.lineage_id = NEW.lineage_id AND root.root_id = NEW.transcript_root_id

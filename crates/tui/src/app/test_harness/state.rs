@@ -64,6 +64,29 @@ impl TestApp {
         );
     }
 
+    /// Wait explicitly for a dialog whose contents are loaded by a Lua worker.
+    pub fn wait_for_lua_dialog(&mut self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self.state().active_modal.is_none() {
+            self.feed_one(SourceEvent::LuaWakeup);
+            assert!(std::time::Instant::now() < deadline, "Lua dialog timed out");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Settle a selected stored rewind without making key dispatch wait for it.
+    pub fn wait_for_rewind(&mut self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self.app.pending_rewind.is_some() {
+            if let Some(event) = self.app.platform.try_recv_app_event() {
+                self.app.handle_app_event(event);
+                self.app.pump_lua();
+            }
+            assert!(std::time::Instant::now() < deadline, "rewind timed out");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     pub(crate) fn wait_for_turn_persistence_until(&mut self, deadline: std::time::Instant) {
         loop {
             self.app.drain_persist_reports();
@@ -1210,7 +1233,8 @@ impl TestApp {
     ) {
         self.app
             .conversation
-            .rewind_history(index, truncate, identity);
+            .rewind_history(index, truncate, identity)
+            .expect("prepare harness rewind count");
     }
 
     pub(crate) fn push_cmdline_history(

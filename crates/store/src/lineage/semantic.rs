@@ -7,13 +7,13 @@ type Key = [u8; 40];
 const KEY_BITS: u16 = 320;
 const HISTORY_CHUNK_ITEMS: u64 = 256;
 
-// Stored history can contain externalized image URLs and metadata. Only notes
-// need typed decoding for semantic indexing; other variants skip their content.
+// Decode user text for legacy-summary classification and note semantic fields.
+// Externalized image URLs remain references; semantic indexing never hydrates images.
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SemanticHistoryItem {
     System,
-    User,
+    User { content: protocol::Content },
     Assistant,
     Note(protocol::HistoryNote),
 }
@@ -24,6 +24,13 @@ impl SemanticHistoryItem {
             Self::Note(note) => Some(note),
             _ => None,
         }
+    }
+
+    fn is_user_turn(&self) -> bool {
+        matches!(self, Self::User { content } if matches!(
+            protocol::classify_user_history_content(content),
+            protocol::UserHistoryContent::Plain
+        ))
     }
 
     fn is_transcript_visible(&self) -> bool {
@@ -40,6 +47,7 @@ pub(crate) enum HistorySemantic<'a> {
     Mode,
     BaseMode,
     Visible,
+    User,
 }
 
 impl HistorySemantic<'_> {
@@ -53,6 +61,7 @@ impl HistorySemantic<'_> {
             Self::Mode => encoder.str("mode"),
             Self::BaseMode => encoder.str("base-mode"),
             Self::Visible => encoder.str("visible"),
+            Self::User => encoder.str("user-turn"),
         }
         let mut key = [0; 40];
         key[..32].copy_from_slice(&Sha256::digest(&encoder.bytes));
@@ -449,7 +458,7 @@ fn index_root(
 ) -> Result<Option<Option<String>>> {
     Ok(conn
         .prepare_cached(
-            "SELECT index_node_id FROM lineage_history_indexes WHERE lineage_id = ?1 AND history_root_id = ?2",
+            "SELECT index_node_id FROM lineage_history_semantic_roots WHERE lineage_id = ?1 AND history_root_id = ?2",
         )?
         .query_row((lineage.as_str(), root.as_str()), |row| row.get(0))
         .optional()?)
@@ -487,6 +496,7 @@ pub(crate) fn ensure_history_index(
              DELETE FROM smelt_new_history_keys;"
         )?;
     }
+    let mut user_count = user_count_in_index(conn, lineage, index.clone(), start, &mut stats)?;
     let mut cursor = start;
     while cursor < root.item_count {
         let end = cursor
@@ -498,6 +508,14 @@ pub(crate) fn ensure_history_index(
         for bytes in items {
             let item: SemanticHistoryItem = serde_json::from_slice(&bytes)?;
             let note = item.as_note();
+            let ordinal = if item.is_user_turn() {
+                user_count = user_count
+                    .checked_add(1)
+                    .ok_or_else(|| StoreError::Integrity("history user count overflow".into()))?;
+                Some(user_count.to_string())
+            } else {
+                None
+            };
             let keys = [
                 note.and_then(protocol::HistoryNote::context_name)
                     .map(|name| (HistorySemantic::Context(name), name)),
@@ -507,6 +525,9 @@ pub(crate) fn ensure_history_index(
                     .map(|mode| (HistorySemantic::BaseMode, mode)),
                 item.is_transcript_visible()
                     .then_some((HistorySemantic::Visible, "")),
+                ordinal
+                    .as_deref()
+                    .map(|value| (HistorySemantic::User, value)),
             ];
             for (semantic, value) in keys.into_iter().flatten() {
                 conn.prepare_cached(
@@ -533,7 +554,7 @@ pub(crate) fn ensure_history_index(
         };
     }
     conn.execute(
-        "INSERT INTO lineage_history_indexes (lineage_id, history_root_id, index_node_id) VALUES (?1, ?2, ?3)",
+        "INSERT INTO lineage_history_semantic_roots (lineage_id, history_root_id, index_node_id) VALUES (?1, ?2, ?3)",
         rusqlite::params![lineage.as_str(), root.id.as_str(), index.as_ref().map(|node| node.id.as_str())],
     )?;
     stats.roots_written += 1;
@@ -614,6 +635,95 @@ fn find_key(
     Ok(None)
 }
 
+fn user_count_in_index(
+    conn: &Connection,
+    lineage: &LineageId,
+    index: Option<IndexNode>,
+    end: u64,
+    stats: &mut OperationStats,
+) -> Result<u64> {
+    if end == 0 {
+        return Ok(0);
+    }
+    let Some(index) = index else { return Ok(0) };
+    let Some(node) = find_key(
+        conn,
+        lineage,
+        index,
+        &HistorySemantic::User.key(0),
+        &HistorySemantic::User.key(end - 1),
+        true,
+        stats,
+    )?
+    else {
+        return Ok(0);
+    };
+    let value = node.value.as_deref().unwrap();
+    let count = value
+        .parse::<u64>()
+        .map_err(|_| StoreError::Integrity("invalid history user ordinal".into()))?;
+    if count == 0 || count > position(&node.min).saturating_add(1) || count.to_string() != value {
+        return Err(StoreError::Integrity(
+            "invalid history user ordinal bounds or encoding".into(),
+        ));
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+pub(crate) fn history_user_count(
+    conn: &Connection,
+    lineage: &LineageId,
+    root: &SequenceRoot,
+    end: u64,
+) -> Result<(u64, OperationStats)> {
+    history_user_count_cancellable(conn, lineage, root, end, &|| false)
+}
+
+pub(crate) fn history_user_count_cancellable(
+    conn: &Connection,
+    lineage: &LineageId,
+    root: &SequenceRoot,
+    end: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(u64, OperationStats)> {
+    if cancelled() {
+        return Err(StoreError::Cancelled);
+    }
+    let end = end.min(root.item_count);
+    let mut stats = OperationStats::default();
+    if end == 0 {
+        return Ok((0, stats));
+    }
+    // COMPAT(lineage-schema-v4): old read-only layouts have no authoritative ordinals.
+    if matches!(crate::schema::user_version(conn)?, 3 | 4 | 5) {
+        let mut count = 0;
+        let mut start = 0;
+        while start < end {
+            if cancelled() {
+                return Err(StoreError::Cancelled);
+            }
+            let stop = start.saturating_add(HISTORY_CHUNK_ITEMS).min(end);
+            let (items, read_stats) = sequence_range(conn, lineage, root, start, stop)?;
+            stats.nodes_read += read_stats.nodes_read;
+            stats.payloads_read += read_stats.payloads_read;
+            for bytes in items {
+                let item: SemanticHistoryItem = serde_json::from_slice(&bytes)?;
+                count += u64::from(item.is_user_turn());
+            }
+            start = stop;
+        }
+        return Ok((count, stats));
+    }
+    let id = index_root(conn, lineage, &root.id)?
+        .ok_or_else(|| StoreError::Integrity("history semantic index is missing".into()))?;
+    let index = id
+        .map(|id| load_index_node(conn, lineage, &id, &mut stats))
+        .transpose()?;
+    let count = user_count_in_index(conn, lineage, index, end, &mut stats)?;
+    Ok((count, stats))
+}
+
 pub(crate) fn history_semantic_range(
     conn: &Connection,
     lineage: &LineageId,
@@ -655,6 +765,11 @@ pub(crate) fn history_semantic_range(
                         item.as_note().and_then(protocol::HistoryNote::base_mode)
                     }
                     HistorySemantic::Visible => item.is_transcript_visible().then_some(""),
+                    HistorySemantic::User => {
+                        return Err(StoreError::Integrity(
+                            "legacy index has no user ordinals".into(),
+                        ))
+                    }
                 };
                 if let Some(value) = value.filter(|_| last || found.is_none()) {
                     found = Some((start + offset as u64, value.to_owned()));
@@ -669,8 +784,13 @@ pub(crate) fn history_semantic_range(
             }
         }
     }
-    let id = index_root(conn, lineage, &root.id)?
-        .ok_or_else(|| StoreError::Integrity("history semantic index is missing".into()))?;
+    // COMPAT(lineage-schema-v4): preserve the original semantic mapping for read-only reads.
+    let id = if matches!(crate::schema::user_version(conn)?, 4 | 5) {
+        conn.prepare_cached("SELECT index_node_id FROM lineage_history_indexes WHERE lineage_id = ?1 AND history_root_id = ?2")?
+            .query_row((lineage.as_str(), root.id.as_str()), |row| row.get::<_, Option<String>>(0)).optional()?
+    } else {
+        index_root(conn, lineage, &root.id)?
+    }.ok_or_else(|| StoreError::Integrity("history semantic index is missing".into()))?;
     let found = if let Some(id) = id {
         let node = load_index_node(conn, lineage, &id, &mut stats)?;
         find_key(
@@ -696,6 +816,49 @@ pub(crate) fn history_semantic_range(
         found.map(|node| (position(&node.min), node.value.unwrap())),
         stats,
     ))
+}
+
+#[cfg(test)]
+pub(crate) fn backfill_shared_fixture_indexes(conn: &Connection) -> Result<()> {
+    let lineage = LineageId::from_hex(conn.query_row(
+        "SELECT lineage_id FROM lineage_identity",
+        [],
+        |row| row.get::<_, String>(0),
+    )?)?;
+    let roots = conn
+        .prepare("SELECT DISTINCT history_root_id FROM lineage_revisions")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in roots {
+        let root = load_root(conn, &lineage, &RootId::from_db(id)?)?;
+        conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS smelt_new_history_keys (key BLOB PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID; DELETE FROM smelt_new_history_keys;")?;
+        let items = sequence_range(conn, &lineage, &root, 0, root.item_count)?.0;
+        for (position, bytes) in items.iter().enumerate() {
+            let item: SemanticHistoryItem = serde_json::from_slice(bytes)?;
+            let note = item.as_note();
+            for (semantic, value) in [
+                note.and_then(protocol::HistoryNote::context_name)
+                    .map(|name| (HistorySemantic::Context(name), name)),
+                note.and_then(protocol::HistoryNote::mode)
+                    .map(|mode| (HistorySemantic::Mode, mode)),
+                note.and_then(protocol::HistoryNote::base_mode)
+                    .map(|mode| (HistorySemantic::BaseMode, mode)),
+                item.is_transcript_visible()
+                    .then_some((HistorySemantic::Visible, "")),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                conn.execute(
+                    "INSERT INTO smelt_new_history_keys (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![&semantic.key(position as u64)[..], value],
+                )?;
+            }
+        }
+        let index = build_delta_index(conn, &lineage, &mut OperationStats::default())?;
+        conn.execute("INSERT OR IGNORE INTO lineage_history_indexes (lineage_id, history_root_id, index_node_id) VALUES (?1, ?2, ?3)", rusqlite::params![lineage.as_str(), root.id.as_str(), index.map(|node| node.id)])?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -743,6 +906,7 @@ mod tests {
                 .and_then(HistoryNote::base_mode)
                 .map(str::to_owned),
             HistorySemantic::Visible => item.is_transcript_visible().then(String::new),
+            HistorySemantic::User => None,
         }
     }
 
@@ -793,6 +957,251 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn already_open_historical_writer_cannot_publish_an_unindexed_history_root() {
+        for version in [4, 5] {
+            let (source, lineage, branch, _, _) =
+                crate::schema::tests::shared_archived_fixture(version);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("isolated-v{version}.db"));
+            crate::diagnostics::backup_connection_to(&source, &path).unwrap();
+            let mut old_writer = Connection::open(&path).unwrap();
+            old_writer
+                .execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+                .unwrap();
+            let parent = lineage_session_head(&old_writer, &lineage, &branch).unwrap();
+            let parent_revision =
+                load_revision(&old_writer, &lineage, &parent.revision_id).unwrap();
+            let sql = "INSERT INTO lineage_revisions (
+            lineage_id, revision_id, parent_revision_id, created_by_session_id, operation_kind,
+            history_root_id, transcript_root_id, state_payload_id, history_len,
+            transcript_record_count, transcript_byte_count, commit_fingerprint, created_at
+        ) SELECT lineage_id, ?1, revision_id, created_by_session_id, 'append', ?2,
+            transcript_root_id, state_payload_id, ?3, transcript_record_count,
+            transcript_byte_count, ?5, 2 FROM lineage_revisions WHERE revision_id = ?4";
+            old_writer.prepare_cached(sql).unwrap();
+            let mut migration = Connection::open(&path).unwrap();
+            crate::schema::initialize_lineage_schema(&mut migration).unwrap();
+            for changed in [false, true] {
+                let tx = old_writer.transaction().unwrap();
+                let root = if changed {
+                    let bytes = serde_json::to_vec(&HistoryItem::user(protocol::Content::text(
+                        "new request",
+                    )))
+                    .unwrap();
+                    append_sequence_in(
+                        &tx,
+                        &lineage,
+                        &parent_revision.history_root,
+                        &[bytes],
+                        ObjectCompression::None,
+                    )
+                    .unwrap()
+                    .0
+                } else {
+                    parent_revision.history_root.clone()
+                };
+                let mut revision = make_revision(
+                    &lineage,
+                    Some(parent_revision.id.clone()),
+                    branch.clone(),
+                    Some(LineageOperation::Append),
+                    root.clone(),
+                    parent_revision.transcript_root.clone(),
+                    parent_revision.state_payload_id.clone(),
+                    2,
+                )
+                .unwrap();
+                revision.commit_fingerprint = Some("b".repeat(64));
+                let result = tx.prepare_cached(sql).unwrap().execute(rusqlite::params![
+                    revision.id.as_str(),
+                    root.id.as_str(),
+                    root.item_count as i64,
+                    parent_revision.id.as_str(),
+                    revision.commit_fingerprint
+                ]);
+                if changed {
+                    let error = result.unwrap_err().to_string();
+                    assert!(
+                        error.contains("completed history semantic index"),
+                        "unexpected rejection: {error}"
+                    );
+                } else {
+                    assert_eq!(
+                        result.unwrap(),
+                        1,
+                        "an already indexed unchanged root remains safe"
+                    );
+                    assert_eq!(
+                        load_revision(&tx, &lineage, &revision.id).unwrap(),
+                        revision
+                    );
+                }
+                tx.rollback().unwrap();
+            }
+            assert_eq!(
+                lineage_session_head(&old_writer, &lineage, &branch).unwrap(),
+                parent
+            );
+            crate::schema::validate_lineage_schema(&old_writer).unwrap();
+        }
+    }
+
+    #[test]
+    fn user_ordinals_count_exact_prefixes_after_append_replacement_and_truncation() {
+        let (mut conn, lineage) = fixture();
+        let empty = empty_sequence(&conn, &lineage, SequenceKind::History).unwrap();
+        let mut items = (0..97)
+            .map(|index| match index % 4 {
+                0 => HistoryItem::user(protocol::Content::text("request")),
+                1 => HistoryItem::user(protocol::compaction_summary_content("legacy summary")),
+                2 => HistoryItem::system("hidden"),
+                _ => HistoryItem::note(HistoryNote::mode_change("mode")),
+            })
+            .collect::<Vec<_>>();
+        let root = append(&mut conn, &lineage, &empty, &items);
+        ensure_history_index(&conn, &lineage, &root, None).unwrap();
+        let assert_counts = |root: &SequenceRoot, items: &[HistoryItem]| {
+            for end in 0..=items.len() + 1 {
+                let (count, stats) = history_user_count(&conn, &lineage, root, end as u64).unwrap();
+                assert_eq!(count as usize, items.iter().take(end).filter(|item| {
+                    matches!(item, HistoryItem::User { content, .. } if matches!(protocol::classify_user_history_content(content), protocol::UserHistoryContent::Plain))
+                }).count(), "prefix {end}");
+                assert_eq!(stats.payloads_read, 0);
+                assert!(stats.nodes_read <= u64::from(KEY_BITS) * 4 + 1);
+            }
+        };
+        assert_counts(&root, &items);
+        for keep in [0, 1, 31, 32, 33, 64, 96] {
+            let prefix = split_sequence_in(&conn, &lineage, &root, keep)
+                .unwrap()
+                .0
+                 .0;
+            ensure_history_index(&conn, &lineage, &prefix, Some(&root)).unwrap();
+            assert_counts(&prefix, &items[..keep as usize]);
+        }
+        let prefix = split_sequence(&mut conn, &lineage, &root, 33).unwrap().0 .0;
+        ensure_history_index(&conn, &lineage, &prefix, Some(&root)).unwrap();
+        items.truncate(33);
+        items.extend([
+            HistoryItem::user(protocol::Content::text("new request")),
+            HistoryItem::system("new hidden"),
+        ]);
+        let replacement = append(&mut conn, &lineage, &prefix, &items[33..]);
+        let stats = ensure_history_index(&conn, &lineage, &replacement, Some(&root)).unwrap();
+        assert_eq!(stats.payloads_read, 2);
+        for end in 0..=items.len() {
+            assert_eq!(history_user_count(&conn, &lineage, &replacement, end as u64).unwrap().0 as usize, items.iter().take(end).filter(|item| matches!(item, HistoryItem::User { content, .. } if matches!(protocol::classify_user_history_content(content), protocol::UserHistoryContent::Plain))).count());
+        }
+        assert_eq!(
+            history_user_count(&conn, &lineage, &root, u64::MAX)
+                .unwrap()
+                .0,
+            25
+        );
+    }
+
+    #[test]
+    fn read_only_historical_user_counts_match_prefixes_without_migration() {
+        let items = [
+            HistoryItem::system("hidden"),
+            HistoryItem::user(protocol::Content::text("first request")),
+            HistoryItem::user(protocol::compaction_summary_content("legacy summary")),
+            HistoryItem::user(protocol::Content::text(format!(
+                "{}plan",
+                protocol::note::MODE_NOTE_PREFIX
+            ))),
+            HistoryItem::user(protocol::Content::text(format!(
+                "{}finished",
+                protocol::note::PROCESS_STATUS_NOTE_PREFIX
+            ))),
+            HistoryItem::user(protocol::Content::text("second request")),
+        ];
+        for version in [3, 4, 5] {
+            let mut conn = match version {
+                3 => crate::schema::tests::v3_connection(),
+                4 => crate::schema::tests::v4_connection(),
+                5 => crate::schema::tests::v5_connection(),
+                _ => unreachable!(),
+            };
+            let lineage = LineageId::from_hex("1".repeat(32)).unwrap();
+            create_lineage(&conn, &lineage, 1).unwrap();
+            let empty = empty_sequence(&conn, &lineage, SequenceKind::History).unwrap();
+            let root = append(&mut conn, &lineage, &empty, &items);
+            conn.pragma_update(None, "query_only", true).unwrap();
+            let changes = conn.total_changes();
+            for (end, expected) in [0, 0, 1, 1, 1, 1, 2, 2].into_iter().enumerate() {
+                let (count, stats) =
+                    history_user_count(&conn, &lineage, &root, end as u64).unwrap();
+                assert_eq!(count, expected, "v{version}, prefix {end}");
+                assert_eq!(stats.payloads_read, (end as u64).min(root.item_count));
+            }
+            assert_eq!(conn.total_changes(), changes);
+            assert_eq!(crate::schema::user_version(&conn).unwrap(), version);
+            crate::schema::validate_lineage_schema(&conn).unwrap();
+        }
+    }
+
+    #[test]
+    fn historical_user_count_cancels_between_bounded_chunks_without_writes() {
+        for version in [3, 4, 5] {
+            let mut conn = match version {
+                3 => crate::schema::tests::v3_connection(),
+                4 => crate::schema::tests::v4_connection(),
+                5 => crate::schema::tests::v5_connection(),
+                _ => unreachable!(),
+            };
+            let lineage = LineageId::from_hex("1".repeat(32)).unwrap();
+            create_lineage(&conn, &lineage, 1).unwrap();
+            let empty = empty_sequence(&conn, &lineage, SequenceKind::History).unwrap();
+            let mut items = (0..513)
+                .map(|index| {
+                    serde_json::to_vec(&HistoryItem::user(protocol::Content::text(format!(
+                        "request {index}"
+                    ))))
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            items[256] = br#"{"kind":"invalid"}"#.to_vec();
+            let root =
+                append_sequence(&mut conn, &lineage, &empty, &items, ObjectCompression::None)
+                    .unwrap()
+                    .0;
+            conn.pragma_update(None, "query_only", true).unwrap();
+            let changes = conn.total_changes();
+            let checks = std::cell::Cell::new(0);
+            let outcome = history_user_count_cancellable(&conn, &lineage, &root, u64::MAX, &|| {
+                checks.set(checks.get() + 1);
+                checks.get() == 3
+            });
+            assert!(matches!(outcome, Err(StoreError::Cancelled)));
+            assert_eq!(checks.get(), 3);
+            assert!(history_user_count(&conn, &lineage, &root, u64::MAX).is_err());
+            assert_eq!(conn.total_changes(), changes);
+            assert_eq!(crate::schema::user_version(&conn).unwrap(), version);
+        }
+    }
+
+    #[test]
+    fn user_ordinal_lookups_and_appends_do_not_read_retained_history() {
+        for count in [1, 32, 33, 1024, 4096] {
+            let (mut conn, lineage) = fixture();
+            let empty = empty_sequence(&conn, &lineage, SequenceKind::History).unwrap();
+            let items = vec![HistoryItem::user(protocol::Content::text("request")); count];
+            let root = append(&mut conn, &lineage, &empty, &items);
+            ensure_history_index(&conn, &lineage, &root, None).unwrap();
+            let next = append(&mut conn, &lineage, &root, &items[..1]);
+            let stats = ensure_history_index(&conn, &lineage, &next, Some(&root)).unwrap();
+            assert_eq!(stats.payloads_read, 1);
+            assert!(stats.nodes_read < 150, "size {count}: {stats:?}");
+            assert!(stats.nodes_written < 80, "size {count}: {stats:?}");
+            let (users, stats) = history_user_count(&conn, &lineage, &next, u64::MAX).unwrap();
+            assert_eq!(users, count as u64 + 1);
+            assert_eq!(stats.payloads_read, 0);
+            assert!(stats.nodes_read < 100, "size {count}: {stats:?}");
         }
     }
 

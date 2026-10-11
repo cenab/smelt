@@ -81,10 +81,28 @@ pub fn resolve_at_path(cwd: &str, token: &str) -> Option<PathBuf> {
     }
 }
 
+pub struct ExpandedFileRefs {
+    pub text: String,
+    pub observations: Vec<(String, crate::fs::FileState)>,
+}
+
 pub fn expand_at_file_refs(text: &str, cwd: &str, files: &FileStateCache) -> String {
+    let expanded = prepare_at_file_refs(text, cwd);
+    for (path, state) in expanded.observations {
+        files.set(&path, state);
+    }
+    expanded.text
+}
+
+/// Read and render references without publishing observations to a shared cache.
+pub fn prepare_at_file_refs(text: &str, cwd: &str) -> ExpandedFileRefs {
     let refs = parse_at_file_refs(text);
+    let mut observations = Vec::new();
     if refs.is_empty() {
-        return text.to_string();
+        return ExpandedFileRefs {
+            text: text.to_string(),
+            observations,
+        };
     }
 
     let mut out = String::with_capacity(text.len());
@@ -105,19 +123,24 @@ pub fn expand_at_file_refs(text: &str, cwd: &str, files: &FileStateCache) -> Str
                 continue;
             }
         };
-        let mtime_ms = crate::fs::file_mtime_ms(&path_str).ok();
-        if let Some(mtime_ms) = mtime_ms {
-            files.record_read_with_mtime(&path_str, raw.clone(), (1, usize::MAX), mtime_ms);
-        } else {
-            files.record_read(&path_str, raw.clone(), (1, usize::MAX));
-        }
+        observations.push((
+            path_str.clone(),
+            crate::fs::FileState {
+                content: raw.clone(),
+                mtime_ms: crate::fs::file_mtime_ms(&path_str).unwrap_or(0),
+                read_range: Some((1, usize::MAX)),
+            },
+        ));
         match render_attached_file(&path, &raw) {
             Ok(rendered) => out.push_str(&rendered),
             Err(err) => out.push_str(&render_attached_file_error(&path_str, &err)),
         }
     }
     out.push_str(&text[last..]);
-    out
+    ExpandedFileRefs {
+        text: out,
+        observations,
+    }
 }
 
 fn render_attached_file(path: &Path, raw: &str) -> Result<String, String> {

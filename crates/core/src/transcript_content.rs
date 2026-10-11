@@ -35,7 +35,7 @@ impl ContentId {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedContentSlice {
     source: Arc<String>,
     range: Range<usize>,

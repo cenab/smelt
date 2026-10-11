@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_INVOCATION_ID: AtomicU64 = AtomicU64::new(1);
+static MODEL_HISTORY_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 fn next_request_id() -> u64 {
     NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
@@ -150,119 +151,152 @@ pub(crate) async fn engine_task(
     let _ = event_tx.send(EngineEvent::Ready);
 
     let mut bg_cancel = CancellationToken::new();
+    let mut pending_command = None;
 
     loop {
         if bg_cancel.is_cancelled() {
             bg_cancel = CancellationToken::new();
         }
-        tokio::select! {
-            Some(cmd) = cmd_rx.recv() => {
-                match cmd {
-                    UiCommand::StartTurn(payload) => {
-                        let protocol::StartTurnPayload {
+        let cmd = match pending_command.take() {
+            Some(cmd) => cmd,
+            None => match cmd_rx.recv().await {
+                Some(cmd) => cmd,
+                None => break,
+            },
+        };
+        match cmd {
+            UiCommand::StartTurn(payload) => {
+                let protocol::StartTurnPayload {
+                    turn_id,
+                    input,
+                    mode,
+                    model_target,
+                    request_config,
+                    reasoning_effort,
+                    fast_mode,
+                    history,
+                    session_id,
+                    sessions_root,
+                    persistence,
+                    permission_overrides,
+                    system_prompt: tui_system_prompt,
+                    tools,
+                } = *payload;
+                let preparation_cancel = CancellationToken::new();
+                let load = prepare_model_history(
+                    history,
+                    sessions_root,
+                    session_id.clone(),
+                    preparation_cancel.clone(),
+                );
+                let ctx = BackgroundCtx {
+                    config: &config,
+                    http_client: &client,
+                    dispatcher: &*dispatcher,
+                    event_tx: &event_tx,
+                    host_tx: &host_tx,
+                    bg_cancel: bg_cancel.clone(),
+                };
+                let (loaded_history, deferred) = match wait_for_model_history(
+                    load,
+                    &mut cmd_rx,
+                    &ctx,
+                    &preparation_cancel,
+                )
+                .await
+                {
+                    ModelHistoryPreparation::Ready(Ok(history), deferred) => (history, deferred),
+                    ModelHistoryPreparation::Ready(Err(message), deferred) => {
+                        install_preparation_contexts(&mut config, deferred);
+                        let _ = event_tx.send(EngineEvent::TurnPreparationError {
                             turn_id,
-                            input,
-                            mode,
-                            model_target,
-                            request_config,
-                            reasoning_effort,
-                            fast_mode,
-                            history,
                             session_id,
-                            sessions_root,
                             persistence,
-                            permission_overrides,
-                            system_prompt: tui_system_prompt,
-                            tools,
-                        } = *payload;
-                        let loaded_history =
-                            match load_model_history(history, &sessions_root, &session_id) {
-                            Ok(history) => history,
-                            Err(message) => {
-                                let _ = event_tx.send(EngineEvent::TurnError {
-                                    message,
-                                    kind: None,
-                                    retry_at_ms: None,
-                                });
-                                continue;
-                            }
-                        };
+                            message,
+                        });
+                        continue;
+                    }
+                    ModelHistoryPreparation::Cancelled(deferred) => {
+                        install_preparation_contexts(&mut config, deferred);
+                        continue;
+                    }
+                    ModelHistoryPreparation::Superseded(payload, deferred) => {
+                        install_preparation_contexts(&mut config, deferred);
+                        pending_command = Some(UiCommand::StartTurn(payload));
+                        continue;
+                    }
+                };
 
-                        let provider = build_provider(
-                            &model_target,
-                            &client,
-                            std::sync::Arc::clone(&config.clock),
-                        );
-                        let system_prompt = tui_system_prompt
-                            .or_else(|| config.system_prompt_override.clone())
-                            .unwrap_or_else(|| {
-                                crate::build_system_prompt(
-                                    config.system_prompt_behavior,
-                                    crate::SystemPromptCapabilities::from_tool_calling(
-                                        provider.tool_calling(),
-                                    ),
-                                    config.instructions.as_deref(),
-                                    config.skill_section.as_deref(),
-                                )
-                            });
-                        let _dispatcher_turn =
-                            DispatcherTurnGuard::new(dispatcher.as_ref(), turn_id);
-                        let started_at = config.clock.instant_now();
-                        let mut turn = Turn {
-                            provider,
-                            dispatcher: &*dispatcher,
-                            cmd_rx: &mut cmd_rx,
-                            event_tx: &event_tx,
-                            host_tx: &host_tx,
-                            config: &mut config,
-                            http_client: &client,
-                            cancel: CancellationToken::new(),
-                            bg_cancel: bg_cancel.clone(),
-                            history: Vec::new(),
-                            history_coordinates: loaded_history.coordinates,
-                            mode,
-                            reasoning_effort,
-                            fast_mode,
-                            turn_id,
-                            model_target,
-                            target_revision: 0,
-                            request_config,
-                            system_prompt,
-                            tools,
-                            permission_overrides,
-                            pending_history_items: Vec::new(),
-                            next_history_changed_from: 0,
-                            history_revision: 0,
-                            session_id,
-                            persistence,
-                            started_at,
-                            tps_samples: Vec::new(),
-                        };
-                        turn.run(input, loaded_history.items).await;
-                    }
-                    UiCommand::SetTurnModel { .. } => {}
-                    UiCommand::UpdateAgentProjectContext(context) => {
-                        config.install_project_context(&context);
-                    }
-                    UiCommand::SetMode { .. } => {}
-                    UiCommand::SetFastMode { .. } => {}
-                    UiCommand::Cancel => {
-                        bg_cancel.cancel();
-                    }
-                    other => {
-                        let ctx = BackgroundCtx {
-                            config: &config,
-                            http_client: &client,
-                            dispatcher: &*dispatcher,
-                            event_tx: &event_tx,
-                            host_tx: &host_tx,
-                            bg_cancel: bg_cancel.clone(),
-                        };
-                        let _ = dispatch_background_cmd(other, &ctx);
-                    }
-                }
+                let provider =
+                    build_provider(&model_target, &client, std::sync::Arc::clone(&config.clock));
+                let system_prompt = tui_system_prompt
+                    .or_else(|| config.system_prompt_override.clone())
+                    .unwrap_or_else(|| {
+                        crate::build_system_prompt(
+                            config.system_prompt_behavior,
+                            crate::SystemPromptCapabilities::from_tool_calling(
+                                provider.tool_calling(),
+                            ),
+                            config.instructions.as_deref(),
+                            config.skill_section.as_deref(),
+                        )
+                    });
+                let _dispatcher_turn = DispatcherTurnGuard::new(dispatcher.as_ref(), turn_id);
+                let started_at = config.clock.instant_now();
+                let mut turn = Turn {
+                    provider,
+                    dispatcher: &*dispatcher,
+                    cmd_rx: &mut cmd_rx,
+                    event_tx: &event_tx,
+                    host_tx: &host_tx,
+                    config: &mut config,
+                    http_client: &client,
+                    cancel: CancellationToken::new(),
+                    bg_cancel: bg_cancel.clone(),
+                    history: Vec::new(),
+                    history_coordinates: loaded_history.coordinates,
+                    mode,
+                    reasoning_effort,
+                    fast_mode,
+                    turn_id,
+                    model_target,
+                    target_revision: 0,
+                    request_config,
+                    system_prompt,
+                    tools,
+                    permission_overrides,
+                    pending_history_items: Vec::new(),
+                    next_history_changed_from: 0,
+                    history_revision: 0,
+                    session_id,
+                    persistence,
+                    started_at,
+                    tps_samples: Vec::new(),
+                };
+                turn.install_history(input, loaded_history.items);
+                turn.apply_deferred_turn_cmds(deferred);
+                turn.run_prepared().await;
             }
-            else => break,
+            UiCommand::SetTurnModel { .. } => {}
+            UiCommand::UpdateAgentProjectContext(context) => {
+                config.install_project_context(&context);
+            }
+            UiCommand::SetMode { .. } => {}
+            UiCommand::SetFastMode { .. } => {}
+            UiCommand::Cancel => {
+                bg_cancel.cancel();
+            }
+            other => {
+                let ctx = BackgroundCtx {
+                    config: &config,
+                    http_client: &client,
+                    dispatcher: &*dispatcher,
+                    event_tx: &event_tx,
+                    host_tx: &host_tx,
+                    bg_cancel: bg_cancel.clone(),
+                };
+                let _ = dispatch_background_cmd(other, &ctx);
+            }
         }
     }
 
@@ -274,10 +308,94 @@ struct LoadedModelHistory {
     coordinates: protocol::ModelHistoryCoordinates,
 }
 
+enum ModelHistoryPreparation {
+    Ready(Result<LoadedModelHistory, String>, Vec<UiCommand>),
+    Cancelled(Vec<UiCommand>),
+    Superseded(Box<protocol::StartTurnPayload>, Vec<UiCommand>),
+}
+
+fn install_preparation_contexts(config: &mut EngineConfig, commands: Vec<UiCommand>) {
+    for command in commands {
+        if let UiCommand::UpdateAgentProjectContext(context) = command {
+            config.install_project_context(&context);
+        }
+    }
+}
+
+async fn prepare_model_history(
+    source: protocol::ModelHistorySource,
+    sessions_root: std::path::PathBuf,
+    session_id: String,
+    cancel: CancellationToken,
+) -> Result<LoadedModelHistory, String> {
+    if let protocol::ModelHistorySource::Items { items, coordinates } = source {
+        smelt_perf::perf::record_value("engine:model_history:source_items", 1);
+        smelt_perf::perf::record_value("engine:model_history:items", items.len() as u64);
+        return Ok(LoadedModelHistory { items, coordinates });
+    }
+    let permit = MODEL_HISTORY_READERS
+        .acquire()
+        .await
+        .map_err(|error| error.to_string())?;
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        load_model_history_cancellable(source, &sessions_root, &session_id, &cancel)
+    })
+    .await
+    .map_err(|error| format!("model history worker failed: {error}"))?;
+    result
+}
+
+/// Keep turn control live during history I/O. History-dependent commands retain
+/// their order and apply only after the captured request history is installed.
+async fn wait_for_model_history(
+    load: impl std::future::Future<Output = Result<LoadedModelHistory, String>>,
+    commands: &mut mpsc::UnboundedReceiver<UiCommand>,
+    ctx: &BackgroundCtx<'_>,
+    cancel: &CancellationToken,
+) -> ModelHistoryPreparation {
+    tokio::pin!(load);
+    let mut deferred = Vec::new();
+    loop {
+        tokio::select! {
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    cancel.cancel();
+                    return ModelHistoryPreparation::Cancelled(deferred);
+                };
+                match ActiveTurnCommand::classify(command) {
+                    ActiveTurnCommand::Cancel => {
+                        cancel.cancel();
+                        ctx.bg_cancel.cancel();
+                        return ModelHistoryPreparation::Cancelled(deferred);
+                    }
+                    ActiveTurnCommand::Other(UiCommand::StartTurn(payload)) => {
+                        cancel.cancel();
+                        return ModelHistoryPreparation::Superseded(payload, deferred);
+                    }
+                    ActiveTurnCommand::Other(command) => { let _ = dispatch_background_cmd(command, ctx); }
+                    command => deferred.push(command.into_command()),
+                }
+            }
+            result = &mut load => return ModelHistoryPreparation::Ready(result, deferred),
+        }
+    }
+}
+
+#[cfg(test)]
 fn load_model_history(
     source: protocol::ModelHistorySource,
     sessions_root: &std::path::Path,
     session_id: &str,
+) -> Result<LoadedModelHistory, String> {
+    load_model_history_cancellable(source, sessions_root, session_id, &CancellationToken::new())
+}
+
+fn load_model_history_cancellable(
+    source: protocol::ModelHistorySource,
+    sessions_root: &std::path::Path,
+    session_id: &str,
+    cancel: &CancellationToken,
 ) -> Result<LoadedModelHistory, String> {
     let _perf = smelt_perf::perf::begin("engine:model_history:load");
     let coordinates = source.coordinates();
@@ -316,16 +434,30 @@ fn load_model_history(
                     )
                     .map_err(|err| format!("open model history lineage: {err}"))?
                 };
-                let mut rows = reader
-                    .history_range(
-                        u64::try_from(first_live_index)
-                            .map_err(|_| "model history start index exceeds u64".to_string())?,
-                        u64::try_from(end_index)
-                            .map_err(|_| "model history end index exceeds u64".to_string())?,
-                    )
-                    .map_err(|err| format!("read lineage model history rows: {err}"))?;
-                smelt_perf::perf::record_value("engine:model_history:rows_read", rows.len() as u64);
-                history.append(&mut rows);
+                reader
+                    .read_snapshot(|reader| {
+                        let mut start = first_live_index;
+                        while start < end_index {
+                            if cancel.is_cancelled() {
+                                return Err("model history preparation cancelled".to_string());
+                            }
+                            let end = start.saturating_add(256).min(end_index);
+                            let mut rows = reader.history_range(start as u64, end as u64).map_err(
+                                |error| format!("read lineage model history rows: {error}"),
+                            )?;
+                            smelt_perf::perf::record_value(
+                                "engine:model_history:rows_read",
+                                rows.len() as u64,
+                            );
+                            if rows.len() != end - start {
+                                return Err("model history range is incomplete".to_string());
+                            }
+                            history.append(&mut rows);
+                            start = end;
+                        }
+                        Ok(())
+                    })
+                    .map_err(|error| format!("read model history snapshot: {error}"))??;
             }
             history.extend(suffix);
             smelt_perf::perf::record_value("engine:model_history:items", history.len() as u64);
@@ -1604,7 +1736,7 @@ impl<'a> Turn<'a> {
         }
     }
 
-    async fn run(&mut self, input: protocol::StartTurnInput, history: Vec<HistoryItem>) {
+    fn install_history(&mut self, input: protocol::StartTurnInput, history: Vec<HistoryItem>) {
         self.provider.reset_turn_state();
         {
             let _perf = smelt_perf::perf::begin("engine:turn:install_history");
@@ -1614,6 +1746,10 @@ impl<'a> Turn<'a> {
             self.next_history_changed_from = self.public_history_len();
             self.push_current_turn_input(input);
         }
+    }
+
+    async fn run_prepared(&mut self) {
+        self.drain_commands();
         self.emit_messages_snapshot();
 
         let mut first = true;
@@ -3519,6 +3655,112 @@ mod tests {
             normalize_reasoning_part(ReasoningKind::Summary, "**Important conclusion**"),
             (None, "**Important conclusion**".into())
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_model_history_can_be_cancelled_before_a_new_turn_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let permit = MODEL_HISTORY_READERS.acquire_many(2).await.unwrap();
+        let mut handle = crate::start(
+            test_engine_config(std::sync::Arc::new(crate::clock::RealClock)),
+            Box::new(crate::tools::EmptyDispatcher::new()),
+        );
+        assert!(matches!(handle.recv().await, Some(EngineEvent::Ready)));
+        let payload = |turn_id, history| {
+            Box::new(protocol::StartTurnPayload {
+                turn_id,
+                input: protocol::StartTurnInput::user(Content::text(format!(
+                    "synthetic request {turn_id}"
+                ))),
+                mode: AgentMode::normal(),
+                model_target: model_target(),
+                request_config: RequestRuntimeConfig::default(),
+                reasoning_effort: ReasoningEffort::Off,
+                fast_mode: false,
+                history,
+                session_id: "preparation-fixture".into(),
+                sessions_root: root.path().to_path_buf(),
+                persistence: protocol::PersistenceScope::default(),
+                permission_overrides: None,
+                system_prompt: Some("synthetic system".into()),
+                tools: Vec::new(),
+            })
+        };
+        handle.send(UiCommand::StartTurn(payload(
+            1,
+            protocol::ModelHistorySource::store(Vec::new(), "missing-lineage".into(), 0, 1),
+        )));
+        tokio::task::yield_now().await;
+        handle.send(UiCommand::Cancel);
+        handle.send(UiCommand::StartTurn(payload(
+            2,
+            protocol::ModelHistorySource::items(Vec::new()),
+        )));
+        let observed = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            loop {
+                match handle.recv_output().await {
+                    Some(crate::EngineOutput::HostCall(
+                        crate::host::HostCall::PrepareRequest { turn_id, .. },
+                    )) => break turn_id,
+                    Some(crate::EngineOutput::Event(EngineEvent::TurnPreparationError {
+                        ..
+                    })) => panic!("cancelled preparation reported an error"),
+                    Some(_) => {}
+                    None => panic!("engine stopped before the replacement request"),
+                }
+            }
+        })
+        .await
+        .expect("cancelled history loading blocked the replacement request");
+        assert_eq!(observed, 2);
+        handle.send(UiCommand::Cancel);
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn model_history_preparation_retains_turn_commands_in_order() {
+        let client = reqwest::Client::new();
+        let dispatcher = crate::tools::EmptyDispatcher::new();
+        let config = test_engine_config(std::sync::Arc::new(crate::clock::RealClock));
+        let (event_tx, host_tx, _outputs) = crate::output_channel(crate::HostCallbacks::Enabled);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(UiCommand::Steer {
+            input: protocol::StartTurnInput::user(Content::text("queued input")),
+        })
+        .unwrap();
+        tx.send(UiCommand::SetFastMode { enabled: true }).unwrap();
+        tx.send(UiCommand::Unsteer { count: 1 }).unwrap();
+        let ctx = BackgroundCtx {
+            config: &config,
+            http_client: &client,
+            dispatcher: &dispatcher,
+            event_tx: &event_tx,
+            host_tx: &host_tx,
+            bg_cancel: CancellationToken::new(),
+        };
+        let result = wait_for_model_history(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                Ok(LoadedModelHistory {
+                    items: Vec::new(),
+                    coordinates: protocol::ModelHistoryCoordinates::canonical(),
+                })
+            },
+            &mut rx,
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+        let ModelHistoryPreparation::Ready(Ok(_), commands) = result else {
+            panic!("preparation did not complete");
+        };
+        assert_eq!(commands.len(), 3);
+        assert!(matches!(commands[0], UiCommand::Steer { .. }));
+        assert!(matches!(
+            commands[1],
+            UiCommand::SetFastMode { enabled: true }
+        ));
+        assert!(matches!(commands[2], UiCommand::Unsteer { count: 1 }));
     }
 
     #[test]

@@ -377,10 +377,12 @@ impl TranscriptViewWatchers {
     }
 }
 
+pub(crate) use smelt_core::lua::{LuaWorkGuard, LUA_WORK_BATCH};
+
 /// TUI-specific state shared by Lua callbacks and the app loop.
 pub(crate) struct LuaShared {
     pub(crate) core: Arc<smelt_core::lua::LuaShared>,
-    pub(crate) pending_invocations: Mutex<Vec<PendingInvocation>>,
+    pub(crate) pending_invocations: Mutex<std::collections::VecDeque<PendingInvocation>>,
     pending_commands: Mutex<std::collections::VecDeque<String>>,
     command_drain_active: AtomicBool,
     layout_refresh_pending: AtomicBool,
@@ -411,7 +413,7 @@ impl LuaShared {
     fn with_core(core: Arc<smelt_core::lua::LuaShared>) -> Self {
         Self {
             core,
-            pending_invocations: Mutex::new(Vec::new()),
+            pending_invocations: Mutex::new(std::collections::VecDeque::new()),
             pending_commands: Mutex::new(std::collections::VecDeque::new()),
             command_drain_active: AtomicBool::new(false),
             layout_refresh_pending: AtomicBool::new(false),
@@ -436,11 +438,24 @@ impl LuaShared {
         Ok(())
     }
 
-    pub(crate) fn drain_commands(&self) -> Vec<String> {
+    pub(crate) fn pop_command(&self) -> Option<String> {
+        self.pending_commands.lock().ok()?.pop_front()
+    }
+
+    pub(crate) fn has_pending_commands(&self) -> bool {
         self.pending_commands
             .lock()
-            .map(|mut commands| commands.drain(..).collect())
-            .unwrap_or_default()
+            .is_ok_and(|commands| !commands.is_empty())
+    }
+
+    pub(crate) fn has_pending_callbacks(&self) -> bool {
+        self.pending_invocations
+            .lock()
+            .is_ok_and(|callbacks| !callbacks.is_empty())
+    }
+
+    pub(crate) fn begin_work(self: &Arc<Self>) -> LuaWorkGuard {
+        self.core.begin_work()
     }
 
     pub(crate) fn try_begin_command_drain(&self) -> bool {

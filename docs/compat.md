@@ -9,13 +9,12 @@ can be removed; schema migration alone does not retire historical bytes or recei
 
 ## `lineage-schema-v3`
 
-Deployed lineage databases use schema v3. Readers validate that original layout
-without writes; writers migrate it directly to v5 in one transaction. The migration
-preserves original logical rows and object bytes, backfills completed-node proofs
-and history semantic indexes, restores installed guards, checks foreign keys, and
-publishes both version markers atomically. Fresh databases are created directly in
-v5. Only v3, the exact v4 layout, and v5 are supported; unreleased development
-layouts are not migration sources, even if their version marker is 4.
+Readers validate the original v3 layout without writes; writers migrate it directly
+to v6 in one transaction. The migration preserves original logical rows and object
+bytes, backfills completed-node proofs and history semantic indexes, restores
+installed guards, checks foreign keys, and publishes both version markers atomically.
+Fresh databases use v6. Exact deployed v3, v4 and v5 layouts and the current v6 layout
+are supported; unreleased development layouts are not migration sources.
 
 Remove the v3 DDL, migration and read-only layout handling only after retained v3
 databases have a verified lossless replacement and read-only v3 support is retired.
@@ -24,15 +23,31 @@ upgrading the schema does not retire their original bytes or hashes.
 
 ## `lineage-schema-v4`
 
-Schema v4 stores retained full responses under the `response` request-object role.
-Readers validate that layout without writes. Writers upgrade it atomically to v5,
-which adds the distinct `response_diagnostics` role for metadata-only summaries.
-Existing roles, object bytes, hashes, receipts, and shared-state projections remain
-unchanged. The migration restores installed guards and validates foreign keys
-before publishing both version markers.
+The exact v4 schema snapshot remains available for write-free historical reads.
+Writers migrate to v6 atomically, adding the `response_diagnostics` request-object
+role and rebuilding root mappings with cumulative user ordinals while retaining
+canonical object bytes, revisions and receipts. Full responses keep the `response`
+role. Legacy summaries, mode changes and process-status messages stored as User
+history are not user turns. Counts come from canonical history, including users
+without transcript records. Read-only v3/v4/v5 counts use a bounded-memory cold scan;
+v4/v5's other semantic queries retain the original index namespace. Runtime count
+installation and maintenance keep these scans out of `session.info()` and
+interactive rewind application.
 
-Remove the v4 DDL, migration, and read-only layout handling only after retained v4
-databases have a verified lossless replacement and read-only v4 support is retired.
+Schema v6 requires a completed current-format mapping before revision insertion.
+Writers opened before migration cannot bypass count maintenance by publishing an
+unindexed changed history root. Remove the v4 schema snapshot, read-only namespace,
+count-scan fallback and historical fixture-publication path only after retained v4
+stores have verified lossless replacements and read-only v4 support is retired.
+
+## `lineage-schema-v5`
+
+Schema v5 retains shared storage and response diagnostics but has no cumulative
+user ordinals. Its exact DDL remains available for write-free validation. Writers
+migrate to v6 in one transaction with the same index rebuild and publication fencing
+as v4, preserving response roles, immutable objects, revisions and receipts.
+Remove the v5 snapshot and count/semantic fallbacks only after retained v5 stores
+have verified lossless replacements and read-only v5 support is retired.
 
 ## `revision-state-v1`
 
@@ -53,9 +68,9 @@ as compatibility debt.
 
 Read-only v3 databases use bounded-memory history scans for semantic queries.
 Writable databases migrate transactionally to the shared, root-specific semantic
-index in v4. Remove the scan fallback and v3 fixture-publication guard after
-read-only v3 support is retired and migration fixtures can be constructed without
-calling the current revision publication seam.
+index in v6. Remove this semantic-query scan fallback after read-only v3 support
+is retired. Historical count and fixture-publication fallbacks have the independent
+removal conditions listed under `lineage-schema-v4`.
 
 ## `lua-session-turn-block-idx`
 

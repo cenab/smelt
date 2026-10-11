@@ -3640,7 +3640,7 @@ fn corrupt_history_rolls_back_v3_migration() {
     assert_eq!(crate::schema::user_version(&conn).unwrap(), 3);
     assert_eq!(
         conn.query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE name = 'lineage_history_indexes'",
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'lineage_history_semantic_roots'",
             [],
             |row| row.get::<_, i64>(0)
         )
@@ -4200,7 +4200,7 @@ fn reclamation_work_units(conn: &Connection, lineage: &LineageId) -> usize {
         "lineage_sequence_entries",
         "lineage_sequence_nodes",
         "lineage_completed_sequence_nodes",
-        "lineage_history_indexes",
+        "lineage_history_semantic_roots",
         "lineage_history_index_nodes",
         "lineage_transcript_record_profiles",
         "lineage_payload_nested_object_refs",
@@ -4267,7 +4267,7 @@ fn lifecycle_snapshot(
         "lineage_sequence_entries",
         "lineage_sequence_roots",
         "lineage_history_index_nodes",
-        "lineage_history_indexes",
+        "lineage_history_semantic_roots",
         "lineage_revisions",
         "lineage_branch_revisions",
         "lineage_commit_receipts",
@@ -4837,10 +4837,35 @@ fn bounded_reclamation_preserves_shared_and_retained_roots() {
     )
     .unwrap();
 
+    let index_nodes = |conn: &Connection| {
+        conn.query_row(
+            "SELECT count(*) FROM lineage_history_index_nodes",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| usize::try_from(count).unwrap())
+        .unwrap()
+    };
+    let nodes_before = index_nodes(&conn);
     let work_before = reclamation_work_units(&conn, &lineage);
     let retained = reclaim_fixture(&mut conn, &lineage);
     let work_after = reclamation_work_units(&conn, &lineage);
-    assert_eq!(retained, 0);
+    // The changed visible/user subtree has one unreferenced merge node. All
+    // revision-owned data must survive while only this staging node is collected.
+    assert_eq!(retained, 1);
+    assert_eq!(nodes_before - index_nodes(&conn), retained);
+    assert_eq!(
+        history_user_count(&conn, &lineage, shared.history_root(), u64::MAX)
+            .unwrap()
+            .0,
+        1
+    );
+    assert_eq!(
+        history_user_count(&conn, &lineage, abandoned.history_root(), u64::MAX)
+            .unwrap()
+            .0,
+        2
+    );
     assert_eq!(work_before.saturating_sub(work_after), retained);
     assert_eq!(
         load_revision(&conn, &lineage, abandoned.id()).unwrap(),
@@ -5337,7 +5362,7 @@ fn lifecycle_publication_rolls_back_at_every_canonical_boundary() {
         "lineage_sequence_entries",
         "lineage_sequence_roots",
         "lineage_history_index_nodes",
-        "lineage_history_indexes",
+        "lineage_history_semantic_roots",
         "lineage_revisions",
         "lineage_branch_revisions",
         "lineage_branches",
@@ -5392,7 +5417,7 @@ fn lifecycle_publication_rolls_back_at_every_canonical_boundary() {
         "lineage_sequence_entries",
         "lineage_sequence_roots",
         "lineage_history_index_nodes",
-        "lineage_history_indexes",
+        "lineage_history_semantic_roots",
         "lineage_revisions",
         "lineage_branch_revisions",
         "lineage_branches",
@@ -5457,7 +5482,7 @@ fn lineage_publication_is_crash_atomic_at_canonical_boundaries() {
             }
             "semantic_root" => {
                 "CREATE TEMP TRIGGER crash_lineage_publication
-                     AFTER INSERT ON lineage_history_indexes
+                     AFTER INSERT ON lineage_history_semantic_roots
                      BEGIN SELECT smelt_test_crash(); END;"
             }
             "revision" => {

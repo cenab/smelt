@@ -4,7 +4,7 @@
 
 Reference for every namespace exposed under the global `smelt` table. Rust-registered signatures come from the closure's argument and return types; bundled Lua signatures come from LuaCATS annotations beside the implementation.
 
-**Coverage:** 88 namespace(s), 443 function(s), 109 class(es), 13 alias(es).
+**Coverage:** 88 namespace(s), 444 function(s), 109 class(es), 13 alias(es).
 
 `Supported` identifies the primary alpha plugin facade. `Advanced` identifies lower-level composition primitives that may evolve more freely. These labels guide API design and documentation; the alpha surface is not compatibility-frozen. Internal runtime machinery is excluded from this reference and IDE completion.
 
@@ -88,7 +88,7 @@ Requires a terminal UI; calling these from headless mode raises.
 - [`smelt.picker`](picker.md) - 2 function(s) - 1 advanced function(s)
 - [`smelt.render`](render.md) - 4 function(s) - Advanced namespace
 - [`smelt.search`](search.md) - 1 function(s)
-- [`smelt.session`](session.md) - 34 function(s) - 9 advanced function(s)
+- [`smelt.session`](session.md) - 35 function(s) - 9 advanced function(s)
 - [`smelt.session.messages`](session_messages.md) - 1 function(s)
 - [`smelt.session.slug`](session_slug.md) - 1 function(s)
 - [`smelt.session.title`](session_title.md) - 2 function(s)

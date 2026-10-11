@@ -615,6 +615,9 @@ pub(crate) fn hydrate_payload_ref(
         )));
     }
     stats.payloads_read += 1;
+    if expected_kind == PayloadKind::Transcript {
+        smelt_perf::perf::record_value("store:transcript:body_reads", 1);
+    }
     Ok(stored.bytes)
 }
 

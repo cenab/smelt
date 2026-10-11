@@ -319,7 +319,6 @@ pub struct TuiApp {
     pub(crate) task_label: Option<String>,
     pub(crate) pending_quit: bool,
     pub(crate) pending_session_save: bool,
-    pending_turn_dispatch: Option<crate::app::agent::PendingTurnDispatch>,
     pub(crate) paint_registry: crate::lua::paint::PaintRegistry,
     pub(crate) working: smelt_core::working::WorkingState,
     host_work: host_dispatch::HostWorkState,
@@ -332,6 +331,8 @@ pub struct TuiApp {
         Option<crate::app::transcript_hydration::TranscriptHydrationWorker>,
     transcript_detail: crate::app::transcript_detail::TranscriptDetailRuntime,
     session_load: crate::app::session_load::SessionLoadRuntime,
+    pending_rewind: Option<crate::app::history::PendingRewind>,
+    rewind_operations: crate::app::session_load::SessionOperationRuntime,
     session_preview: crate::app::session_preview::SessionPreviewRuntime,
     pending_transcript_search: Option<crate::app::search::PendingTranscriptSearch>,
     frame_scheduler: crate::app::render_loop::FrameScheduler,
@@ -525,7 +526,9 @@ pub enum AppEvent {
     TranscriptHydrationCompleted(
         Box<crate::app::transcript_hydration::TranscriptHydrationWorkerResult>,
     ),
+    TurnInputPrepared(Box<crate::app::agent::TurnInputPrepared>),
     SessionLoadCompleted(Box<crate::app::session_load::SessionLoadWorkerResult>),
+    RewindPrepared(Box<crate::app::history::RewindWorkerResult>),
     SessionPreviewCompleted(crate::app::session_preview::SessionPreviewWorkerResult),
     ShutdownSignal,
 }
@@ -1314,9 +1317,7 @@ impl TuiApp {
     }
 
     pub(crate) fn turn_lifecycle_is_active(&self) -> bool {
-        self.agent_is_running()
-            || self.turn_submission_is_pending()
-            || self.conversation.canonical_operations_are_pending()
+        self.agent_is_running() || self.turn_submission_is_pending()
     }
 
     pub(crate) fn request_urgent_render(&mut self) {
@@ -1344,16 +1345,10 @@ impl TuiApp {
     }
 
     pub(crate) fn prompt_work_state(&self) -> PromptWorkState {
-        let turn_active = self.agent_is_running()
-            || self.turn_submission_is_active()
-            || self.working.is_compacting();
+        let turn_active = self.turn_lifecycle_is_active() || self.working.is_compacting();
         if turn_active {
             PromptWorkState::TurnActive
-        } else if self.busy_stack.is_busy()
-            || self.turn_submission_is_pending()
-            || self.conversation.canonical_operations_are_pending()
-        {
-            // Persistence delays dispatch, but there is no live response to steer or interrupt.
+        } else if self.busy_stack.is_busy() {
             PromptWorkState::BackgroundBusy
         } else if self
             .conversation
@@ -1721,6 +1716,11 @@ impl TuiApp {
     pub(crate) fn start_queued_input(&mut self, queued: QueuedInput) -> Result<(), QueuedInput> {
         self.clear_prompt_prediction();
         let retry = queued.clone();
+        let recovery = matches!(queued, QueuedInput::Request(_)).then(|| {
+            crate::app::prompt_runtime::PendingPromptRecovery::for_queued_request(
+                queued.prompt_replay(),
+            )
+        });
         let started = match queued {
             QueuedInput::Request(req) => {
                 let req = *req;
@@ -1768,6 +1768,9 @@ impl TuiApp {
             QueuedInput::ProcessStatus(_) => true,
         };
         if started {
+            if let Some(recovery) = recovery {
+                self.preserve_pending_prompt_submission(recovery);
+            }
             Ok(())
         } else {
             Err(retry)
@@ -2113,7 +2116,6 @@ impl TuiApp {
             task_label: None,
             pending_quit: false,
             pending_session_save: false,
-            pending_turn_dispatch: None,
             paint_registry: crate::lua::paint::PaintRegistry::default(),
             working: smelt_core::working::WorkingState::new(working_clock),
             host_work: host_dispatch::HostWorkState::default(),
@@ -2123,6 +2125,8 @@ impl TuiApp {
             transcript_hydration_worker: None,
             transcript_detail: crate::app::transcript_detail::TranscriptDetailRuntime::default(),
             session_load: crate::app::session_load::SessionLoadRuntime::default(),
+            pending_rewind: None,
+            rewind_operations: crate::app::session_load::SessionOperationRuntime::default(),
             session_preview: crate::app::session_preview::SessionPreviewRuntime::default(),
             pending_transcript_search: None,
             frame_scheduler: crate::app::render_loop::FrameScheduler::default(),
@@ -2586,45 +2590,41 @@ impl TuiApp {
         if !self.core.signals.has_pending() {
             return;
         }
-        let fires = self.core.signals.drain_pending();
-        let lua = self.lua.lua();
-        let mut calls = Vec::new();
-        for fire in fires {
+        let work = self.lua.shared().begin_work();
+        for _ in 0..crate::lua::LUA_WORK_BATCH {
+            if !self.core.signals.has_pending() || !self.lua.shared().claim_work() {
+                break;
+            }
+            let Some(fire) = self.core.signals.pop_pending_callback() else {
+                break;
+            };
+            let callback = fire.callbacks.front().expect("one pending callback");
+            let lua = self.lua.lua();
             let value = self.core.signals.project_to_lua(&*fire.value, lua);
             let prev = fire
                 .prev
                 .as_deref()
                 .map(|prev| self.core.signals.project_to_lua(prev, lua))
                 .unwrap_or(mlua::Value::Nil);
-            for cb in &fire.callbacks {
-                let smelt_core::signals::SubscriberKind::Lua(handle) = &cb.kind;
-                let func = match lua.registry_value::<mlua::Function>(&handle.key) {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                calls.push((
-                    fire.name.clone(),
-                    value.clone(),
-                    prev.clone(),
-                    func,
-                    cb.is_glob,
-                ));
-            }
-        }
-        let lua = self.lua.execution();
-        crate::lua::scope_app(self, move || {
-            for (name, value, prev, func, is_glob) in calls {
+            let smelt_core::signals::SubscriberKind::Lua(handle) = &callback.kind;
+            let Ok(func) = lua.registry_value::<mlua::Function>(&handle.key) else {
+                continue;
+            };
+            let is_glob = callback.is_glob;
+            let lua = self.lua.execution();
+            crate::lua::scope_app(self, move || {
                 let _perf = smelt_perf::perf::begin("lua:cell_cb");
                 let result = if is_glob {
-                    func.call::<()>((name.clone(), value, prev))
+                    func.call::<()>((fire.name.clone(), value, prev))
                 } else {
                     func.call::<()>((value, prev))
                 };
-                if let Err(e) = result {
-                    lua.record_error(format!("cell `{name}`: {e}"));
+                if let Err(error) = result {
+                    lua.record_error(format!("cell `{}`: {error}", fire.name));
                 }
-            }
-        });
+            });
+        }
+        self.finish_lua_work(&work);
     }
 
     pub(crate) fn sync_prompt_placeholder_display(&mut self) {
@@ -2836,6 +2836,7 @@ impl TuiApp {
     pub(crate) fn drain_persist_reports(&mut self) {
         let Some(report) = self.conversation.drain_persistence_report() else {
             self.drive_canonical_operations();
+            self.poll_session_adoption();
             return;
         };
         if let Some(Err(cause)) = report.startup {
@@ -2870,6 +2871,7 @@ impl TuiApp {
             self.notify_warn(warning);
         }
         self.drive_canonical_operations();
+        self.poll_session_adoption();
     }
 
     fn handle_canonical_completion(
@@ -3005,9 +3007,11 @@ impl TuiApp {
                     }
                 }
             }
+            AppEvent::TurnInputPrepared(result) => self.handle_turn_input_prepared(*result),
             AppEvent::SessionLoadCompleted(result) => {
                 self.handle_session_load_worker_result(*result)
             }
+            AppEvent::RewindPrepared(result) => self.handle_rewind_worker_result(*result),
             AppEvent::SessionPreviewCompleted(result) => {
                 self.handle_session_preview_worker_result(result)
             }

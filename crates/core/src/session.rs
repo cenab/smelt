@@ -361,7 +361,7 @@ struct SessionWire {
 
 mod archives;
 mod snapshots;
-pub use archives::PreparedArchiveSave;
+pub use archives::{CapturedArchiveSave, PreparedArchiveSave};
 pub use snapshots::{CheckpointEvents, HistorySnapshots, SnapshotSuffix, SnapshotVersion};
 
 #[derive(Debug, Default)]
@@ -1405,6 +1405,7 @@ pub struct SessionHeader {
 #[derive(Clone, Debug)]
 pub struct SessionStoreResume {
     pub header: SessionHeader,
+    pub user_turn_count: usize,
     pub session: Session,
     pub store_address: SessionStoreAddress,
     pub head: smelt_store::StoreHead,
@@ -1986,8 +1987,21 @@ impl SessionStorage {
         record_width: u16,
         record_target_rows: u16,
     ) -> SessionStoreResult<Option<SessionStoreResume>> {
+        self.load_store_resume_cancellable(id_or_prefix, record_width, record_target_rows, &|| {
+            false
+        })
+    }
+
+    pub fn load_store_resume_cancellable(
+        &self,
+        id_or_prefix: &str,
+        record_width: u16,
+        record_target_rows: u16,
+        cancelled: &dyn Fn() -> bool,
+    ) -> SessionStoreResult<Option<SessionStoreResume>> {
         let resolved = self.resolve_session_for_read_result(id_or_prefix)?;
-        load_lineage_resume_from_resolved(resolved, record_width, record_target_rows).map(Some)
+        load_lineage_resume_from_resolved(resolved, record_width, record_target_rows, cancelled)
+            .map(Some)
     }
 
     pub fn load_store_header(
@@ -2043,20 +2057,26 @@ pub fn load_store_resume_result(
     process_storage().load_store_resume_result(id_or_prefix, record_width, record_target_rows)
 }
 
-fn open_lineage_snapshot(
+fn open_lineage_reader(
     resolved: &ResolvedSession,
-) -> SessionStoreResult<(
-    smelt_store::LineageSessionReader,
-    smelt_store::LineageSessionState,
-)> {
-    let reader = smelt_store::LineageSessionReader::open_existing_in_lineage(
+) -> SessionStoreResult<smelt_store::LineageSessionReader> {
+    smelt_store::LineageSessionReader::open_existing_in_lineage(
         &resolved.sessions_root,
         &resolved.lineage_id,
         &resolved.id,
     )
     .map_err(|error| {
         crate::session_store::store_error("open lineage session", &resolved.sessions_root, error)
-    })?;
+    })
+}
+
+fn open_lineage_snapshot(
+    resolved: &ResolvedSession,
+) -> SessionStoreResult<(
+    smelt_store::LineageSessionReader,
+    smelt_store::LineageSessionState,
+)> {
+    let reader = open_lineage_reader(resolved)?;
     let snapshot = reader.snapshot().map_err(|error| {
         crate::session_store::store_error(
             "read lineage session head",
@@ -2109,34 +2129,73 @@ fn load_lineage_resume_from_resolved(
     resolved: ResolvedSession,
     record_width: u16,
     record_target_rows: u16,
+    cancelled: &dyn Fn() -> bool,
 ) -> SessionStoreResult<SessionStoreResume> {
-    let (reader, snapshot) = open_lineage_snapshot(&resolved)?;
-    let transcript_count = snapshot
-        .head
-        .transcript_record_count
-        .as_usize()
-        .ok_or_else(|| SessionStoreError::Corrupt {
-            context: "lineage transcript length exceeds platform limits".into(),
-        })?;
-    let transcript_record_tail = reader
-        .transcript_tail_for_rows_with_total(transcript_count, record_width, record_target_rows)
+    let reader = open_lineage_reader(&resolved)?;
+    reader
+        .read_snapshot(|reader| {
+            let snapshot = reader.snapshot().map_err(|error| {
+                crate::session_store::store_error(
+                    "read lineage session head",
+                    &resolved.sessions_root,
+                    error,
+                )
+            })?;
+            let count = reader
+                .history_user_turn_count_before_cancellable(
+                    snapshot.head.history_len.get(),
+                    cancelled,
+                )
+                .map_err(|error| {
+                    crate::session_store::store_error(
+                        "read lineage user count",
+                        &resolved.sessions_root,
+                        error,
+                    )
+                })?;
+            let user_turn_count =
+                usize::try_from(count).map_err(|_| SessionStoreError::Corrupt {
+                    context: "lineage user count exceeds platform limits".into(),
+                })?;
+            let transcript_count = snapshot
+                .head
+                .transcript_record_count
+                .as_usize()
+                .ok_or_else(|| SessionStoreError::Corrupt {
+                    context: "lineage transcript length exceeds platform limits".into(),
+                })?;
+            let transcript_record_tail = reader
+                .transcript_tail_for_rows_with_total(
+                    transcript_count,
+                    record_width,
+                    record_target_rows,
+                )
+                .map_err(|error| {
+                    crate::session_store::store_error(
+                        "read lineage transcript tail",
+                        &resolved.sessions_root,
+                        error,
+                    )
+                })?;
+            let head = snapshot.head;
+            let (header, store_address) = lineage_header_from_snapshot(&resolved, &snapshot)?;
+            let session = session_from_lineage_snapshot(header.meta.clone(), snapshot)?;
+            Ok(SessionStoreResume {
+                header,
+                user_turn_count,
+                session,
+                store_address,
+                head,
+                transcript_record_tail,
+            })
+        })
         .map_err(|error| {
             crate::session_store::store_error(
-                "read lineage transcript tail",
+                "read lineage resume snapshot",
                 &resolved.sessions_root,
                 error,
             )
-        })?;
-    let head = snapshot.head;
-    let (header, store_address) = lineage_header_from_snapshot(&resolved, &snapshot)?;
-    let session = session_from_lineage_snapshot(header.meta.clone(), snapshot)?;
-    Ok(SessionStoreResume {
-        header,
-        session,
-        store_address,
-        head,
-        transcript_record_tail,
-    })
+        })?
 }
 
 pub fn load_store_header(id_or_prefix: &str) -> Option<(SessionHeader, SessionStoreAddress)> {
@@ -3212,6 +3271,51 @@ mod tests {
         assert_eq!(resumed.session_usage.prompt_tokens, Some(30));
         assert_eq!(resumed.session_usage.completion_tokens, Some(10));
         assert_eq!(resumed.context_snapshots.len(), 1);
+    }
+
+    #[test]
+    fn resume_user_count_and_header_share_a_snapshot_during_concurrent_publication() {
+        let state = tempfile::tempdir().unwrap();
+        let storage = SessionStorage::new(state.path().to_path_buf());
+        let mut session = Session::new(1, std::path::PathBuf::from("/tmp"));
+        session.title = Some("original".into());
+        session.history = vec![user_item("original request")];
+        storage.save_result(&session).unwrap();
+        let writer =
+            smelt_store::OwnedLineageWriter::open_existing(storage.sessions_dir(), &session.id)
+                .unwrap();
+        let expected = writer.store_head().unwrap();
+        session.title = Some("replacement".into());
+        session.history = vec![
+            HistoryItem::system("system one"),
+            HistoryItem::system("system two"),
+        ];
+        let mut command = initial_store_commit_from_session(&session).unwrap();
+        command.expected = expected;
+        let writer = std::cell::RefCell::new(writer);
+        let published = std::cell::Cell::new(false);
+        let resumed = storage
+            .load_store_resume_cancellable(&session.id, 80, 24, &|| {
+                if !published.replace(true) {
+                    writer.borrow_mut().commit_session(&command).unwrap();
+                }
+                false
+            })
+            .unwrap()
+            .unwrap();
+        assert!(published.get());
+        assert_eq!(resumed.header.history_len, 1);
+        assert_eq!(resumed.header.meta.title.as_deref(), Some("original"));
+        assert_eq!(resumed.user_turn_count, 1);
+        assert_eq!(resumed.head, expected);
+        let fresh = storage
+            .load_store_resume_result(&session.id, 80, 24)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.header.history_len, 2);
+        assert_eq!(fresh.header.meta.title.as_deref(), Some("replacement"));
+        assert_eq!(fresh.user_turn_count, 0);
+        assert!(fresh.head.revision > expected.revision);
     }
 
     #[test]

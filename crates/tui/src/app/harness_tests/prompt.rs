@@ -36,6 +36,44 @@ fn slash_completion_tab_accepts_command_name() {
 }
 
 #[test]
+fn slash_completion_accepts_current_command_from_a_terminal_burst() {
+    for accept in [KeyCode::Enter, KeyCode::Tab] {
+        let mut app = TestApp::builder().with_vim(false).build();
+        app.run_lua_result(
+            r#"
+            accepted_burst_command = false
+            smelt.cmd.register("rewind-first", function()
+                accepted_burst_command = true
+            end)
+            "#,
+        )
+        .unwrap();
+        app.type_text("/r");
+        assert!(app.state().picker_count > 0);
+
+        let work = app.app.lua.core_shared().begin_work();
+        while app.app.lua.core_shared().claim_work() {}
+        for code in "ewind-first".chars().map(KeyCode::Char).chain([accept]) {
+            app.app
+                .dispatch_terminal_event(crossterm::event::Event::Key(
+                    crossterm::event::KeyEvent::new(code, KeyModifiers::NONE),
+                ));
+        }
+        drop(work);
+        app.settle_lua();
+
+        if accept == KeyCode::Enter {
+            assert!(app
+                .eval_lua::<bool>("return accepted_burst_command")
+                .unwrap());
+            assert_eq!(app.prompt_source(), "");
+        } else {
+            assert_eq!(app.prompt_source(), "/rewind-first ");
+        }
+    }
+}
+
+#[test]
 fn partial_model_command_tab_then_enter_opens_model_picker() {
     let mut app = TestApp::builder().build();
     app.set_available_models(vec![smelt_core::config::ResolvedModel {
@@ -829,10 +867,11 @@ fn rewind_steered_message_restores_input_and_preserves_prior_transcript() {
         }
 
         assert!(app.run_lua("smelt.cmd.run('rewind')"));
-        drive_lua_tasks(&mut app);
+        app.wait_for_lua_dialog();
         app.press(KeyCode::Up);
         app.press(KeyCode::Enter);
         drive_lua_tasks(&mut app);
+        app.wait_for_rewind();
 
         let frame = app.render_to_frame().text();
         assert_eq!(app.state().prompt_text, "changed my mind", "{frame}");

@@ -94,5 +94,5 @@ pub use inline::{
 };
 pub use syntax::{
     lang_to_ext, print_code_lines, print_syntax_file, print_syntax_file_ext, render_code_block,
-    syntax_for_lang, InlineSyntax, InlineSyntaxSpan,
+    render_code_block_range, syntax_for_lang, InlineSyntax, InlineSyntaxSpan,
 };

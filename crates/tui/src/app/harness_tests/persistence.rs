@@ -6,6 +6,71 @@ use protocol::{
 use smelt_core::transcript_model::Block;
 
 #[test]
+fn stored_session_info_counts_canonical_users_without_opening_history() {
+    let mut app = TestApp::builder().build();
+    let mut session =
+        smelt_core::session::Session::new(app.app.core.env.pid(), app.app.core.env.cwd());
+    session
+        .history
+        .push(HistoryItem::user(Content::text("recorded request")));
+    session.history.extend((0..4096).map(|index| {
+        HistoryItem::note(protocol::HistoryNote::named_context(
+            format!("context-{index}"),
+            "hidden context",
+        ))
+    }));
+    session
+        .history
+        .push(HistoryItem::user(protocol::compaction_summary_content(
+            "summary",
+        )));
+    session
+        .history
+        .push(HistoryItem::user(Content::text("unrecorded request")));
+    let id = session.id.clone();
+    let root = app.app.core.sessions.sessions_dir().to_path_buf();
+    let mut command = smelt_core::session::initial_store_commit_from_session(&session).unwrap();
+    let transcript = crate::app::history::build_transcript_from_session(&app.app.lua, &session);
+    let record = transcript.history.block_records_with_ids_from(0).remove(0);
+    command.transcript_records = Some(smelt_store::TranscriptRecordSuffix {
+        start: smelt_store::TranscriptRecordIndex::ZERO,
+        records: vec![
+            smelt_core::transcript_model::transcript_block_row_with_block_idx(
+                0,
+                record.block_id.get(),
+                &record.record,
+            )
+            .unwrap(),
+        ],
+    });
+    let mut writer = smelt_store::OwnedLineageWriter::open(&root, &id).unwrap();
+    writer.commit_session(&command).unwrap();
+    writer.refresh_catalog().unwrap();
+    writer.release().unwrap();
+    assert!(app.resume_session(&id));
+    app.ensure_writer_ready();
+    assert!(app.app.conversation.has_live_session());
+    let perf_enabled = smelt_perf::perf::enabled();
+    smelt_perf::perf::set_enabled(true);
+    smelt_perf::perf::clear();
+    let success = app.run_lua("for i = 1, 8 do assert(smelt.session.info().turn_count == 2) end");
+    let opens = smelt_perf::perf::snapshot()
+        .durations
+        .iter()
+        .find(|row| row.label == "session:live_store:open")
+        .map_or(0, |row| row.count);
+    smelt_perf::perf::set_enabled(perf_enabled);
+    assert!(
+        success,
+        "stored counts must exclude summaries and include unrecorded canonical users"
+    );
+    assert_eq!(
+        opens, 0,
+        "session.info() must use its maintained count, not open history on the UI"
+    );
+}
+
+#[test]
 fn title_catalog_refresh_does_not_materialize_retained_archive_values() {
     let mut app = TestApp::builder().build();
     let mut session =
@@ -406,10 +471,11 @@ fn legacy_projection_survives_noop_and_avoids_retained_metadata_reads_on_title_s
 }
 
 #[test]
-fn canonical_enter_projects_records_before_dispatch_and_does_not_reproject_them() {
+fn canonical_enter_serializes_records_on_writer_before_dispatch() {
     let mut app = TestApp::builder().build();
     app.ensure_writer_ready();
     let release = app.app.conversation.pause_persistence();
+    let perf_enabled = smelt_perf::perf::enabled();
     smelt_perf::perf::set_enabled(true);
     smelt_perf::perf::clear();
     let projection_count = || {
@@ -427,16 +493,16 @@ fn canonical_enter_projects_records_before_dispatch_and_does_not_reproject_them(
     release.send(()).unwrap();
     app.wait_for_turn_persistence();
     let durable_count = projection_count();
-    smelt_perf::perf::set_enabled(false);
+    smelt_perf::perf::set_enabled(perf_enabled);
     assert!(pending);
     assert!(!running);
-    assert!(
-        prepared_count > 0,
-        "record projection belongs to preparation, not storage dispatch"
+    assert_eq!(
+        prepared_count, 0,
+        "Enter must capture records without serializing them on the UI"
     );
     assert_eq!(
-        durable_count, prepared_count,
-        "dispatch must reuse prepared canonical rows"
+        durable_count, 1,
+        "the writer must serialize the captured user record exactly once before dispatch"
     );
     assert_eq!(
         app.drain_engine_sends()
@@ -458,6 +524,627 @@ fn canonical_enter_projects_records_before_dispatch_and_does_not_reproject_them(
         .records
         .iter()
         .any(|row| row.indexed_text.contains("projected submitted request α")));
+}
+
+#[test]
+fn canonical_dispatch_boundary_measures_preparation_commit_and_publication_separately() {
+    for retained in [0, 128, 4096] {
+        let mut app = TestApp::builder().with_vim(false).build();
+        if retained > 0 {
+            let mut session =
+                smelt_core::session::Session::new(app.app.core.env.pid(), app.app.core.env.cwd());
+            session.history = (0..retained)
+                .map(|index| {
+                    if index % 2 == 0 {
+                        HistoryItem::user(Content::text(format!("retained request {index}")))
+                    } else {
+                        HistoryItem::Assistant(AssistantStep::terminal(
+                            Some(Content::text("retained answer ".repeat(64))),
+                            None,
+                            Vec::new(),
+                        ))
+                    }
+                })
+                .collect();
+            app.app.load_session(session);
+            app.ensure_writer_ready();
+            save_full_history_fixture(&mut app);
+            app.save_session_and_flush();
+            let id = app.session_snapshot().id.clone();
+            assert!(app.resume_session(&id));
+        }
+        app.ensure_writer_ready();
+        let enabled = smelt_perf::perf::enabled();
+        smelt_perf::perf::set_enabled(true);
+        smelt_perf::perf::clear();
+        let mut enters = Vec::new();
+        let mut dispatches = Vec::new();
+        for sample in 0..10 {
+            let release = app.app.conversation.pause_persistence();
+            app.type_text(&format!("measured request {sample}"));
+            let entered = std::time::Instant::now();
+            app.press(KeyCode::Enter);
+            enters.push(entered.elapsed().as_micros());
+            assert!(app.app.turn_submission_is_pending());
+            assert!(!app.agent_running());
+            assert!(app
+                .drain_engine_sends()
+                .iter()
+                .all(|command| !matches!(command, protocol::UiCommand::StartTurn(_))));
+            let released = std::time::Instant::now();
+            release.send(()).unwrap();
+            app.wait_for_turn_persistence();
+            dispatches.push(released.elapsed().as_micros());
+            assert_eq!(
+                app.drain_engine_sends()
+                    .iter()
+                    .filter(|command| matches!(command, protocol::UiCommand::StartTurn(_)))
+                    .count(),
+                1
+            );
+            assert!(app.finish_turn());
+            app.save_session_and_flush();
+        }
+        let snapshot = smelt_perf::perf::snapshot();
+        smelt_perf::perf::set_enabled(enabled);
+        eprintln!("dispatch boundary retained={retained} Enter_us={enters:?} release_to_dispatch_us={dispatches:?}");
+        for label in [
+            "persist:canonical:prepare",
+            "persist:submit_turn",
+            "persist:publication:complete",
+        ] {
+            let row = snapshot
+                .durations
+                .iter()
+                .find(|row| row.label == label)
+                .expect("measured boundary phase");
+            assert!(row.count >= 10, "{label}: {row:?}");
+            eprintln!("{row:?}");
+        }
+        assert!(enters.iter().all(|elapsed| *elapsed < 250_000));
+    }
+}
+
+#[test]
+fn enter_uses_owned_lineage_while_catalog_repair_is_blocked() {
+    let mut app = TestApp::builder().with_vim(false).build();
+    app.start_submitted_turn("initial request");
+    app.drain_engine_sends();
+    assert!(app.finish_turn());
+    app.save_session_and_flush();
+    assert!(app.app.conversation.live_session().is_none());
+    let base = app
+        .app
+        .conversation
+        .session()
+        .archive_base()
+        .unwrap()
+        .clone();
+    let root = app.core_probe().sessions.sessions_dir().to_path_buf();
+    assert!(app
+        .core_probe()
+        .sessions
+        .wait_for_session_catalog(Duration::from_secs(5)));
+    let id = app.session_snapshot().id.clone();
+    let layout = smelt_store::SessionStoreLayout::from_sessions_root(&root);
+    let storage_release = app.app.conversation.pause_persistence();
+    let marker = smelt_store::CatalogMarkerLock::acquire(&root, &id).unwrap();
+    smelt_store::Catalog::open(layout.catalog_path())
+        .unwrap()
+        .remove(&id)
+        .unwrap();
+    std::fs::create_dir_all(layout.catalog_pending_dir()).unwrap();
+    std::fs::write(layout.catalog_pending_path(&id), [1; 16]).unwrap();
+    app.type_text("follow-up request");
+    let elapsed = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            drop(marker);
+        });
+        let entered_at = std::time::Instant::now();
+        app.press(KeyCode::Enter);
+        entered_at.elapsed()
+    });
+    let accepted = app.app.turn_submission_is_pending();
+    storage_release.send(()).unwrap();
+    app.wait_for_turn_persistence();
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "Enter waited for catalog repair for {elapsed:?}"
+    );
+    assert!(accepted);
+    let request = app
+        .drain_engine_sends()
+        .into_iter()
+        .find_map(|command| match command {
+            protocol::UiCommand::StartTurn(request) => Some(request),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        matches!(request.history, protocol::ModelHistorySource::Store { lineage_id, .. }
+        if lineage_id == base.lineage_id)
+    );
+}
+
+#[test]
+fn file_expansion_accepts_input_before_reading_and_keeps_the_ui_responsive() {
+    let mut app = TestApp::builder().with_vim(false).build();
+    app.ensure_writer_ready();
+    let (input_started, release) = app.app.conversation.submissions.pause_input();
+    app.type_text("summarize @missing-responsive-fixture.txt");
+    let started = std::time::Instant::now();
+    app.press(KeyCode::Enter);
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "Enter waited for file expansion"
+    );
+    input_started.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(app.app.turn_submission_is_pending());
+    assert_eq!(app.state().prompt_text, "");
+    assert!(app
+        .render_unsettled_silent()
+        .text()
+        .contains("summarize @missing-responsive-fixture.txt"));
+    assert!(app
+        .session_history()
+        .iter()
+        .all(|item| !matches!(item, HistoryItem::User { .. })));
+    app.run_lua_result(
+        r#"
+        smelt.time.now_ms = function() return _G.animation_now or 0 end
+        package.loaded["smelt.spinner"] = nil
+        smelt.spinner = require("smelt.spinner")
+    "#,
+    )
+    .unwrap();
+    let mut glyphs = std::collections::HashSet::new();
+    for _ in 0..8 {
+        let started = std::time::Instant::now();
+        app.feed_one(SourceEvent::Tick(150));
+        app.app
+            .lua
+            .lua()
+            .globals()
+            .set(
+                "animation_now",
+                engine::clock::unix_time_ms(app.app.core.clock.as_ref()),
+            )
+            .unwrap();
+        app.app.publish_diff_signals();
+        let frame = app.render_unsettled_silent().text();
+        let glyph: String = app.eval_lua("return smelt.spinner.glyph()").unwrap();
+        assert!(frame.contains(&glyph), "{frame}");
+        glyphs.insert(glyph);
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+    assert_eq!(glyphs.len(), 4);
+    app.type_text("new draft");
+    for key in [3, 12] {
+        let started = std::time::Instant::now();
+        app.press(KeyCode::F(key));
+        app.render_unsettled_silent();
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+    release.send(()).unwrap();
+    app.wait_for_turn_persistence();
+    assert!(app.agent_running());
+    assert_eq!(app.state().prompt_text, "new draft");
+}
+
+#[test]
+fn file_expansion_includes_turn_start_context_changes() {
+    let mut app = TestApp::builder().with_vim(false).build();
+    app.ensure_writer_ready();
+    assert!(app.run_lua(
+        r#"
+        smelt.events.on("turn_start", function()
+            smelt.session.context_note("acceptance-hook", "request context from hook")
+        end)
+        "#
+    ));
+    let (input_started, release) = app.app.conversation.submissions.pause_input();
+    app.type_text("summarize @missing-context-fixture.txt");
+    app.press(KeyCode::Enter);
+    input_started.recv_timeout(Duration::from_secs(5)).unwrap();
+    release.send(()).unwrap();
+    app.wait_for_turn_persistence();
+    assert!(
+        app.agent_running(),
+        "turn-start context invalidated accepted input"
+    );
+    let sends = app.drain_engine_sends();
+    let payload = sends
+        .iter()
+        .find_map(|command| match command {
+            protocol::UiCommand::StartTurn(payload) => Some(payload),
+            _ => None,
+        })
+        .unwrap();
+    let history = match &payload.history {
+        protocol::ModelHistorySource::Items { items, .. } => items.clone(),
+        protocol::ModelHistorySource::Store {
+            prefix,
+            lineage_id,
+            first_live_index,
+            end_index,
+            suffix,
+            ..
+        } => {
+            let mut history = prefix.clone();
+            let reader = smelt_store::LineageSessionReader::open_existing_in_lineage(
+                &payload.sessions_root,
+                lineage_id,
+                &payload.session_id,
+            )
+            .unwrap();
+            history.extend(
+                reader
+                    .history_range(*first_live_index as u64, *end_index as u64)
+                    .unwrap(),
+            );
+            history.extend(suffix.clone());
+            history
+        }
+    };
+    assert!(history.iter().any(|item| matches!(item,
+        HistoryItem::Note(protocol::HistoryNote::Context { name, text })
+            if name == "acceptance-hook" && text == "request context from hook"
+    )));
+    app.assert_invariants();
+}
+
+#[test]
+fn file_preparation_failure_keeps_older_cancelled_receipts_pending() {
+    let mut app = TestApp::builder().with_vim(false).build();
+    app.ensure_writer_ready();
+    let storage_release = app.app.conversation.pause_persistence();
+    app.type_text("older request");
+    app.press(KeyCode::Enter);
+    let (input_started, input_release) = app.app.conversation.submissions.pause_input();
+    app.type_text("replacement @missing-receipt-fixture.txt");
+    for _ in 0..3 {
+        app.press(KeyCode::Enter);
+    }
+    input_started.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        app.app
+            .conversation
+            .submissions
+            .settling_cancellations
+            .len(),
+        1
+    );
+    app.session_append_history(HistoryItem::Note(protocol::HistoryNote::Context {
+        name: "later-change".into(),
+        text: "invalidate replacement preparation".into(),
+    }));
+    input_release.send(()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app.app.turn_submission_is_pending() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "file preparation did not finish"
+        );
+        if let Some(event) = app.app.platform.try_recv_app_event() {
+            app.app.handle_app_event(event);
+        } else {
+            std::thread::yield_now();
+        }
+    }
+    let pending_cancellations = app
+        .app
+        .conversation
+        .submissions
+        .settling_cancellations
+        .len();
+    storage_release.send(()).unwrap();
+    assert_eq!(
+        pending_cancellations, 1,
+        "input preparation forgot an older cancelled receipt"
+    );
+    assert_eq!(
+        app.state().prompt_text,
+        "replacement @missing-receipt-fixture.txt"
+    );
+    app.wait_for_turn_persistence();
+    assert!(app.session_history().iter().any(|item| matches!(item,
+        HistoryItem::Note(protocol::HistoryNote::Context { name, text })
+            if name == "later-change" && text == "invalidate replacement preparation"
+    )));
+    assert!(app
+        .app
+        .conversation
+        .submissions
+        .settling_cancellations
+        .is_empty());
+    assert!(app
+        .drain_engine_sends()
+        .iter()
+        .all(|command| !matches!(command, protocol::UiCommand::StartTurn(_))));
+    app.assert_invariants();
+}
+
+#[test]
+fn ordinary_submission_failure_preserves_callback_history_and_display() {
+    let mut app = TestApp::builder().with_vim(false).build();
+    app.ensure_writer_ready();
+    app.app
+        .conversation
+        .inject_commit_failure(smelt_store::SessionCommitFailure::InvalidCommand {
+            message: "injected submission rejection".into(),
+        });
+    assert!(app.run_lua(
+        r#"
+        smelt.events.on("turn_start", function()
+            smelt.session.context_note("retained-hook", "keep hook context")
+        end)
+        "#
+    ));
+    let release = app.app.conversation.pause_persistence();
+    app.type_text("ordinary request");
+    app.press(KeyCode::Enter);
+    app.app.push_block(Block::Text {
+        content: "keep callback display".into(),
+    });
+    release.send(()).unwrap();
+    app.wait_for_turn_persistence();
+    assert!(!app.agent_running());
+    assert_eq!(app.state().prompt_text, "ordinary request");
+    assert!(app.session_history().iter().any(|item| matches!(item,
+        HistoryItem::Note(protocol::HistoryNote::Context { name, text })
+            if name == "retained-hook" && text == "keep hook context"
+    )));
+    assert!(app
+        .session_history()
+        .iter()
+        .all(|item| !matches!(item, HistoryItem::User { .. })));
+    assert!(app
+        .render_unsettled_silent()
+        .text()
+        .contains("keep callback display"));
+    app.assert_invariants();
+}
+
+#[test]
+fn file_expansion_failure_preserves_callback_history_and_display() {
+    for change_history in [false, true] {
+        let mut app = TestApp::builder().with_vim(false).build();
+        app.ensure_writer_ready();
+        if !change_history {
+            app.app.conversation.inject_commit_failure(
+                smelt_store::SessionCommitFailure::InvalidCommand {
+                    message: "injected expanded submission rejection".into(),
+                },
+            );
+        }
+        assert!(app.run_lua(
+            r#"
+            smelt.events.on("turn_start", function()
+                smelt.session.context_note("retained-hook", "keep hook context")
+            end)
+            "#
+        ));
+        let (input_started, release) = app.app.conversation.submissions.pause_input();
+        app.type_text("summarize @missing-failure-fixture.txt");
+        app.press(KeyCode::Enter);
+        input_started.recv_timeout(Duration::from_secs(5)).unwrap();
+        app.app.push_block(Block::Text {
+            content: "keep callback display".into(),
+        });
+        if change_history {
+            app.session_append_history(HistoryItem::Note(protocol::HistoryNote::Context {
+                name: "later-context".into(),
+                text: "keep later context".into(),
+            }));
+        }
+        release.send(()).unwrap();
+        app.wait_for_turn_persistence();
+        assert!(!app.agent_running());
+        assert!(!app.app.turn_submission_is_pending());
+        assert_eq!(
+            app.state().prompt_text,
+            "summarize @missing-failure-fixture.txt"
+        );
+        assert!(app.session_history().iter().any(|item| matches!(item,
+            HistoryItem::Note(protocol::HistoryNote::Context { name, text })
+                if name == "retained-hook" && text == "keep hook context"
+        )));
+        assert!(app
+            .session_history()
+            .iter()
+            .all(|item| !matches!(item, HistoryItem::User { .. })));
+        assert!(app
+            .render_unsettled_silent()
+            .text()
+            .contains("keep callback display"));
+        app.assert_invariants();
+    }
+}
+
+#[test]
+fn file_expansion_display_is_not_saved_until_promoted_in_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("fixture.txt"), "synthetic file content").unwrap();
+    let mut app = TestApp::builder()
+        .with_cwd(tmp.path())
+        .with_vim(false)
+        .build();
+    app.start_submitted_turn("baseline");
+    app.finish_turn();
+    app.wait_for_turn_persistence();
+    app.save_session_and_flush();
+    let id = app.session_snapshot().id.clone();
+    let reader =
+        smelt_store::LineageSessionReader::open_existing(app.app.core.sessions.sessions_dir(), &id)
+            .unwrap();
+    let baseline = reader.store_head().unwrap();
+    let (input_started, release) = app.app.conversation.submissions.pause_input();
+    app.type_text("summarize @fixture.txt");
+    app.press(KeyCode::Enter);
+    input_started.recv_timeout(Duration::from_secs(5)).unwrap();
+    let block_id = app
+        .app
+        .conversation
+        .transcript()
+        .history()
+        .last_block_id()
+        .unwrap();
+    assert!(!app
+        .app
+        .conversation
+        .transcript()
+        .history()
+        .is_persisted_block(block_id));
+    app.save_session_and_flush();
+    let saved = reader.store_head().unwrap();
+    assert_eq!(saved.history_len, baseline.history_len);
+    assert_eq!(
+        saved.transcript_record_count,
+        baseline.transcript_record_count
+    );
+    assert!(!app
+        .app
+        .core
+        .files
+        .has(&tmp.path().join("fixture.txt").to_string_lossy()));
+    release.send(()).unwrap();
+    app.wait_for_turn_persistence();
+    assert_eq!(
+        app.app.conversation.transcript().history().last_block_id(),
+        Some(block_id)
+    );
+    assert!(app
+        .app
+        .conversation
+        .transcript()
+        .history()
+        .is_persisted_block(block_id));
+    let sends = app.drain_engine_sends();
+    let payload = sends
+        .iter()
+        .rev()
+        .find_map(|command| match command {
+            protocol::UiCommand::StartTurn(payload) => Some(payload),
+            _ => None,
+        })
+        .unwrap();
+    assert!(payload
+        .input
+        .provider_content()
+        .text_content()
+        .contains("synthetic file content"));
+    assert!(app
+        .app
+        .core
+        .files
+        .has(&tmp.path().join("fixture.txt").to_string_lossy()));
+    app.assert_invariants();
+}
+
+#[test]
+fn file_expansion_cancellation_and_force_ignore_stale_results() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("old.txt"), "old synthetic content").unwrap();
+    for force in [false, true] {
+        let mut app = TestApp::builder()
+            .with_cwd(tmp.path())
+            .with_vim(false)
+            .build();
+        app.ensure_writer_ready();
+        let (input_started, release) = app.app.conversation.submissions.pause_input();
+        app.type_text("summarize @old.txt");
+        app.press(KeyCode::Enter);
+        input_started.recv_timeout(Duration::from_secs(5)).unwrap();
+        if force {
+            app.type_text("new request");
+            for _ in 0..3 {
+                app.press(KeyCode::Enter);
+            }
+            assert!(app.state().queued_inputs.is_empty());
+            assert_eq!(
+                app.state().prompt_text,
+                "",
+                "forcing restored cancelled input"
+            );
+            assert!(app.render_unsettled_silent().text().contains("new request"));
+        } else {
+            app.press(KeyCode::Esc);
+            app.press(KeyCode::Esc);
+            assert_eq!(app.state().prompt_text, "summarize @old.txt");
+            assert!(!app.app.turn_submission_is_pending());
+        }
+        release.send(()).unwrap();
+        app.wait_for_turn_persistence();
+        assert!(!app
+            .app
+            .core
+            .files
+            .has(&tmp.path().join("old.txt").to_string_lossy()));
+        let inputs: Vec<_> = app
+            .drain_engine_sends()
+            .into_iter()
+            .filter_map(|command| match command {
+                protocol::UiCommand::StartTurn(payload) => {
+                    Some(payload.input.provider_content().text_content().into_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            inputs,
+            if force {
+                vec!["new request".to_string()]
+            } else {
+                Vec::new()
+            }
+        );
+        app.assert_invariants();
+    }
+}
+
+#[test]
+fn scoped_preparation_errors_cannot_stop_another_turn_or_session() {
+    let mut app = TestApp::builder().with_vim(false).build();
+    app.type_text("active request");
+    app.press(KeyCode::Enter);
+    app.wait_for_turn_persistence();
+    let turn_id = app.app.conversation.active().unwrap().turn_id;
+    let session_id = app.session_snapshot().id.clone();
+    let persistence = app.app.conversation.persistence_scope();
+    for stale in 0..3 {
+        let mut scope = persistence;
+        if stale == 2 {
+            scope.epoch = scope.epoch.wrapping_add(1);
+        }
+        app.engine_event(EngineEvent::TurnPreparationError {
+            turn_id: if stale == 0 { turn_id + 1 } else { turn_id },
+            session_id: if stale == 1 {
+                "another-session".into()
+            } else {
+                session_id.clone()
+            },
+            persistence: scope,
+            message: "stale request preparation failure".into(),
+        });
+        assert!(app.agent_running());
+        assert!(!app
+            .render_unsettled_silent()
+            .text()
+            .contains("stale request preparation failure"));
+    }
+    app.engine_event(EngineEvent::TurnPreparationError {
+        turn_id,
+        session_id,
+        persistence,
+        message: "matching request preparation failure".into(),
+    });
+    assert!(!app.agent_running());
+    assert!(app
+        .render_unsettled_silent()
+        .text()
+        .contains("matching request preparation failure"));
+    app.assert_invariants();
 }
 
 #[test]
@@ -727,7 +1414,167 @@ fn rejected_paste_keeps_shell_escape_disabled_on_resubmission() {
 }
 
 #[test]
-fn canonical_completion_repaints_before_receipt_and_gates_queued_dispatch() {
+fn queued_paste_recovery_does_not_reinterpret_model_input_as_a_shell_command() {
+    let mut app = TestApp::builder().with_vim(false).build();
+    app.start_submitted_turn("first request");
+    app.app.flush_persist();
+    app.feed_one(SourceEvent::Term(Event::Paste(
+        "!literal model input".into(),
+    )));
+    app.press(KeyCode::Enter);
+    assert_eq!(app.state().queued_inputs, ["!literal model input"]);
+    app.app
+        .conversation
+        .inject_commit_failure(smelt_store::SessionCommitFailure::OwnershipLost);
+    app.app.discard_turn(crate::app::TurnEnd::Complete);
+    app.app.flush_persist();
+    app.wait_for_turn_persistence();
+    assert_eq!(app.prompt_source(), "!literal model input");
+    assert!(app.app.prompt.skip_shell_escape());
+    assert!(!app.agent_running());
+}
+
+#[test]
+fn repeated_force_during_pending_submit_dispatches_only_the_latest_turn() {
+    let mut app = TestApp::builder().with_vim(false).build();
+    app.ensure_writer_ready();
+    let release = app.app.conversation.pause_persistence();
+    app.type_text("first accepted");
+    app.press(KeyCode::Enter);
+    for replacement in ["second accepted", "third accepted"] {
+        app.type_text(replacement);
+        app.press(KeyCode::Enter);
+        app.press(KeyCode::Enter);
+        app.press(KeyCode::Enter);
+        assert!(app.state().queued_inputs.is_empty());
+        assert!(app.app.turn_submission_is_pending());
+        assert!(app.working_probe().is_animating());
+    }
+    release.send(()).unwrap();
+    app.wait_for_turn_persistence();
+    let inputs: Vec<_> = app
+        .drain_engine_sends()
+        .into_iter()
+        .filter_map(|command| match command {
+            protocol::UiCommand::StartTurn(payload) => {
+                Some(payload.input.provider_content().text_content().into_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(inputs, ["third accepted"]);
+    assert!(app.agent_running());
+    app.assert_invariants();
+}
+
+#[test]
+fn forced_queued_submission_is_visible_before_cancel_persistence() {
+    let mut app = TestApp::builder().with_vim(false).build();
+    app.start_submitted_turn("initial request");
+    app.drain_engine_sends();
+    let release = app.app.conversation.pause_persistence();
+    app.type_text("forced replacement");
+    app.press(KeyCode::Enter);
+    app.press(KeyCode::Enter);
+    app.press(KeyCode::Enter);
+    let frame = app.render_to_frame().text();
+    let history = app.app.conversation.transcript().history();
+    let visible = history.order.iter().filter_map(|id| history.block(*id)).any(|block| {
+        matches!(block, smelt_core::Block::User { text, .. } if text == "forced replacement")
+    });
+    let queued = app.state().queued_inputs.len();
+    let preparing = app.app.turn_submission_is_pending();
+    release.send(()).unwrap();
+    app.wait_for_turn_persistence();
+    assert!(visible, "forced message was not in the transcript: {frame}");
+    assert_eq!(queued, 0, "forced message returned to a queue");
+    assert!(preparing, "forced message did not start a visible turn");
+}
+
+#[test]
+fn large_response_keeps_history_append_and_follow_up_enter_responsive() {
+    let mut app = TestApp::builder().with_vim(false).build();
+    app.start_submitted_turn("initial request");
+    app.drain_engine_sends();
+    let turn_id = app.current_turn_id().unwrap();
+    let body = format!("```\n{}\n```", "x".repeat(1024 * 1024));
+    app.feed_one(SourceEvent::engine(EngineEvent::TextDelta {
+        delta: body.clone(),
+    }));
+    let release = app.app.conversation.pause_persistence();
+    let perf_enabled = smelt_perf::perf::enabled();
+    smelt_perf::perf::enable();
+    smelt_perf::perf::clear();
+    let appended_at = std::time::Instant::now();
+    app.feed_one(SourceEvent::engine(EngineEvent::HistoryAppended {
+        turn_id,
+        delta: protocol::CanonicalHistoryDelta::new(
+            1,
+            vec![HistoryItem::Assistant(protocol::AssistantStep::terminal(
+                Some(Content::text(body)),
+                None,
+                Vec::new(),
+            ))],
+        ),
+    }));
+    let append_elapsed = appended_at.elapsed();
+    let completed_at = std::time::Instant::now();
+    app.feed_one(SourceEvent::engine(EngineEvent::TurnComplete {
+        turn_id,
+        history: None,
+        meta: None,
+    }));
+    let completion_elapsed = completed_at.elapsed();
+    app.type_text("follow-up request");
+    let entered_at = std::time::Instant::now();
+    app.press(KeyCode::Enter);
+    let enter_elapsed = entered_at.elapsed();
+    let accepted = app.app.turn_submission_is_pending();
+    release.send(()).unwrap();
+    let timings = smelt_perf::perf::snapshot_top(12);
+    assert!(
+        append_elapsed < Duration::from_millis(250),
+        "history append blocked UI for {append_elapsed:?}: {timings:?}"
+    );
+    assert!(
+        completion_elapsed < Duration::from_millis(250),
+        "completion blocked UI for {completion_elapsed:?}: {timings:?}"
+    );
+    assert!(
+        enter_elapsed < Duration::from_millis(250),
+        "Enter blocked UI for {enter_elapsed:?}"
+    );
+    assert!(accepted);
+    app.wait_for_turn_persistence();
+    let snapshot = smelt_perf::perf::snapshot();
+    smelt_perf::perf::set_enabled(perf_enabled);
+    for label in [
+        "persist:canonical:prepare",
+        "persist:submit_turn",
+        "persist:publication:complete",
+    ] {
+        let row = snapshot
+            .durations
+            .iter()
+            .find(|row| row.label == label)
+            .expect("measured large-response boundary phase");
+        eprintln!("large changed response {row:?}");
+    }
+    assert!(app.agent_running());
+    let reader = smelt_store::LineageSessionReader::open_existing(
+        app.core_probe().sessions.sessions_dir(),
+        &app.session_snapshot().id,
+    )
+    .unwrap();
+    let stored = reader.history_range(1, 3).unwrap();
+    assert!(matches!(&stored[0], HistoryItem::Assistant(step)
+        if step.content.as_ref().unwrap().text_content() == format!("```\n{}\n```", "x".repeat(1024 * 1024))));
+    assert!(matches!(&stored[1], HistoryItem::User { content, .. }
+        if content.text_content() == "follow-up request"));
+}
+
+#[test]
+fn canonical_completion_accepts_queued_work_before_receipt_and_gates_dispatch() {
     for queued in [false, true] {
         let mut app = TestApp::builder().build();
         app.start_submitted_turn("initial request");
@@ -741,11 +1588,15 @@ fn canonical_completion_repaints_before_receipt_and_gates_queued_dispatch() {
         app.render_silent();
         assert!(started.elapsed() < std::time::Duration::from_millis(500));
         assert!(!app.agent_running());
-        assert!(!app.working_probe().is_animating());
-        assert_eq!(
-            app.working_probe().last_outcome(),
-            Some(smelt_core::working::TurnOutcome::Done)
-        );
+        assert_eq!(app.working_probe().is_animating(), queued);
+        assert_eq!(app.app.turn_submission_is_pending(), queued);
+        assert!(app.state().queued_inputs.is_empty());
+        if !queued {
+            assert_eq!(
+                app.working_probe().last_outcome(),
+                Some(smelt_core::working::TurnOutcome::Done)
+            );
+        }
         assert!(app.app.conversation.canonical_operations_are_pending());
         assert!(app
             .drain_engine_sends()
@@ -839,6 +1690,7 @@ fn saved_one_row_session(guard: &smelt_test_support::ProcessEnvironmentGuard) ->
 fn wait_for_session_load(app: &mut TestApp, id: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while app.session_snapshot().id != id {
+        app.app.drain_persist_reports();
         if let Some(event) = app.try_recv_app_event() {
             app.handle_app_event(event);
         } else {
@@ -2565,9 +3417,13 @@ fn large_sparse_fork_preserves_every_canonical_history_and_record_row() {
         } else {
             &fork_id
         };
+        resumed
+            .set_lua_string_global("__switch_target", target.clone())
+            .unwrap();
         let started = std::time::Instant::now();
-        assert!(resumed.load_session_by_id(target));
+        assert!(resumed.run_lua("smelt.session.load(__switch_target)"));
         switch_durations.push(started.elapsed());
+        resumed.wait_for_session_lifecycle();
         assert_eq!(resumed.session_snapshot().id.as_str(), target.as_str());
         assert_eq!(resumed.app.session_history_len(), 700);
     }
@@ -3011,6 +3867,7 @@ fn resumed_rewind_restores_prior_turn_context_before_next_request() {
     resumed.render_silent();
 
     resumed.rewind_to_history_index(Some(2), false);
+    resumed.wait_for_rewind();
     assert_eq!(resumed.session_message_count(), 2);
     assert_eq!(resumed.session_snapshot().context_tokens, Some(100));
     assert_eq!(
@@ -3319,6 +4176,7 @@ fn resume_waits_for_pending_catalog_publication() {
 fn wait_for_fork(app: &mut TestApp, source_id: &str) -> String {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while app.session_snapshot().id == source_id {
+        app.app.drain_persist_reports();
         if let Some(event) = app.try_recv_app_event() {
             app.handle_app_event(event);
         } else {

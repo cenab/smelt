@@ -195,7 +195,7 @@ impl<T: Clone> InlineLine<T> {
 
 impl<T: Clone + PartialEq> InlineLine<T> {
     pub fn wrap_rows(&self, max_cells: usize) -> usize {
-        self.wrap_ranges(max_cells).len()
+        self.wrap_fragments(max_cells).len()
     }
 
     pub fn wrap_ranges(&self, max_cells: usize) -> Vec<Vec<InlineRun<T>>> {
@@ -396,7 +396,24 @@ fn append_grapheme_fragments<T: Clone>(
     range: Range<usize>,
     state: &mut WrapState<T>,
 ) {
-    for (offset, grapheme) in grapheme_indices(&run.text[range.clone()]) {
+    let text = &run.text[range.clone()];
+    if text.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+        let mut start = range.start;
+        while start < range.end {
+            if state.col + state.pending_width() >= state.max_cells() && state.col > 0 {
+                state.push_row();
+            }
+            let available = state
+                .max_cells()
+                .saturating_sub(state.col + state.pending_width());
+            let len = available.max(1).min(range.end - start);
+            state.append_fragment(run_index, start..start + len, run);
+            state.col += len;
+            start += len;
+        }
+        return;
+    }
+    for (offset, grapheme) in grapheme_indices(text) {
         let start = range.start + offset;
         let end = start + grapheme.len();
         let width = text_width(grapheme);
@@ -429,6 +446,55 @@ mod tests {
         rows.into_iter()
             .map(|row| row.into_iter().map(|run| run.text).collect())
             .collect()
+    }
+
+    #[test]
+    fn ascii_chunks_match_grapheme_wrapping_with_occupied_cells() {
+        for first_cells in 1..=4 {
+            for continuation_cells in 1..=4 {
+                for first_occupied in 0..=first_cells {
+                    for continuation_occupied in 0..=continuation_cells {
+                        for prefix in ["", ">", "oversized prefix"] {
+                            for text in ["", "abcdefghij", " aa bb cc "] {
+                                let run = InlineRun::new(text, (), BreakPolicy::PreserveSpaces);
+                                let make_state = || {
+                                    let mut state = WrapState::new(
+                                        first_cells,
+                                        first_occupied,
+                                        continuation_cells,
+                                        continuation_occupied,
+                                    );
+                                    state.push_pending_attach(
+                                        1,
+                                        &InlineRun::new(prefix, (), BreakPolicy::AttachNext),
+                                    );
+                                    state
+                                };
+                                let mut actual = make_state();
+                                append_grapheme_fragments(0, &run, 0..text.len(), &mut actual);
+                                let mut expected = make_state();
+                                for (offset, grapheme) in grapheme_indices(text) {
+                                    let width = text_width(grapheme);
+                                    if expected.col + expected.pending_width() + width
+                                        > expected.max_cells()
+                                        && expected.col > 0
+                                    {
+                                        expected.push_row();
+                                    }
+                                    expected.append_fragment(
+                                        0,
+                                        offset..offset + grapheme.len(),
+                                        &run,
+                                    );
+                                    expected.col += width;
+                                }
+                                assert_eq!(actual.finish(), expected.finish());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

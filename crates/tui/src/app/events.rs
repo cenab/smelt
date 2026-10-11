@@ -956,15 +956,10 @@ impl TuiApp {
                 count: interrupted.unsteer_count(),
             });
         }
-        let terminal_commit = self.discard_turn(crate::app::TurnEnd::Cancelled);
+        self.discard_turn(crate::app::TurnEnd::Cancelled);
         if let Some(queued) = self.prompt.restore_after_interrupt(interrupted) {
-            // Interrupt-and-send authorizes the replacement, even if persistence is still pending.
             self.conversation.set_turn_pause(None);
-            if terminal_commit.is_durable() {
-                if let Err(queued) = self.start_queued_input(queued) {
-                    self.prompt.queue_front(QueueStage::Turn, queued);
-                }
-            } else {
+            if let Err(queued) = self.start_queued_input(queued) {
                 self.prompt.queue_front(QueueStage::Turn, queued);
             }
         }
@@ -2889,7 +2884,8 @@ mod tests {
             app.press(KeyCode::Enter);
             app.clear_actions();
             app.press(KeyCode::Enter);
-            assert_eq!(queue_stages(&app), vec!["turn"]);
+            assert!(queue_stages(&app).is_empty());
+            assert!(app.app.turn_submission_is_pending());
             assert!(app.actions().iter().all(|action| !matches!(
                 action,
                 Action::EngineSend(command)
@@ -3006,7 +3002,8 @@ mod tests {
             app.app.discard_turn(crate::app::TurnEnd::Cancelled);
             app.type_text("/follow-up");
             app.press_mod(KeyCode::Enter, modifiers);
-            assert_eq!(queue_stages(&app), vec!["turn"]);
+            assert!(queue_stages(&app).is_empty());
+            assert!(app.app.turn_submission_is_pending());
             release.send(()).unwrap();
             app.wait_for_turn_persistence();
             assert!(app.agent_running(), "command stayed paused: {busy}");
@@ -3037,7 +3034,8 @@ mod tests {
 
         app.press(KeyCode::Esc);
         app.press(KeyCode::Esc);
-        assert!(app.app.turn_submission_is_pending());
+        assert!(!app.app.turn_submission_is_pending());
+        assert!(app.app.conversation.canonical_operations_are_pending());
         assert!(!app.agent_running());
 
         release_persistence
@@ -3107,7 +3105,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_waits_for_terminal_turn_before_submitting_queued_request() {
+    fn interrupt_accepts_queued_request_before_terminal_persistence() {
         let mut app = TestApp::builder().build();
         app.type_text("first turn");
         app.press(KeyCode::Enter);
@@ -3138,7 +3136,8 @@ mod tests {
             app.app.conversation.read_only_reason()
         );
         assert!(!app.agent_running());
-        assert_eq!(app.state().queued_inputs, vec!["run now"]);
+        assert!(app.state().queued_inputs.is_empty());
+        assert!(app.app.turn_submission_is_pending());
 
         release_persistence
             .send(())

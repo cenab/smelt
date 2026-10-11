@@ -123,11 +123,11 @@ impl std::fmt::Display for SessionBatchPreparationError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ProjectedSessionSave {
     pub(crate) record_projection: SessionRecordSaveProjection,
     history: smelt_store::HistorySuffix,
-    records: Option<smelt_store::TranscriptRecordSuffix>,
+    records: Option<Vec<smelt_core::transcript_model::CapturedTranscriptBlockRecord>>,
 }
 
 impl ProjectedSessionSave {
@@ -136,7 +136,122 @@ impl ProjectedSessionSave {
         session: &Session,
         expected: smelt_store::StoreHead,
     ) -> Result<smelt_core::session::PreparedArchiveSave, smelt_store::StoreError> {
-        session.prepare_archive_save(expected, self.history, self.records)
+        let archives = session.capture_archive_save(expected, self.history.final_len)?;
+        self.prepare(archives)
+    }
+
+    fn prepare(
+        self,
+        archives: smelt_core::session::CapturedArchiveSave,
+    ) -> Result<smelt_core::session::PreparedArchiveSave, smelt_store::StoreError> {
+        let records = self
+            .records
+            .map(|records| {
+                let bounds = self
+                    .record_projection
+                    .bounds
+                    .expect("captured record bounds");
+                Ok::<_, smelt_store::StoreError>(smelt_store::TranscriptRecordSuffix {
+                    start: smelt_store::TranscriptRecordIndex::new(bounds.record_start_idx as u64),
+                    records: records
+                        .into_iter()
+                        .enumerate()
+                        .map(|(offset, record)| {
+                            transcript_record_row(
+                                bounds.record_start_idx + offset,
+                                &record.prepare(),
+                                &self.history,
+                            )
+                        })
+                        .collect::<Result<_, _>>()?,
+                })
+            })
+            .transpose()?;
+        archives.prepare(self.history, records)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SessionBatch {
+    pub(crate) generation: PersistenceGeneration,
+    pub(crate) record_projection: SessionRecordSaveProjection,
+    content: SessionBatchContent,
+}
+
+#[derive(Clone, Debug)]
+enum SessionBatchContent {
+    Captured(std::sync::Arc<CapturedSessionSave>),
+    Prepared(std::sync::Arc<smelt_core::session::PreparedArchiveSave>),
+}
+
+#[derive(Debug)]
+struct CapturedSessionSave {
+    projection: ProjectedSessionSave,
+    archives: smelt_core::session::CapturedArchiveSave,
+}
+
+impl PartialEq for SessionBatch {
+    fn eq(&self, other: &Self) -> bool {
+        if self.generation != other.generation || self.record_projection != other.record_projection
+        {
+            return false;
+        }
+        match (&self.content, &other.content) {
+            (SessionBatchContent::Captured(left), SessionBatchContent::Captured(right)) => {
+                std::sync::Arc::ptr_eq(left, right)
+                    || (left.archives.same_snapshot(&right.archives)
+                        && left.projection == right.projection)
+            }
+            (SessionBatchContent::Prepared(left), SessionBatchContent::Prepared(right)) => {
+                std::sync::Arc::ptr_eq(left, right) || left.same_snapshot(right)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl SessionBatch {
+    pub(crate) fn session_id(&self) -> &str {
+        match &self.content {
+            SessionBatchContent::Captured(capture) => capture.archives.session_id(),
+            SessionBatchContent::Prepared(frame) => &frame.command().session_id,
+        }
+    }
+
+    pub(crate) fn matches_archive_base(&self, session: &Session) -> bool {
+        let base = match &self.content {
+            SessionBatchContent::Captured(capture) => capture.archives.archive_base(),
+            SessionBatchContent::Prepared(frame) => frame.command().archive_base.as_ref(),
+        };
+        base == session.archive_base()
+    }
+
+    /// Prepare on the persistence actor, then retain the exact frame for all attempts.
+    pub(crate) fn prepare(&self) -> Result<PreparedSessionBatch, smelt_store::StoreError> {
+        let frame = match &self.content {
+            SessionBatchContent::Captured(capture) => std::sync::Arc::new(
+                capture
+                    .projection
+                    .clone()
+                    .prepare(capture.archives.clone())?,
+            ),
+            SessionBatchContent::Prepared(frame) => frame.clone(),
+        };
+        Ok(PreparedSessionBatch {
+            generation: self.generation,
+            record_projection: self.record_projection,
+            frame,
+        })
+    }
+}
+
+impl From<PreparedSessionBatch> for SessionBatch {
+    fn from(batch: PreparedSessionBatch) -> Self {
+        Self {
+            generation: batch.generation,
+            record_projection: batch.record_projection,
+            content: SessionBatchContent::Prepared(batch.frame),
+        }
     }
 }
 
@@ -160,10 +275,6 @@ impl PreparedSessionBatch {
     pub(crate) fn command(&self) -> &smelt_store::CompactSessionCommit {
         self.frame.command()
     }
-
-    pub(crate) fn matches_archive_base(&self, session: &Session) -> bool {
-        self.command().archive_base.as_ref() == session.archive_base()
-    }
 }
 
 pub(crate) struct SessionDocument {
@@ -182,6 +293,7 @@ enum ChangeTracking {
 pub(crate) struct TuiSessionDocument {
     pub(crate) transcript: TranscriptDocument,
     pub(crate) live_session: Option<LiveSession>,
+    pub(crate) navigation: smelt_core::session_runtime::HistoryNavigation,
     changes: DocumentChanges,
     persistence_epoch: Option<SessionEpoch>,
     change_tracking: ChangeTracking,
@@ -192,6 +304,7 @@ impl TuiSessionDocument {
         Self {
             transcript,
             live_session: None,
+            navigation: Default::default(),
             changes: DocumentChanges::default(),
             persistence_epoch: None,
             change_tracking: ChangeTracking::Enabled,
@@ -232,6 +345,20 @@ impl TuiSessionDocument {
             Some(&mut self.transcript),
             mutation,
         );
+        if self.live_session.is_none() {
+            if let Some(start) = change.history_dirty_from {
+                self.navigation.truncate(start);
+                for (offset, item) in session
+                    .history
+                    .get(start..)
+                    .unwrap_or(&[])
+                    .iter()
+                    .enumerate()
+                {
+                    self.navigation.append(start + offset, item);
+                }
+            }
+        }
         self.record_change(generation, &change);
         change
     }
@@ -397,6 +524,7 @@ impl TuiSessionDocument {
             Some(live_session.history_len())
         );
         self.live_session = Some(live_session);
+        self.navigation = Default::default();
         self.transcript.replace_loaded_transcript(transcript);
         self.changes.install_head(store_head);
         self.persistence_epoch = None;
@@ -412,24 +540,37 @@ impl TuiSessionDocument {
         self.changes.history_dirty_from
     }
 
-    pub(crate) fn prepare_event_batch(
+    pub(crate) fn capture_event_batch(
+        &mut self,
+        session: &mut Session,
+        metadata: RuntimeSessionMetadata,
+    ) -> Result<Option<SessionBatch>, SessionBatchPreparationError> {
+        let _perf = smelt_perf::perf::begin("session:capture_save_batch");
+        let Some(projection) = self.project_save_with_history(session, metadata, None)? else {
+            return Ok(None);
+        };
+        let archives = session
+            .capture_archive_save(self.changes.published_head, projection.history.final_len)
+            .map_err(|error| error.to_string())?;
+        Ok(Some(SessionBatch {
+            generation: self.changes.current,
+            record_projection: projection.record_projection,
+            content: SessionBatchContent::Captured(std::sync::Arc::new(CapturedSessionSave {
+                projection,
+                archives,
+            })),
+        }))
+    }
+
+    #[cfg(test)]
+    fn prepare_event_batch(
         &mut self,
         session: &mut Session,
         metadata: RuntimeSessionMetadata,
     ) -> Result<Option<PreparedSessionBatch>, SessionBatchPreparationError> {
-        let _perf = smelt_perf::perf::begin("session:prepare_save_batch");
-        let Some(projection) = self.project_save_with_history(session, metadata, None)? else {
-            return Ok(None);
-        };
-        let record_projection = projection.record_projection;
-        let frame = projection
-            .prepare_archives(session, self.changes.published_head)
-            .map_err(|error| error.to_string())?;
-        Ok(Some(PreparedSessionBatch {
-            generation: self.changes.current,
-            record_projection,
-            frame: std::sync::Arc::new(frame),
-        }))
+        self.capture_event_batch(session, metadata)?
+            .map(|capture| capture.prepare().map_err(|error| error.to_string().into()))
+            .transpose()
     }
 
     pub(crate) fn prepare_fork_save(
@@ -516,26 +657,12 @@ impl TuiSessionDocument {
                     "hydrate canonical transcript record suffix".to_owned(),
                 ),
             })?;
-        let records = record_bounds
-            .map(|bounds| {
-                let records = self
-                    .transcript
-                    .history()
-                    .block_records_with_ids_from(bounds.order_start)
-                    .iter()
-                    .enumerate()
-                    .map(|(offset, record)| {
-                        transcript_record_row(bounds.record_start_idx + offset, record, &history)
-                    })
-                    .collect::<Result<Vec<_>, smelt_store::StoreError>>()?;
-                Ok::<_, smelt_store::StoreError>(smelt_store::TranscriptRecordSuffix {
-                    start: smelt_store::TranscriptRecordIndex::new(bounds.record_start_idx as u64),
-                    records,
-                })
-            })
-            .transpose();
+        let records = record_bounds.map(|bounds| {
+            self.transcript
+                .history()
+                .capture_block_records_with_ids_from(bounds.order_start)
+        });
         self.transcript.unpin_record_suffix_after_save();
-        let records = records.map_err(|error| error.to_string())?;
         Ok(Some(ProjectedSessionSave {
             record_projection,
             history,
@@ -543,17 +670,17 @@ impl TuiSessionDocument {
         }))
     }
 
-    pub(crate) fn prepare_turn_batch(
+    pub(crate) fn capture_turn_batch(
         &mut self,
         session: &mut Session,
         metadata: RuntimeSessionMetadata,
-    ) -> Result<PreparedSessionBatch, SessionBatchPreparationError> {
+    ) -> Result<SessionBatch, SessionBatchPreparationError> {
         if self.changes.current == self.changes.durable
             && self.transcript.history().record_dirty_from().is_none()
         {
             self.changes.force_dirty();
         }
-        self.prepare_event_batch(session, metadata)?.ok_or_else(|| {
+        self.capture_event_batch(session, metadata)?.ok_or_else(|| {
             SessionBatchPreparationError::Invalid(
                 "a canonical turn update requires persisted session history".to_string(),
             )
@@ -772,10 +899,12 @@ pub(crate) enum HistoryMutation {
     },
     TruncateFrom {
         index: usize,
+        user_turn_count: Option<usize>,
         identity: ContextTokenIdentity,
     },
     RewindTo {
         index: usize,
+        user_turn_count: Option<usize>,
         keep_checkpoint_at_boundary: bool,
         identity: ContextTokenIdentity,
     },
@@ -784,6 +913,20 @@ pub(crate) enum HistoryMutation {
 pub(crate) enum TranscriptMutation {
     AppendBlock {
         block: Block,
+    },
+    AppendAccepted {
+        block: Block,
+    },
+    PromoteAccepted {
+        id: BlockId,
+        history_index: usize,
+    },
+    RemoveAccepted {
+        id: BlockId,
+    },
+    RemoveSubmittedUser {
+        id: BlockId,
+        history_index: usize,
     },
     InsertCheckpointMarker {
         block_index: usize,
@@ -1032,9 +1175,13 @@ impl SessionDocument {
         store_address: SessionStoreAddress,
         store_head: smelt_store::StoreHead,
         transcript: crate::app::transcript::LoadedTranscript,
+        user_turn_count: usize,
     ) -> Self {
-        let live_session =
-            smelt_core::session_runtime::LiveSession::from_store(header, store_address);
+        let live_session = smelt_core::session_runtime::LiveSession::from_store(
+            header,
+            store_address,
+            user_turn_count,
+        );
         Self {
             session,
             transcript,
@@ -1098,7 +1245,7 @@ impl SessionDocument {
             .then(|| {
                 live_session
                     .as_deref()
-                    .map(|live| (live.live_start, live.live_history.len()))
+                    .map(|live| (live.live_start, live.live_suffix_len()))
             })
             .flatten();
         let mut result = match mutation {
@@ -1129,10 +1276,14 @@ impl SessionDocument {
                 block.map(|block| *block),
                 first_user_message,
             ),
-            HistoryMutation::TruncateFrom { index, identity } => {
+            HistoryMutation::TruncateFrom {
+                index,
+                user_turn_count,
+                identity,
+            } => {
                 let dirty_from = if let Some(live_session) = live_session.as_deref_mut() {
                     let index = index.min(live_session.history_len());
-                    live_session.truncate_from(index);
+                    live_session.truncate_from(index, user_turn_count);
                     index
                 } else {
                     let index = index.min(session.history.len());
@@ -1150,12 +1301,13 @@ impl SessionDocument {
             }
             HistoryMutation::RewindTo {
                 index,
+                user_turn_count,
                 keep_checkpoint_at_boundary,
                 identity,
             } => {
                 let dirty_from = if let Some(live_session) = live_session.as_deref_mut() {
                     let index = index.min(live_session.history_len());
-                    live_session.truncate_from(index);
+                    live_session.truncate_from(index, user_turn_count);
                     index
                 } else {
                     let index = index.min(session.history.len());
@@ -1181,7 +1333,7 @@ impl SessionDocument {
             && before_live
                 == live_session
                     .as_deref()
-                    .map(|live| (live.live_start, live.live_history.len()))
+                    .map(|live| (live.live_start, live.live_suffix_len()))
         {
             result.session_dirty = false;
             result.history_dirty_from = None;
@@ -1593,6 +1745,21 @@ impl SessionDocument {
                 transcript.history().record_dirty_generation() != before_generation
                     || transcript.history().record_dirty_from() != before_dirty_from
             }
+            TranscriptMutation::AppendAccepted { block } => {
+                transcript
+                    .push_with_origin(block, smelt_core::transcript_model::BlockOrigin::Accepted);
+                block_id = transcript.history().last_block_id();
+                block_id.is_some()
+            }
+            TranscriptMutation::PromoteAccepted { id, history_index } => {
+                transcript.history_mut().promote_accepted(id, history_index)
+            }
+            TranscriptMutation::RemoveAccepted { id } => {
+                transcript.history_mut().remove_accepted(id)
+            }
+            TranscriptMutation::RemoveSubmittedUser { id, history_index } => transcript
+                .history_mut()
+                .remove_submitted_user(id, history_index),
             TranscriptMutation::InsertCheckpointMarker {
                 block_index,
                 history_index,
@@ -1776,7 +1943,17 @@ mod tests {
             revision: 0,
             degraded_warnings: Vec::new(),
         };
-        LiveSession::from_parts(header, std::path::PathBuf::new(), None)
+        LiveSession::from_parts(
+            header,
+            std::path::PathBuf::new(),
+            None,
+            session
+                .history
+                .iter()
+                .take(history_len)
+                .filter_map(smelt_core::session_runtime::rewind_label)
+                .count(),
+        )
     }
 
     fn apply_usage(session: &mut Session, mutation: UsageMutation) -> DocumentChange {
@@ -2040,6 +2217,7 @@ mod tests {
             &mut session,
             HistoryMutation::RewindTo {
                 index: 0,
+                user_turn_count: None,
                 keep_checkpoint_at_boundary: false,
                 identity,
             },
@@ -2352,6 +2530,7 @@ mod tests {
             &mut session,
             HistoryMutation::TruncateFrom {
                 index: 1,
+                user_turn_count: None,
                 identity: token_identity(),
             },
         );
@@ -2874,7 +3053,11 @@ mod tests {
         let base = session.archive_base().unwrap().clone();
         let mut document = TuiSessionDocument::new(TranscriptDocument::new());
         document.changes.install_head(resume.head);
-        document.live_session = Some(LiveSession::from_store(resume.header, resume.store_address));
+        document.live_session = Some(LiveSession::from_store(
+            resume.header,
+            resume.store_address,
+            resume.user_turn_count,
+        ));
         let epoch = SessionEpoch::new(7);
         document.bind_persistence(epoch);
         document.apply_metadata(
@@ -2897,7 +3080,12 @@ mod tests {
             },
         });
         let pending = document.changes;
-        let history = document.live_session.as_ref().unwrap().live_history.clone();
+        let history = document
+            .live_session
+            .as_ref()
+            .unwrap()
+            .live_history()
+            .to_vec();
         let record_dirty = document.transcript.history().record_dirty_from();
         assert!(record_dirty.is_some());
         let writer =
@@ -2939,7 +3127,7 @@ mod tests {
         assert_eq!(session.title.as_deref(), Some("pending title"));
         let live = document.live_session.as_ref().unwrap();
         assert_eq!(live.header.revision, recovery.head().revision.get());
-        assert_eq!(live.live_history, history);
+        assert_eq!(live.live_history(), history);
         assert_eq!(live.history_len(), 2);
         assert_eq!(
             document.transcript.history().record_dirty_from(),
@@ -2993,6 +3181,7 @@ mod tests {
                 &mut session,
                 HistoryMutation::TruncateFrom {
                     index: 0,
+                    user_turn_count: None,
                     identity: token_identity(),
                 },
             ),
@@ -3217,6 +3406,75 @@ mod tests {
     }
 
     #[test]
+    fn captured_save_prepares_exact_records_and_archives_after_newer_document_edits() {
+        let mut session = Session::new(1, std::path::PathBuf::from("/tmp"));
+        let mut document = TuiSessionDocument::new(TranscriptDocument::new());
+        let epoch = SessionEpoch::new(7);
+        document.bind_persistence(epoch);
+        document.apply_history(
+            &mut session,
+            HistoryMutation::AppendItem {
+                item: HistoryItem::user(Content::text("captured request")),
+            },
+        );
+        document.apply_transcript(TranscriptMutation::AppendBlock {
+            block: Block::Text {
+                content: "captured display".into(),
+            },
+        });
+        document.apply_metadata(
+            &mut session,
+            MetadataMutation::SetTitle {
+                title: "captured title".into(),
+                slug: "captured-title".into(),
+                snapshot_history_len: 1,
+            },
+        );
+        let capture = document
+            .capture_event_batch(&mut session, runtime_metadata())
+            .unwrap()
+            .unwrap();
+        let expected = document
+            .prepare_event_batch(&mut session, runtime_metadata())
+            .unwrap()
+            .unwrap();
+        document.apply_history(
+            &mut session,
+            HistoryMutation::AppendItem {
+                item: HistoryItem::user(Content::text("newer request")),
+            },
+        );
+        document.apply_transcript(TranscriptMutation::AppendBlock {
+            block: Block::Text {
+                content: "newer display".into(),
+            },
+        });
+        document.apply_metadata(
+            &mut session,
+            MetadataMutation::SetTitle {
+                title: "newer title".into(),
+                slug: "newer-title".into(),
+                snapshot_history_len: 2,
+            },
+        );
+        let prepared = capture.prepare().unwrap();
+        assert_eq!(prepared, expected);
+        assert_eq!(prepared.command(), expected.command());
+        let (_root, mut writer) = native_writer(&session);
+        let acknowledgement =
+            acknowledgement_for(epoch, &prepared, publish(&prepared, &mut writer));
+        assert!(!document.acknowledge(&acknowledgement, &mut session, 2));
+        assert_eq!(session.title.as_deref(), Some("newer title"));
+        assert_eq!(session.history.len(), 2);
+        assert!(document.has_session_work());
+        assert!(session.metadata_snapshots.changed_suffix().is_some());
+        assert_eq!(
+            session.archive_base().unwrap().revision_id,
+            acknowledgement.result.revision_id
+        );
+    }
+
+    #[test]
     fn native_archive_adoption_preserves_newer_edits_and_invalidates_runtime_proofs() {
         let mut session = Session::new(1, std::path::PathBuf::from("/tmp"));
         session.created_at_ms = 1;
@@ -3311,12 +3569,12 @@ mod tests {
             session.archive_base().unwrap().revision_id,
             first_ack.result.revision_id
         );
-        assert!(!queued.matches_archive_base(&session));
+        assert!(!SessionBatch::from(queued.clone()).matches_archive_base(&session));
         let refreshed = document
             .prepare_event_batch(&mut session, runtime_metadata())
             .unwrap()
             .unwrap();
-        assert!(refreshed.matches_archive_base(&session));
+        assert!(SessionBatch::from(refreshed.clone()).matches_archive_base(&session));
         assert_eq!(queued, refreshed);
         assert_ne!(queued.command(), refreshed.command());
 
@@ -3392,6 +3650,7 @@ mod tests {
                             &mut session,
                             HistoryMutation::TruncateFrom {
                                 index: (state as usize) % (history_len + 1),
+                                user_turn_count: None,
                                 identity: token_identity(),
                             },
                         );
@@ -3625,7 +3884,7 @@ mod tests {
             .unwrap()
             .session;
         let mut document = TuiSessionDocument::new(TranscriptDocument::new());
-        document.live_session = Some(LiveSession::from_store(header, store_address));
+        document.live_session = Some(LiveSession::from_store(header, store_address, 2));
         document.changes.install_head(receipt.current);
         document.set_history_resave_from_for_test(0);
         document.apply_history(
@@ -3679,7 +3938,11 @@ mod tests {
                 .unwrap();
         let mut session = resume.session;
         let mut document = TuiSessionDocument::new(TranscriptDocument::new());
-        document.live_session = Some(LiveSession::from_store(resume.header, resume.store_address));
+        document.live_session = Some(LiveSession::from_store(
+            resume.header,
+            resume.store_address,
+            resume.user_turn_count,
+        ));
         document.changes.install_head(resume.head);
         document.apply_history(
             &mut session,
@@ -3705,9 +3968,63 @@ mod tests {
             document
                 .live_session
                 .as_ref()
+                .unwrap()
+                .navigation()
+                .user_turn_count(),
+            3
+        );
+        assert_eq!(
+            document
+                .live_session
+                .as_ref()
                 .expect("live session")
                 .live_suffix_len(),
             0
         );
+        document.apply_metadata(
+            &mut session,
+            MetadataMutation::SetTitle {
+                title: "metadata only".into(),
+                slug: "metadata-only".into(),
+                snapshot_history_len: 3,
+            },
+        );
+        let metadata = document
+            .prepare_event_batch(&mut session, runtime_metadata())
+            .unwrap()
+            .unwrap();
+        let acknowledgement =
+            acknowledgement_for(epoch, &metadata, publish(&metadata, &mut writer));
+        assert!(document.acknowledge(&acknowledgement, &mut session, 3));
+        assert_eq!(
+            document
+                .live_session
+                .as_ref()
+                .unwrap()
+                .navigation()
+                .user_turn_count(),
+            3
+        );
+        document.apply_history(
+            &mut session,
+            HistoryMutation::AppendItem {
+                item: HistoryItem::user(Content::text("fourth")),
+            },
+        );
+        let old = document
+            .prepare_event_batch(&mut session, runtime_metadata())
+            .unwrap()
+            .unwrap();
+        let acknowledgement = acknowledgement_for(epoch, &old, publish(&old, &mut writer));
+        document.apply_history(
+            &mut session,
+            HistoryMutation::AppendItem {
+                item: HistoryItem::user(Content::text("fifth")),
+            },
+        );
+        assert!(!document.acknowledge(&acknowledgement, &mut session, 5));
+        let live = document.live_session.as_ref().unwrap();
+        assert_eq!(live.navigation().user_turn_count(), 5);
+        assert_eq!(live.live_suffix_len(), 2);
     }
 }

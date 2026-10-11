@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::app::session_document::{
-    PersistenceGeneration, PreparedSessionBatch, SessionRecordSaveProjection,
+    PersistenceGeneration, PreparedSessionBatch, SessionBatch, SessionRecordSaveProjection,
 };
 
 const CONTROL_CAPACITY: usize = 64;
@@ -307,6 +307,27 @@ struct PreparedClose {
     finalize: Option<mpsc::Sender<mpsc::Sender<PersistenceCloseOutcome>>>,
 }
 
+/// Keeps the finalization channel alive until the owner permits physical release.
+/// Polling never waits for the control lane, SQLite, or the actor thread.
+pub(crate) struct PendingPersistenceClose {
+    target: PersistenceGeneration,
+    deadline: Instant,
+    state: Option<PendingCloseState>,
+}
+
+enum PendingCloseState {
+    Queued {
+        command: PersistenceControl,
+        prepared: Receiver<PreparedClose>,
+    },
+    Preparing(Receiver<PreparedClose>),
+    Finalizing {
+        completion: Receiver<PersistenceCloseOutcome>,
+        outcome: PersistenceCloseOutcome,
+    },
+    Released(PersistenceCloseOutcome),
+}
+
 pub(crate) struct RequestAuditIntent {
     pub(crate) epoch: SessionEpoch,
     pub(crate) required_generation: PersistenceGeneration,
@@ -328,14 +349,14 @@ impl CanonicalCommandId {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SubmitTurnIntent {
     pub(crate) command_id: CanonicalCommandId,
-    pub(crate) session: PreparedSessionBatch,
+    pub(crate) session: SessionBatch,
     pub(crate) turn: smelt_store::NewTurn,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TurnTransitionIntent {
     pub(crate) command_id: CanonicalCommandId,
-    pub(crate) session: PreparedSessionBatch,
+    pub(crate) session: SessionBatch,
     pub(crate) turn_id: smelt_store::TurnId,
     pub(crate) state: smelt_store::TurnState,
     pub(crate) at_ms: u64,
@@ -525,7 +546,7 @@ fn record_failure_transition(prefix: &'static str, class: PersistenceFailureClas
 struct PendingBatchState {
     accepting: bool,
     wake_pending: bool,
-    desired: Option<Arc<PreparedSessionBatch>>,
+    desired: Option<Arc<SessionBatch>>,
 }
 
 fn reserve_bytes(counter: &AtomicUsize, bytes: usize, limit: usize) -> bool {
@@ -714,11 +735,12 @@ impl SessionPersistence {
         self.epoch
     }
 
-    pub(crate) fn submit(&self, intent: PreparedSessionBatch) -> Result<(), PersistenceCause> {
-        if intent.command().identity.id != self.session_id.as_str() {
+    pub(crate) fn submit(&self, intent: impl Into<SessionBatch>) -> Result<(), PersistenceCause> {
+        let intent = intent.into();
+        if intent.session_id() != self.session_id.as_str() {
             return Err(PersistenceCause::invariant(format!(
                 "session batch session {} does not match actor session {}",
-                intent.command().identity.id,
+                intent.session_id(),
                 self.session_id
             )));
         }
@@ -788,10 +810,10 @@ impl SessionPersistence {
         &self,
         intent: SubmitTurnIntent,
     ) -> Result<CanonicalEnqueueStatus<SubmitTurnIntent>, PersistenceCause> {
-        if intent.session.command().identity.id != self.session_id.as_str() {
+        if intent.session.session_id() != self.session_id.as_str() {
             return Err(PersistenceCause::invariant(format!(
                 "turn submit session {} does not match actor session {}",
-                intent.session.command().identity.id,
+                intent.session.session_id(),
                 self.session_id
             )));
         }
@@ -822,10 +844,10 @@ impl SessionPersistence {
         intent: SubmitTurnIntent,
         deadline: Instant,
     ) -> Result<SubmitTurnOutcome, PersistenceCause> {
-        if intent.session.command().identity.id != self.session_id.as_str() {
+        if intent.session.session_id() != self.session_id.as_str() {
             return Err(PersistenceCause::invariant(format!(
                 "turn submit session {} does not match actor session {}",
-                intent.session.command().identity.id,
+                intent.session.session_id(),
                 self.session_id
             )));
         }
@@ -885,10 +907,10 @@ impl SessionPersistence {
         &self,
         intent: TurnTransitionIntent,
     ) -> Result<CanonicalEnqueueStatus<TurnTransitionIntent>, PersistenceCause> {
-        if intent.session.command().identity.id != self.session_id.as_str() {
+        if intent.session.session_id() != self.session_id.as_str() {
             return Err(PersistenceCause::invariant(format!(
                 "turn transition session {} does not match actor session {}",
-                intent.session.command().identity.id,
+                intent.session.session_id(),
                 self.session_id
             )));
         }
@@ -919,10 +941,10 @@ impl SessionPersistence {
         intent: TurnTransitionIntent,
         deadline: Instant,
     ) -> Result<TurnTransitionOutcome, PersistenceCause> {
-        if intent.session.command().identity.id != self.session_id.as_str() {
+        if intent.session.session_id() != self.session_id.as_str() {
             return Err(PersistenceCause::invariant(format!(
                 "turn transition session {} does not match actor session {}",
-                intent.session.command().identity.id,
+                intent.session.session_id(),
                 self.session_id
             )));
         }
@@ -1302,6 +1324,134 @@ impl SessionPersistence {
             .unwrap_or_else(|_| self.deadline_flush(target))
     }
 
+    pub(crate) fn begin_close(
+        &self,
+        target: PersistenceGeneration,
+        deadline: Instant,
+    ) -> PendingPersistenceClose {
+        let target = {
+            let mut latest = self
+                .latest
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            latest.accepting = false;
+            latest
+                .desired
+                .as_ref()
+                .map_or(target, |intent| target.max(intent.generation))
+        };
+        let (reply, prepared) = mpsc::channel();
+        PendingPersistenceClose {
+            target,
+            deadline,
+            state: Some(PendingCloseState::Queued {
+                command: PersistenceControl::Close {
+                    target,
+                    deadline,
+                    policy: ClosePolicy::RequireDurable,
+                    reply,
+                },
+                prepared,
+            }),
+        }
+    }
+
+    pub(crate) fn poll_close(
+        &mut self,
+        pending: &mut PendingPersistenceClose,
+        cancelled: bool,
+    ) -> Option<Result<PersistenceCloseOutcome, String>> {
+        let state = pending.state.take().expect("unfinished persistence close");
+        if matches!(
+            state,
+            PendingCloseState::Queued { .. } | PendingCloseState::Preparing(_)
+        ) && (cancelled || Instant::now() >= pending.deadline)
+        {
+            drop(state);
+            self.latest
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .accepting = true;
+            return Some(Err(if cancelled {
+                "session close cancelled".into()
+            } else {
+                "persistence actor close did not complete before the deadline".into()
+            }));
+        }
+        let next = match state {
+            PendingCloseState::Queued { command, prepared } => {
+                let Some(control) = self.control.as_ref() else {
+                    return Some(Ok(self.disconnected_close(pending.target)));
+                };
+                match control.try_send(command) {
+                    Ok(()) => PendingCloseState::Preparing(prepared),
+                    Err(TrySendError::Full(command)) => {
+                        PendingCloseState::Queued { command, prepared }
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        return Some(Ok(self.disconnected_close(pending.target)));
+                    }
+                }
+            }
+            PendingCloseState::Preparing(prepared) => match prepared.try_recv() {
+                Ok(prepared) => {
+                    if prepared.outcome.durable < prepared.outcome.target {
+                        self.latest
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .accepting = true;
+                        return Some(Ok(prepared.outcome));
+                    }
+                    let Some(finalize) = prepared.finalize else {
+                        return Some(Ok(self.disconnected_close(pending.target)));
+                    };
+                    let (completed, completion) = mpsc::channel();
+                    if finalize.send(completed).is_err() {
+                        return Some(Ok(self.disconnected_close(pending.target)));
+                    }
+                    self.control = None;
+                    PendingCloseState::Finalizing {
+                        completion,
+                        outcome: prepared.outcome,
+                    }
+                }
+                Err(TryRecvError::Empty) => PendingCloseState::Preparing(prepared),
+                Err(TryRecvError::Disconnected) => {
+                    return Some(Ok(self.disconnected_close(pending.target)));
+                }
+            },
+            PendingCloseState::Finalizing {
+                completion,
+                outcome,
+            } => match completion.try_recv() {
+                Ok(outcome) => PendingCloseState::Released(outcome),
+                Err(TryRecvError::Empty) => PendingCloseState::Finalizing {
+                    completion,
+                    outcome,
+                },
+                Err(TryRecvError::Disconnected) => {
+                    PendingCloseState::Released(self.disconnected_close(pending.target))
+                }
+            },
+            PendingCloseState::Released(outcome) => {
+                if !self.is_finished() {
+                    pending.state = Some(PendingCloseState::Released(outcome));
+                    return None;
+                }
+                if self
+                    .thread
+                    .take()
+                    .is_some_and(|thread| thread.join().is_err())
+                {
+                    return Some(Err("persistence actor panicked during close".into()));
+                }
+                return Some(Ok(outcome));
+            }
+        };
+        pending.state = Some(next);
+        None
+    }
+
     pub(crate) fn close(
         &mut self,
         target: PersistenceGeneration,
@@ -1614,7 +1764,7 @@ impl SessionPersistence {
     }
 
     #[cfg(test)]
-    fn install_finish_barrier(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+    pub(crate) fn install_finish_barrier(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
         let (started, waiting) = mpsc::channel();
         let (release, released) = mpsc::channel();
         let (installed, acknowledged) = mpsc::channel();
@@ -2369,7 +2519,7 @@ impl PersistenceActor {
             .map(|intent| intent.generation)
     }
 
-    fn pending_batch(&self) -> Option<Arc<PreparedSessionBatch>> {
+    fn pending_batch(&self) -> Option<Arc<SessionBatch>> {
         let mut latest = self
             .latest
             .lock()
@@ -2524,7 +2674,15 @@ impl PersistenceActor {
             if intent.generation <= self.durable {
                 return;
             }
-            let mut prepared = intent.as_ref().clone();
+            let mut prepared = match intent.prepare() {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let cause =
+                        PersistenceCause::from_store("prepare captured session batch", error);
+                    self.block_persistence(intent.generation, cause, None);
+                    return;
+                }
+            };
             if let Err(cause) = self.finalize_session(&mut prepared) {
                 self.block_persistence(prepared.generation, cause, None);
                 return;
@@ -2898,9 +3056,15 @@ impl PersistenceActor {
         if let Some(blocked) = self.blocked.as_ref() {
             return Err(blocked.cause.clone());
         }
-        self.finalize_session(&mut intent.session)?;
+        let preparation = smelt_perf::perf::begin("persist:canonical:prepare");
+        let mut prepared = intent.session.prepare().map_err(|error| {
+            PersistenceCause::from_store("prepare captured canonical batch", error)
+        })?;
+        self.finalize_session(&mut prepared)?;
+        intent.session = prepared.clone().into();
+        drop(preparation);
         let command = smelt_store::CompactSubmitTurn {
-            session: intent.session.command().clone(),
+            session: prepared.command().clone(),
             turn: intent.turn.clone(),
         };
         let batch = smelt_store::SessionEventBatch::compact_submit_turn(
@@ -2920,7 +3084,7 @@ impl PersistenceActor {
                 PersistenceCause::invariant("turn submission returned turn ID zero").after_commit(),
             );
         }
-        self.complete_commit(&intent.session.frame, &result.session)
+        self.complete_commit(&prepared.frame, &result.session)
             .map_err(PersistenceCause::after_commit)?;
         let receipt = smelt_store::SubmitTurnReceipt {
             session: result.session.receipt.clone(),
@@ -2930,7 +3094,7 @@ impl PersistenceActor {
         self.durable = intent.session.generation;
         self.blocked = None;
         let persistence = self.publisher.publish_durable(
-            &intent.session,
+            &prepared,
             result.session,
             Some(CanonicalCommandReceipt::Submit {
                 command_id: intent.command_id,
@@ -2953,9 +3117,15 @@ impl PersistenceActor {
         if let Some(blocked) = self.blocked.as_ref() {
             return Err(blocked.cause.clone());
         }
-        self.finalize_session(&mut intent.session)?;
+        let preparation = smelt_perf::perf::begin("persist:canonical:prepare");
+        let mut prepared = intent.session.prepare().map_err(|error| {
+            PersistenceCause::from_store("prepare captured canonical batch", error)
+        })?;
+        self.finalize_session(&mut prepared)?;
+        intent.session = prepared.clone().into();
+        drop(preparation);
         let command = smelt_store::CompactTurnTransition {
-            session: intent.session.command().clone(),
+            session: prepared.command().clone(),
             turn_id: intent.turn_id,
             state: intent.state,
             at_ms: intent.at_ms,
@@ -2979,7 +3149,7 @@ impl PersistenceActor {
             )
             .after_commit());
         }
-        self.complete_commit(&intent.session.frame, &result.session)
+        self.complete_commit(&prepared.frame, &result.session)
             .map_err(PersistenceCause::after_commit)?;
         let receipt = smelt_store::TurnTransitionReceipt {
             session: result.session.receipt.clone(),
@@ -2990,7 +3160,7 @@ impl PersistenceActor {
         self.durable = intent.session.generation;
         self.blocked = None;
         let persistence = self.publisher.publish_durable(
-            &intent.session,
+            &prepared,
             result.session,
             Some(CanonicalCommandReceipt::Transition {
                 command_id: intent.command_id,
@@ -3028,6 +3198,7 @@ impl PersistenceActor {
         frame: &smelt_core::session::PreparedArchiveSave,
         result: &smelt_store::SessionCommitResult,
     ) -> Result<(), PersistenceCause> {
+        let _perf = smelt_perf::perf::begin("persist:publication:complete");
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_publish) {
             self.writer
@@ -3964,7 +4135,7 @@ mod tests {
             assert!(!history.is_empty());
             SubmitTurnIntent {
                 command_id: CanonicalCommandId::new(generation),
-                session: self.prepare_save(generation, history),
+                session: self.prepare_save(generation, history).into(),
                 turn: smelt_store::NewTurn {
                     kind: smelt_store::TurnKind::User,
                     submitted_history_idx: smelt_store::HistoryIndex::new(
@@ -3985,7 +4156,7 @@ mod tests {
         ) -> TurnTransitionIntent {
             TurnTransitionIntent {
                 command_id: CanonicalCommandId::new(generation),
-                session: self.prepare_save(generation, history),
+                session: self.prepare_save(generation, history).into(),
                 turn_id,
                 state,
                 at_ms: generation,
@@ -5108,7 +5279,7 @@ mod tests {
             actor
                 .enqueue_turn_transition(TurnTransitionIntent {
                     command_id: CanonicalCommandId::new(2),
-                    session: actor.prepare_save(2, &["dispatch accepted"]),
+                    session: actor.prepare_save(2, &["dispatch accepted"]).into(),
                     turn_id: submitted.receipt.turn_id,
                     state: smelt_store::TurnState::Running,
                     at_ms: 200,

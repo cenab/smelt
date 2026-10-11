@@ -22,7 +22,7 @@ pub(crate) struct PromptRuntime {
 
 pub(super) struct PendingPromptRecovery {
     replay: crate::input::PromptReplay,
-    from_paste: bool,
+    skip_shell_escape: bool,
     removed: Option<RemovedPromptRange>,
 }
 
@@ -35,6 +35,15 @@ struct RemovedPromptRange {
 }
 
 impl PendingPromptRecovery {
+    pub(super) fn for_queued_request(replay: crate::input::PromptReplay) -> Self {
+        Self {
+            replay,
+            // Accepted model input must not become a shell command on retry.
+            skip_shell_escape: true,
+            removed: None,
+        }
+    }
+
     pub(super) fn record_applied_edit(&mut self, buf: &Buffer) {
         if let Some(removed) = self.removed.as_mut() {
             removed.buffer_id = buf.id();
@@ -143,7 +152,7 @@ impl PromptRuntime {
         };
         PendingPromptRecovery {
             replay,
-            from_paste: self.input.from_paste,
+            skip_shell_escape: self.input.skip_shell_escape(),
             removed,
         }
     }
@@ -153,7 +162,7 @@ impl PromptRuntime {
         ctx: &mut PromptCtx<'_>,
         recovery: PendingPromptRecovery,
     ) {
-        let from_paste = self.input.from_paste || recovery.from_paste;
+        let skip_shell_escape = self.input.skip_shell_escape() || recovery.skip_shell_escape;
         if let Some(removed) = recovery.removed.filter(|removed| {
             removed.buffer_id == ctx.buf.id() && removed.source_tick == ctx.buf.source_tick()
         }) {
@@ -166,7 +175,7 @@ impl PromptRuntime {
             }
             self.input.prepend_attached(ctx, replay.source, replay.ids);
         }
-        self.input.from_paste = from_paste;
+        self.input.from_paste = skip_shell_escape;
     }
 
     pub(crate) fn replace_text(&mut self, ctx: &mut PromptCtx<'_>, text: String) {

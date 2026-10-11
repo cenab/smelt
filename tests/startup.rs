@@ -139,6 +139,208 @@ fn drain_provider_requests(listener: &TcpListener) -> bool {
     model_request_seen
 }
 
+#[test]
+fn interactive_rewind_keeps_terminal_actions_responsive_with_large_stored_history() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("init.lua");
+    std::fs::write(
+        &config,
+        r#"
+smelt.settings.autoupgrade = "off"
+smelt.settings.auto_continue = "off"
+smelt.settings.auto_reload = false
+smelt.settings.show_prediction = false
+smelt.settings.vim = false
+smelt.provider.register("probe", {
+  type = "openai-compatible", api_base = "http://127.0.0.1:9/v1",
+  models = { "test-model" },
+})
+"#,
+    )
+    .unwrap();
+    let mut session = smelt_core::session::Session::new(1, root.path().to_owned());
+    let mut transcript = smelt_core::content::transcript::Transcript::new();
+    for turn in 0..1_024 {
+        let text = format!("rewind fixture {turn}");
+        let index = session.history.len();
+        session
+            .history
+            .push(protocol::HistoryItem::user(protocol::Content::text(&text)));
+        transcript.push_with_origin(
+            smelt_core::Block::User {
+                text,
+                image_labels: Vec::new(),
+                command: false,
+                sent_at_ms: None,
+            },
+            smelt_core::BlockOrigin::History(index),
+        );
+        let output = "large stored assistant output\n".repeat(8_192);
+        let index = session.history.len();
+        session.history.push(protocol::HistoryItem::assistant(
+            protocol::AssistantStep::terminal(
+                Some(protocol::Content::text(&output)),
+                None,
+                Vec::new(),
+            ),
+        ));
+        transcript.push_with_origin(
+            smelt_core::Block::Text {
+                content: output.into(),
+            },
+            smelt_core::BlockOrigin::History(index),
+        );
+    }
+    let id = session.id.clone();
+    let sessions_root = root.path().join("state/smelt/sessions");
+    let mut writer = smelt_store::OwnedLineageWriter::open(&sessions_root, &id).unwrap();
+    let mut commit = smelt_core::session::initial_store_commit_from_session(&session).unwrap();
+    commit.transcript_records = Some(smelt_store::TranscriptRecordSuffix {
+        start: smelt_store::TranscriptRecordIndex::ZERO,
+        records: transcript
+            .history
+            .block_records()
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                smelt_core::transcript_model::transcript_block_row_with_block_idx(
+                    index,
+                    index as u64,
+                    record,
+                )
+                .unwrap()
+            })
+            .collect(),
+    });
+    writer.commit_session(&commit).unwrap();
+    writer.refresh_catalog().unwrap();
+    writer.release().unwrap();
+    drop(commit);
+    drop(session);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_smelt"));
+    command
+        .args(["--config", config.to_str().unwrap(), "--resume", &id])
+        .current_dir(root.path())
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("XDG_CACHE_HOME", root.path().join("cache"))
+        .env("TERM", "xterm-256color");
+    let (mut master, mut process) = spawn_in_pty(command);
+    let mut captured = Vec::new();
+    let mut terminal = vt100::Parser::new(24, 100, 0);
+    let startup_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let previous_len = captured.len();
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[previous_len..]);
+        assert!(process.child.try_wait().unwrap().is_none(), "smelt exited");
+        if terminal
+            .screen()
+            .contents()
+            .contains("large stored assistant output")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < startup_deadline,
+            "resume stalled: {}",
+            terminal.screen().contents()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    master.write_all(b"\x1b").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    master.write_all(b"\x1b").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    master.write_all(b"\x1b[24~").unwrap();
+    let input_deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        let previous_len = captured.len();
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[previous_len..]);
+        if terminal.screen().contents().contains("performance") {
+            break;
+        }
+        assert!(
+            Instant::now() < input_deadline,
+            "Escape-Escape blocked F12: {}",
+            terminal.screen().contents()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    master.write_all(b"\x1b[24~").unwrap();
+    let dialog_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let previous_len = captured.len();
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[previous_len..]);
+        if terminal.screen().contents().contains("(current)") {
+            break;
+        }
+        assert!(
+            Instant::now() < dialog_deadline,
+            "rewind dialog did not open: {}",
+            terminal.screen().contents()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The newest page contains 128 user turns, an older-page action and current.
+    for _ in 0..129 {
+        master.write_all(b"\x1b[A").unwrap();
+    }
+    master.write_all(b"\r").unwrap();
+    let page_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let previous_len = captured.len();
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[previous_len..]);
+        if terminal.screen().contents().contains("(newer turns)") {
+            break;
+        }
+        assert!(
+            Instant::now() < page_deadline,
+            "older rewind page did not open: {}",
+            terminal.screen().contents()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Skip current and the newer-page action, then select a real stored prefix.
+    master.write_all(b"\x1b[A\x1b[A\r\x1b[24~").unwrap();
+    let input_deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        let previous_len = captured.len();
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[previous_len..]);
+        if terminal.screen().contents().contains("performance") {
+            break;
+        }
+        assert!(
+            Instant::now() < input_deadline,
+            "stored selection blocked F12: {}",
+            terminal.screen().contents()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    master.write_all(b"\x1b[24~").unwrap();
+    let rewind_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let previous_len = captured.len();
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[previous_len..]);
+        if terminal.screen().contents().contains("rewind fixture 895") {
+            break;
+        }
+        assert!(
+            Instant::now() < rewind_deadline,
+            "stored selection did not restore input: {}",
+            terminal.screen().contents()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interactive_worktree_tool_keeps_typing_responsive_during_checkout() {
     interactive_tool_keeps_typing_responsive(ToolProbe::Worktree).await;

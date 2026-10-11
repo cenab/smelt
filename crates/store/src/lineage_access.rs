@@ -1343,6 +1343,31 @@ impl LineageSessionReader {
             .map(|(index, _)| index))
     }
 
+    /// Exact rewindable user count in the canonical history prefix, independent of transcript records.
+    /// Current schemas use a bounded index lookup; historical read-only schemas scan once on load.
+    pub fn history_user_turn_count_before(&self, end: u64) -> Result<u64> {
+        self.history_user_turn_count_before_cancellable(end, &|| false)
+    }
+
+    pub fn history_user_turn_count_before_cancellable(
+        &self,
+        end: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<u64> {
+        if cancelled() {
+            return Err(StoreError::Cancelled);
+        }
+        let head = lineage::lineage_session_head(&self.conn, &self.lineage, &self.branch)?;
+        Ok(lineage::history_user_count_cancellable(
+            &self.conn,
+            &self.lineage,
+            &head.history_root,
+            end,
+            cancelled,
+        )?
+        .0)
+    }
+
     pub fn history_mode_before(&self, end: u64) -> Result<Option<String>> {
         Ok(self
             .history_semantic_query(lineage::HistorySemantic::Mode, 0..end, true)?
@@ -1460,6 +1485,79 @@ impl LineageSessionReader {
             kind,
             before_or_at,
         )
+    }
+
+    /// Keep related reads on one SQLite snapshot while a writer publishes new roots.
+    pub fn read_snapshot<T>(&self, read: impl FnOnce(&Self) -> T) -> Result<T> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let result = read(self);
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Read the newest records of `kind` strictly before a history boundary.
+    /// The page uses one consistent head and reads profiles, not record bodies.
+    pub fn transcript_records_before_kind(
+        &self,
+        kind: &str,
+        before_history_idx: u64,
+        limit: usize,
+    ) -> Result<Vec<crate::TranscriptNavigationRecord>> {
+        self.transcript_records_before_kind_cancellable(kind, before_history_idx, limit, &|| false)
+    }
+
+    pub fn transcript_records_before_kind_cancellable(
+        &self,
+        kind: &str,
+        before_history_idx: u64,
+        limit: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<crate::TranscriptNavigationRecord>> {
+        if cancelled() {
+            return Err(StoreError::Cancelled);
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        let head = lineage::lineage_session_head(&transaction, &self.lineage, &self.branch)?;
+        let boundary = lineage::lineage_transcript_record_index_for_history_idx(
+            &transaction,
+            &self.lineage,
+            &head.transcript_root,
+            before_history_idx,
+        )?
+        .unwrap_or(head.transcript_root.item_count() as usize);
+        let mut before = boundary.checked_sub(1);
+        let mut records = Vec::new();
+        while records.len() < limit {
+            if cancelled() {
+                return Err(StoreError::Cancelled);
+            }
+            let Some(index) = before else {
+                break;
+            };
+            let Some(record) = lineage::lineage_transcript_record_before_kind(
+                &transaction,
+                &self.lineage,
+                &head.transcript_root,
+                kind,
+                index,
+            )?
+            else {
+                break;
+            };
+            before = record.record_index.get().checked_sub(1);
+            if record
+                .profile
+                .history_idx
+                .is_some_and(|index| index < before_history_idx)
+            {
+                records.push(record);
+            }
+        }
+        transaction.commit()?;
+        Ok(records)
     }
 
     pub fn transcript_record_after_kind(
@@ -2725,14 +2823,10 @@ mod tests {
 
     #[test]
     fn catalog_projection_preserves_metadata_without_hydrating_compact_archives() {
-        for (version, checkpoints) in [
-            (3, 0),
-            (3, 32),
-            (3, 128),
-            (crate::schema::LINEAGE_SCHEMA_VERSION, 0),
-            (crate::schema::LINEAGE_SCHEMA_VERSION, 32),
-            (crate::schema::LINEAGE_SCHEMA_VERSION, 128),
-        ] {
+        for (version, checkpoints) in [3, crate::schema::LINEAGE_SCHEMA_VERSION]
+            .into_iter()
+            .flat_map(|version| [0, 32, 128].map(|count| (version, count)))
+        {
             let root = tempfile::tempdir().unwrap();
             let id = session_id('1');
             let mut writer = OwnedLineageWriter::open(root.path(), &id).unwrap();

@@ -908,6 +908,30 @@ impl TuiApp {
                     SessionControl::Done
                 }
             }
+            EngineEvent::TurnPreparationError {
+                turn_id: failed_turn,
+                session_id,
+                persistence,
+                message,
+            } => {
+                if failed_turn != turn_id
+                    || session_id != self.conversation.session().id.as_str()
+                    || persistence.epoch != self.conversation.persistence_scope().epoch
+                {
+                    SessionControl::Continue
+                } else {
+                    return self.handle_engine_event(
+                        EngineEvent::TurnError {
+                            message,
+                            kind: None,
+                            retry_at_ms: None,
+                        },
+                        turn_id,
+                        submitted_history_idx,
+                        pending,
+                    );
+                }
+            }
             EngineEvent::TurnError {
                 message,
                 kind,

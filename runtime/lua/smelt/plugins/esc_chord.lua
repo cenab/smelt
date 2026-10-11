@@ -18,13 +18,9 @@ smelt.keymap.set("", "<Esc><Esc>", function(ctx)
     return
   end
 
-  if #smelt.session.turns() == 0 then
-    return
-  end
-
   if restore_insert then
-    smelt.cmd.run("rewind insert")
+    smelt.cmd.run("rewind insert quiet")
   else
-    smelt.cmd.run("rewind")
+    smelt.cmd.run("rewind quiet")
   end
 end, { desc = "cancel work / rewind" })

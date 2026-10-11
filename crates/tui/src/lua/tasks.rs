@@ -76,7 +76,7 @@ impl LuaRuntime {
         payload: &crate::smelt_edit::Payload,
     ) {
         if let Ok(mut q) = self.shared.pending_invocations.lock() {
-            q.push(crate::lua::PendingInvocation {
+            q.push_back(crate::lua::PendingInvocation {
                 handle,
                 win,
                 payload: payload.clone(),
@@ -84,12 +84,9 @@ impl LuaRuntime {
         }
     }
 
-    /// Drain all queued invocations for preparation before their scoped Lua entries.
-    pub(crate) fn drain_invocations(&self) -> Vec<crate::lua::PendingInvocation> {
-        match self.shared.pending_invocations.lock() {
-            Ok(mut q) => std::mem::take(&mut *q),
-            Err(_) => Vec::new(),
-        }
+    /// Take one invocation, leaving the remainder in registration order.
+    pub(crate) fn pop_invocation(&self) -> Option<crate::lua::PendingInvocation> {
+        self.shared.pending_invocations.lock().ok()?.pop_front()
     }
 }
 

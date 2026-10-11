@@ -792,7 +792,7 @@ fn quota_recovery_keeps_original_deadline_when_a_retry_omits_metadata() {
 }
 
 #[test]
-fn quota_retry_preserves_deadline_while_terminal_receipt_is_pending() {
+fn quota_retry_accepts_at_deadline_while_terminal_receipt_is_pending() {
     let mut app = isolated_app();
     create_auto_goal(&mut app, "retain reset while finalizing");
     start_canonical_turn(&mut app);
@@ -806,21 +806,25 @@ fn quota_retry_preserves_deadline_while_terminal_receipt_is_pending() {
         kind: Some(protocol::EngineAskErrorKind::Quota),
         retry_at_ms: None,
     }));
-    assert!(!has_started_turn(&run_due_timers(&mut app, 90_999)));
-    assert!(!has_started_turn(&run_due_timers(&mut app, 1)));
-    assert!(app.run_lua(&format!(
-        r#"
-        assert(smelt.engine.has_active_turn())
-        local status = smelt.signal.get("auto_continue_status")
-        assert(status.next_attempt_at_ms == {})
-        assert(status.phase == "waiting_for_idle")
-        "#,
-        reset + 1000,
-    )));
+    app.feed_one(SourceEvent::Tick(90_999));
+    app.tick_timers();
+    assert!(!app.app.turn_submission_is_pending());
+    app.feed_one(SourceEvent::Tick(1));
+    app.tick_timers();
+    assert!(app.app.turn_submission_is_pending());
+    assert!(app.working_probe().is_animating());
+    assert!(!has_started_turn(&app.drain_engine_sends()));
     release.send(()).unwrap();
     app.wait_for_turn_persistence();
-    assert!(!has_started_turn(&run_due_timers(&mut app, 249)));
-    assert!(has_started_turn(&run_due_timers(&mut app, 1)));
+    let commands = app.drain_engine_sends();
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| matches!(command, protocol::UiCommand::StartTurn(_)))
+            .count(),
+        1
+    );
+    assert!(!has_started_turn(&run_due_timers(&mut app, 250)));
 }
 
 #[test]

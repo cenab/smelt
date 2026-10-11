@@ -1508,18 +1508,14 @@ impl LuaRuntime {
             }
         }
 
-        // Run the handler on the Lua task runtime so it executes inside a
-        // coroutine. Yieldable APIs (`smelt.dialog.open`, `smelt.sleep`,
-        // `smelt.task.wait`, ...) then work without each command wrapping its
-        // body in `smelt.spawn`. Non-yielding handlers finish in the
-        // synchronous drive below; yielding handlers park on the runtime and
-        // resume on the next main-loop `drive_tasks` tick.
-        let spawn_result = {
+        // Start only this command's coroutine. Yielding handlers park for the
+        // next task tick; unrelated ready tasks keep their queue position.
+        let task = {
             let Ok(mut rt) = self.shared.tasks.lock() else {
                 self.record_error(format!("cmd `{name}`: task runtime unavailable"));
                 return true;
             };
-            rt.spawn(
+            match rt.spawn(
                 &self.lua,
                 func,
                 initial_args,
@@ -1528,13 +1524,23 @@ impl LuaRuntime {
                     queue_target,
                     sent_at_ms,
                 },
-            )
+            ) {
+                Ok(id) => rt.take_task(id),
+                Err(error) => {
+                    self.record_error(format!("cmd `{name}`: {error}"));
+                    return true;
+                }
+            }
         };
-        if let Err(e) = spawn_result {
-            self.record_error(format!("cmd `{name}`: {e}"));
-            return true;
+        if let Some(task) = task {
+            let mut outputs = Vec::new();
+            let _ = self.step_task_outside_runtime_lock(task, Instant::now(), &mut outputs);
+            for output in outputs {
+                if let TaskDriveOutput::NotifyError(message) = output {
+                    self.record_error(message);
+                }
+            }
         }
-        let _ = self.drive_tasks(Instant::now());
         true
     }
 
@@ -1915,26 +1921,24 @@ impl LuaRuntime {
     }
 
     pub fn pump_task_events(&self) {
-        let json_pending: Vec<(u64, serde_json::Value)> = {
-            let Ok(mut inbox) = self.shared.json_inbox.lock() else {
-                return;
-            };
-            std::mem::take(&mut *inbox)
-        };
-        if !json_pending.is_empty() {
-            if let Ok(mut main) = self.shared.task_inbox.lock() {
-                for (external_id, value) in json_pending {
-                    main.push(TaskEvent::ExternalResolvedJson { external_id, value });
-                }
+        let _work = self.shared.begin_work();
+        for index in 0..super::shared::LUA_WORK_BATCH {
+            if !self.shared.claim_work() {
+                break;
             }
-        }
-        let events: Vec<TaskEvent> = {
-            let Ok(mut inbox) = self.shared.task_inbox.lock() else {
-                return;
+            // Alternate sources so a busy owner-thread producer cannot starve
+            // cross-thread completions. Each inbox retains its FIFO order.
+            let pop_main = || self.shared.task_inbox.lock().ok()?.pop_front();
+            let pop_json = || {
+                let (external_id, value) = self.shared.json_inbox.lock().ok()?.pop_front()?;
+                Some(TaskEvent::ExternalResolvedJson { external_id, value })
             };
-            std::mem::take(&mut *inbox)
-        };
-        for ev in events {
+            let event = if index % 2 == 0 {
+                pop_main().or_else(pop_json)
+            } else {
+                pop_json().or_else(pop_main)
+            };
+            let Some(ev) = event else { break };
             match ev {
                 TaskEvent::ExternalResolved { external_id, value } => {
                     let v = self.lua.registry_value(&value).unwrap_or(mlua::Value::Nil);
@@ -1944,6 +1948,11 @@ impl LuaRuntime {
                     let v = json_to_lua(&self.lua, &value).unwrap_or(mlua::Value::Nil);
                     self.resolve_external(external_id, v);
                 }
+            }
+        }
+        if self.shared.has_pending_task_events() {
+            if let Some(sender) = self.shared.wakeup_tx.get() {
+                let _ = sender.send(());
             }
         }
     }
@@ -2003,8 +2012,9 @@ impl LuaRuntime {
     }
 
     pub fn drive_tasks(&self, now: Instant) -> Vec<TaskDriveOutput> {
+        let _work = self.shared.begin_work();
         let mut outs = Vec::new();
-        loop {
+        while self.shared.claim_work() {
             let task = match self.take_next_ready_task(now) {
                 Ok(Some(task)) => task,
                 Ok(None) => break,
@@ -2015,6 +2025,11 @@ impl LuaRuntime {
                 .is_err()
             {
                 return Vec::new();
+            }
+        }
+        if self.next_task_wakeup(now).is_some_and(|at| at <= now) {
+            if let Some(sender) = self.shared.wakeup_tx.get() {
+                let _ = sender.send(());
             }
         }
         let mut forward = Vec::with_capacity(outs.len());

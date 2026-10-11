@@ -18,6 +18,33 @@ pub(crate) fn lua_messages_to_protocol(lua: &Lua, table: &mlua::Table) -> Vec<pr
     out
 }
 
+static REWIND_PAGE_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// A cancelled Lua task does not release capacity until its physical read exits.
+async fn run_rewind_page_read(
+    cancel: tokio_util::sync::CancellationToken,
+    read: impl FnOnce(
+            &tokio_util::sync::CancellationToken,
+        ) -> Result<crate::app::history::RewindPage, String>
+        + Send
+        + 'static,
+) -> Result<crate::app::history::RewindPage, String> {
+    let permit = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err("rewind page cancelled".into()),
+        permit = REWIND_PAGE_READERS.acquire() => permit.map_err(|error| error.to_string())?,
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if cancel.is_cancelled() {
+            return Err("rewind page cancelled".into());
+        }
+        read(&cancel)
+    })
+    .await
+    .map_err(|error| format!("rewind page worker failed: {error}"))?
+}
+
 const DEFAULT_LUA_SESSION_LIMIT: usize = 200;
 const DEFAULT_LUA_SESSION_MAX_BYTES: usize = 1024 * 1024;
 
@@ -807,6 +834,60 @@ pub(super) fn register(
             conversation_to_lua(lua, &history, limit)
         },
     )?;
+    struct RewindPageTask(Option<crate::app::history::RewindPageRequest>);
+    impl mlua::UserData for RewindPageTask {}
+
+    m.private_live_only_fn(
+        "__prepare_turns_page",
+        &["before"],
+        |lua, before: Option<usize>| -> LuaResult<mlua::Value> {
+            let request = crate::lua::with_session_host(|host| host.rewind_page_request(before));
+            if request.needs_storage() {
+                Ok(mlua::Value::UserData(
+                    lua.create_userdata(RewindPageTask(Some(request)))?,
+                ))
+            } else {
+                let page = request.read().map_err(mlua::Error::RuntimeError)?;
+                smelt_core::lua::serde_to_lua(lua, &page)
+            }
+        },
+    )?;
+    let rewind_sink = shared.core.resume_sink();
+    m.private_live_only_fn(
+        "__start_turns_page",
+        &["task_id", "request"],
+        move |_, (task_id, request): (u64, mlua::Value)| -> LuaResult<()> {
+            let request = request
+                .as_userdata()
+                .ok_or_else(|| mlua::Error::RuntimeError("expected rewind page request".into()))?
+                .borrow_mut::<RewindPageTask>()?
+                .0
+                .take()
+                .ok_or_else(|| {
+                    mlua::Error::RuntimeError("rewind page request already started".into())
+                })?;
+            let cancel = smelt_core::lua::current_task_cancel().ok_or_else(|| {
+                mlua::Error::RuntimeError("rewind page requires a Lua task".into())
+            })?;
+            let sink = rewind_sink.clone();
+            tokio::spawn(async move {
+                let result = run_rewind_page_read(cancel.clone(), move |cancel| {
+                    request.read_cancellable(&|| cancel.is_cancelled())
+                })
+                .await;
+                if !cancel.is_cancelled() {
+                    sink.resolve_json(
+                        task_id,
+                        match result {
+                            Ok(page) => serde_json::json!({ "page": page }),
+                            Err(error) => serde_json::json!({ "err": error }),
+                        },
+                    );
+                }
+            });
+            Ok(())
+        },
+    )?;
     m.fn_(
         "turns",
         "Return rewindable user turns as `{ history_idx, block_idx, label }` rows where `history_idx` is the canonical rewind coordinate, deprecated `block_idx` is its compatibility alias, and `label` is the first line of the user message.",
@@ -830,7 +911,7 @@ pub(super) fn register(
     )?;
     m.live_only_fn(
         "rewind_to",
-        "Rewind the session to a prior user turn. `history_idx = nil` rewinds to before the first turn; `opts.restore_vim_insert = true` re-enters vim insert mode after the rewind.",
+        "Rewind the session to a prior user turn. Stored targets prepare in the background and apply only if the session and draft remain unchanged. `history_idx = nil` rewinds to before the first turn; `opts.restore_vim_insert = true` re-enters vim insert mode after the rewind.",
         &["history_idx", "opts"],
         |_, (history_idx, opts): (Option<usize>, Option<mlua::Table>)| -> LuaResult<()> {
             let restore_vim_insert = opts
@@ -1079,4 +1160,179 @@ pub(super) fn register(
         },
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    // Capacity assertions need exclusive access to the shared reader pool.
+    static PAGE_READER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn parked_lua_tasks_keep_typing_and_targeted_resume_responsive() {
+        let mut app = crate::app::test_harness::TestApp::builder()
+            .with_vim(false)
+            .build();
+        app.run_lua_result(
+            r#"
+            parked = 0
+            external_ids = {}
+            for i = 1, 8192 do
+                local id = smelt.task.alloc()
+                external_ids[i] = id
+                smelt.spawn(function()
+                    parked = parked + 1
+                    resumed = smelt.task.wait(id)
+                end)
+            end
+        "#,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while app.eval_lua::<usize>("return parked").unwrap() != 8192 {
+            assert!(std::time::Instant::now() < deadline);
+            app.feed_one(crate::event_source::SourceEvent::LuaWakeup);
+        }
+        for key in [
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyCode::F(3),
+            crossterm::event::KeyCode::F(3),
+            crossterm::event::KeyCode::F(12),
+            crossterm::event::KeyCode::F(12),
+        ] {
+            let started = std::time::Instant::now();
+            app.press(key);
+            app.render_unsettled_silent();
+            assert!(started.elapsed() < Duration::from_millis(250));
+        }
+        assert_eq!(app.state().prompt_text, "x");
+        let started = std::time::Instant::now();
+        app.run_lua_result("smelt.task.resume(external_ids[#external_ids], 'targeted result')")
+            .unwrap();
+        app.feed_one(crate::event_source::SourceEvent::LuaWakeup);
+        assert_eq!(
+            app.eval_lua::<String>("return resumed").unwrap(),
+            "targeted result"
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        app.assert_invariants();
+    }
+
+    #[tokio::test]
+    async fn rewind_page_cancellation_keeps_running_reader_capacity_and_skips_waiting_work() {
+        let _guard = PAGE_READER_TEST_LOCK.lock().await;
+        let reserved = REWIND_PAGE_READERS.acquire().await.unwrap();
+        let cancel = CancellationToken::new();
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let worker_cancel = cancel.clone();
+        let worker = tokio::spawn(run_rewind_page_read(worker_cancel, move |cancel| {
+            started.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(cancel.is_cancelled());
+            Err("stopped".into())
+        }));
+        tokio::time::timeout(Duration::from_secs(5), start)
+            .await
+            .unwrap()
+            .unwrap();
+        cancel.cancel();
+        assert!(REWIND_PAGE_READERS.try_acquire().is_err());
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = called.clone();
+        let queued_cancel = CancellationToken::new();
+        let queued = tokio::spawn(run_rewind_page_read(queued_cancel.clone(), move |_| {
+            observed.store(true, Ordering::Release);
+            Err("unexpected read".into())
+        }));
+        tokio::task::yield_now().await;
+        queued_cancel.cancel();
+        assert!(tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(!called.load(Ordering::Acquire));
+        release.send(()).unwrap();
+        assert!(worker.await.unwrap().is_err());
+        drop(reserved);
+        assert_eq!(REWIND_PAGE_READERS.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn stored_lua_rewind_pages_wait_off_ui_and_cancel_without_consuming_capacity() {
+        let _guard = PAGE_READER_TEST_LOCK.lock().await;
+        let mut app = crate::app::test_harness::TestApp::builder()
+            .with_vim(false)
+            .build();
+        app.ensure_writer_ready();
+        for text in ["first user", "second user"] {
+            app.app.stage_request_history_item(
+                protocol::HistoryItem::user(protocol::Content::text(text)),
+                Some(smelt_core::Block::User {
+                    text: text.into(),
+                    image_labels: Vec::new(),
+                    command: false,
+                    sent_at_ms: None,
+                }),
+            );
+        }
+        app.save_session_and_flush();
+        let id = app.session_snapshot().id.clone();
+        assert!(app.load_session_by_id(&id));
+        let reserved = REWIND_PAGE_READERS.acquire_many(2).await.unwrap();
+        app.run_lua_result(
+            r#"
+            pages_returned = 0
+            page_tasks = {}
+            for i = 1, 32 do
+                page_tasks[i] = smelt.spawn(function()
+                    smelt.session.turns_page()
+                    pages_returned = pages_returned + 1
+                end)
+            end
+        "#,
+        )
+        .unwrap();
+        app.feed_one(crate::event_source::SourceEvent::LuaWakeup);
+        tokio::task::yield_now().await;
+        app.type_text("draft while pages wait");
+        assert_eq!(app.state().prompt_text, "draft while pages wait");
+        assert_eq!(app.eval_lua::<usize>("return pages_returned").unwrap(), 0);
+        app.run_lua_result("for _, task in ipairs(page_tasks) do task:remove() end")
+            .unwrap();
+        app.feed_one(crate::event_source::SourceEvent::LuaWakeup);
+        drop(reserved);
+        app.run_lua_result(
+            r#"
+            smelt.spawn(function()
+                local page = smelt.session.turns_page()
+                page_label = page.turns[1].label
+                pages_returned = pages_returned + 1
+            end)
+        "#,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while app.eval_lua::<usize>("return pages_returned").unwrap() == 0 {
+                app.feed_one(crate::event_source::SourceEvent::LuaWakeup);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.eval_lua::<usize>("return pages_returned").unwrap(), 1);
+        assert_eq!(
+            app.eval_lua::<String>("return page_label").unwrap(),
+            "first user"
+        );
+        app.assert_invariants();
+    }
 }

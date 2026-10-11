@@ -521,6 +521,14 @@ pub enum EngineEvent {
         meta: Option<TurnMeta>,
     },
 
+    /// Request preparation failed before the provider started.
+    TurnPreparationError {
+        turn_id: u64,
+        session_id: String,
+        persistence: PersistenceScope,
+        message: String,
+    },
+
     /// The agent turn ended with an error.
     TurnError {
         message: String,

@@ -63,7 +63,7 @@ enum CanonicalOperationPayload {
 struct CanonicalOperation {
     command_id: crate::persist::CanonicalCommandId,
     payload: CanonicalOperationPayload,
-    prepared: Option<super::session_document::PreparedSessionBatch>,
+    prepared: Option<super::session_document::SessionBatch>,
 }
 
 #[derive(Clone, Copy)]
@@ -113,6 +113,7 @@ pub(crate) struct ConversationRuntime {
     resume_preview_cache: ResumePreviewCache,
     shared_session: Arc<Mutex<Option<SharedSessionState>>>,
     turn: TurnLifecycle,
+    pub(super) submissions: super::agent::TurnSubmissions,
     persistence: Option<crate::persist::SessionPersistence>,
     persistence_epoch: crate::persist::SessionEpoch,
     observed_persistence_status: Option<crate::persist::SessionPersistenceStatus>,
@@ -137,9 +138,12 @@ impl ConversationRuntime {
         storage: SessionPersistence,
     ) -> Self {
         transcript.set_store_address(storage.transcript_store_address(&sessions, &session));
+        let mut document = TuiSessionDocument::new(transcript);
+        document.navigation =
+            smelt_core::session_runtime::HistoryNavigation::from_history(&session.history);
         Self {
             session,
-            document: TuiSessionDocument::new(transcript),
+            document,
             committed_transcript_view: None,
             parser: smelt_core::content::stream_parser::StreamParser::new(),
             stream_animation: StreamAnimation::default(),
@@ -148,6 +152,7 @@ impl ConversationRuntime {
             resume_preview_cache,
             shared_session,
             turn,
+            submissions: Default::default(),
             persistence: None,
             persistence_epoch: crate::persist::SessionEpoch::ZERO,
             observed_persistence_status: None,
@@ -885,6 +890,15 @@ impl ConversationRuntime {
 
     pub(crate) fn clear_live_session(&mut self) {
         self.document.live_session = None;
+        self.document.navigation =
+            smelt_core::session_runtime::HistoryNavigation::from_history(&self.session.history);
+    }
+
+    pub(crate) fn history_navigation(&self) -> &smelt_core::session_runtime::HistoryNavigation {
+        self.document
+            .live_session
+            .as_ref()
+            .map_or(&self.document.navigation, |live| live.navigation())
     }
 
     pub(crate) fn install_loaded_full_session(
@@ -1001,7 +1015,7 @@ impl ConversationRuntime {
                     .history_len()
                     .checked_sub(1)
                     .ok_or_else(|| "tail history mutation requires an existing item".to_string())?;
-                self.truncate_history(index, identity);
+                self.truncate_history(index, identity)?;
                 if plan == HistoryAppendPlan::ReplaceLast {
                     self.append_history_item(append.item.clone());
                 }
@@ -1034,26 +1048,52 @@ impl ConversationRuntime {
         .expect("request history commit returns its canonical index")
     }
 
+    pub(crate) fn history_user_turn_count_before(&self, index: usize) -> Result<usize, String> {
+        if let Some(live) = self.live_session() {
+            live.user_turn_count_before(index)
+        } else {
+            Ok(self
+                .history_navigation()
+                .user_turn_count_before(index.min(self.history_len())))
+        }
+    }
+
     pub(crate) fn truncate_history(
         &mut self,
         index: usize,
         identity: smelt_core::session::ContextTokenIdentity,
-    ) -> Option<protocol::TurnMeta> {
-        self.apply_history_mutation(super::session_document::HistoryMutation::TruncateFrom {
-            index,
-            identity,
-        })
-        .turn_meta
+    ) -> Result<Option<protocol::TurnMeta>, String> {
+        let user_turn_count = self.history_user_turn_count_before(index)?;
+        Ok(self
+            .apply_history_mutation(super::session_document::HistoryMutation::TruncateFrom {
+                index,
+                user_turn_count: Some(user_turn_count),
+                identity,
+            })
+            .turn_meta)
     }
 
+    #[cfg(any(test, feature = "harness"))]
     pub(crate) fn rewind_history(
         &mut self,
         index: usize,
         keep_checkpoint_at_boundary: bool,
         identity: smelt_core::session::ContextTokenIdentity,
+    ) -> Result<Option<protocol::TurnMeta>, String> {
+        let count = self.history_user_turn_count_before(index)?;
+        Ok(self.rewind_history_with_count(index, count, keep_checkpoint_at_boundary, identity))
+    }
+
+    pub(crate) fn rewind_history_with_count(
+        &mut self,
+        index: usize,
+        user_turn_count: usize,
+        keep_checkpoint_at_boundary: bool,
+        identity: smelt_core::session::ContextTokenIdentity,
     ) -> Option<protocol::TurnMeta> {
         self.apply_history_mutation(super::session_document::HistoryMutation::RewindTo {
             index,
+            user_turn_count: Some(user_turn_count),
             keep_checkpoint_at_boundary,
             identity,
         })
@@ -1205,6 +1245,44 @@ impl ConversationRuntime {
             },
         )
         .applied
+    }
+
+    pub(super) fn append_accepted_block(
+        &mut self,
+        block: smelt_core::transcript_model::Block,
+    ) -> smelt_core::transcript_model::BlockId {
+        self.apply_transcript_mutation(
+            super::session_document::TranscriptMutation::AppendAccepted { block },
+        )
+        .block_id
+        .expect("accepted user block")
+    }
+
+    pub(super) fn promote_accepted_block(
+        &mut self,
+        id: smelt_core::transcript_model::BlockId,
+        history_index: usize,
+    ) -> bool {
+        self.apply_transcript_mutation(
+            super::session_document::TranscriptMutation::PromoteAccepted { id, history_index },
+        )
+        .applied
+    }
+
+    pub(super) fn remove_accepted_block(&mut self, id: smelt_core::transcript_model::BlockId) {
+        self.apply_transcript_mutation(
+            super::session_document::TranscriptMutation::RemoveAccepted { id },
+        );
+    }
+
+    pub(super) fn remove_submitted_user_block(
+        &mut self,
+        id: smelt_core::transcript_model::BlockId,
+        history_index: usize,
+    ) {
+        self.apply_transcript_mutation(
+            super::session_document::TranscriptMutation::RemoveSubmittedUser { id, history_index },
+        );
     }
 
     pub(crate) fn append_block(&mut self, block: smelt_core::transcript_model::Block) -> bool {
@@ -1921,8 +1999,8 @@ impl ConversationRuntime {
 
     #[cfg(test)]
     pub(crate) fn install_session_for_harness(&mut self, session: smelt_core::session::Session) {
-        self.document.live_session = None;
         self.session = session;
+        self.clear_live_session();
     }
 
     #[cfg(test)]
@@ -1958,8 +2036,8 @@ impl ConversationRuntime {
 
     #[cfg(any(test, feature = "harness"))]
     pub(crate) fn replace_history_for_harness(&mut self, history: Vec<protocol::HistoryItem>) {
-        self.document.live_session = None;
         self.session.history = history;
+        self.clear_live_session();
     }
 
     #[cfg(any(test, feature = "harness"))]
@@ -2141,6 +2219,10 @@ impl ConversationRuntime {
         }
         let end = range.end.min(self.session.history.len());
         let start = range.start.min(end);
+        smelt_perf::perf::record_value(
+            "session:history:scanned_items",
+            end.saturating_sub(start) as u64,
+        );
         let chunk_items = chunk_items.max(1);
         for (chunk_offset, items) in self.session.history[start..end]
             .chunks(chunk_items)
@@ -2358,6 +2440,7 @@ impl ConversationRuntime {
         loaded: smelt_core::session::Session,
     ) -> Option<String> {
         self.session = loaded;
+        self.clear_live_session();
         self.turn.reset_session();
         self.canonical_operations.clear();
         self.inflight_canonical_commands.clear();
@@ -2456,24 +2539,23 @@ impl ConversationRuntime {
         self.observed_persistence_status = Some(status.clone());
 
         let mut acknowledged_session_id = None;
-        let acknowledgement_applied =
-            status
-                .acknowledgement
-                .as_ref()
-                .is_none_or(|acknowledgement| {
-                    let applied = self.apply_persistence_acknowledgement(acknowledgement);
-                    if applied {
-                        acknowledged_session_id =
-                            Some(acknowledgement.result.receipt.session_id.clone());
-                    }
-                    applied
-                });
+        let publication_adopted = status
+            .acknowledgement
+            .as_ref()
+            .is_none_or(|acknowledgement| {
+                let applied = self.apply_persistence_acknowledgement(acknowledgement);
+                if applied == Some(true) {
+                    acknowledged_session_id =
+                        Some(acknowledgement.result.receipt.session_id.clone());
+                }
+                applied.is_some()
+            });
         let durable_generation = self.document.durable_generation();
         let canonical_completions = status
             .canonical_completions
             .iter()
             .filter(|completion| {
-                acknowledgement_applied
+                publication_adopted
                     || match completion {
                         crate::persist::CanonicalCommandCompletion::Submit(acknowledgement) => {
                             acknowledgement.persistence.generation <= durable_generation
@@ -2576,14 +2658,10 @@ impl ConversationRuntime {
                 "live_session:suffix_items",
                 live.live_suffix_len() as u64,
             );
-            smelt_perf::perf::record_value(
-                "live_session:suffix_bytes",
-                live.live_suffix_bytes() as u64,
-            );
         }
         let intent = match self
             .document
-            .prepare_event_batch(&mut self.session, metadata)
+            .capture_event_batch(&mut self.session, metadata)
         {
             Ok(Some(intent)) => intent,
             Ok(None) => return Ok(SaveStatus::Unchanged),
@@ -2639,7 +2717,7 @@ impl ConversationRuntime {
         if prepare_latest {
             let intent = match self
                 .document
-                .prepare_event_batch(&mut self.session, metadata)
+                .capture_event_batch(&mut self.session, metadata)
             {
                 Ok(intent) => intent,
                 Err(super::session_document::SessionBatchPreparationError::HydrationPending) => {
@@ -2725,6 +2803,16 @@ impl ConversationRuntime {
             .install_commit_barrier()
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_persistence_finish_barrier(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.persistence
+            .as_ref()
+            .expect("persistence actor is running")
+            .install_finish_barrier()
+    }
+
     pub(crate) fn append_request_audit(
         &self,
         scope: protocol::PersistenceScope,
@@ -2750,6 +2838,33 @@ impl ConversationRuntime {
         Ok(true)
     }
 
+    pub(crate) fn begin_persistence_close(
+        &self,
+    ) -> Result<Option<crate::persist::PendingPersistenceClose>, String> {
+        if let Some(block) = self.persistence_preparation_block.as_ref() {
+            return Err(block.cause.message.clone());
+        }
+        Ok(self.persistence.as_ref().map(|actor| {
+            actor.begin_close(
+                self.document.generation(),
+                std::time::Instant::now() + crate::persist::INTERACTIVE_PERSISTENCE_DEADLINE,
+            )
+        }))
+    }
+
+    pub(crate) fn poll_persistence_close(
+        &mut self,
+        pending: &mut crate::persist::PendingPersistenceClose,
+        cancelled: bool,
+    ) -> Option<Result<Option<String>, String>> {
+        let persistence = self
+            .persistence
+            .as_mut()
+            .expect("closing writer remains owned");
+        let outcome = persistence.poll_close(pending, cancelled)?;
+        Some(outcome.and_then(|outcome| self.finish_persistence_close(outcome, None)))
+    }
+
     pub(crate) fn close_persistence_until(
         &mut self,
         policy: crate::persist::ClosePolicy,
@@ -2768,19 +2883,37 @@ impl ConversationRuntime {
         let Some(persistence) = self.persistence.as_mut() else {
             return Ok(preparation_failure);
         };
-        let epoch = persistence.epoch();
         let outcome = persistence.close(target, deadline, policy);
+        self.finish_persistence_close(outcome, preparation_failure)
+    }
+
+    fn finish_persistence_close(
+        &mut self,
+        outcome: crate::persist::PersistenceCloseOutcome,
+        preparation_failure: Option<String>,
+    ) -> Result<Option<String>, String> {
+        let epoch = outcome.epoch;
+        let writer_released = self
+            .persistence
+            .as_ref()
+            .is_none_or(|actor| actor.is_finished());
         if let Some(acknowledgement) = outcome.acknowledgement.as_ref() {
-            self.apply_persistence_acknowledgement(acknowledgement);
+            let _ = self.apply_persistence_acknowledgement(acknowledgement);
         }
         if outcome.durable < outcome.target && outcome.omitted.is_none() {
             return Err(outcome.cause.map_or_else(
                 || {
                     format!(
                         "generation {} did not become durable before session close",
-                        target.get()
+                        outcome.target.get()
                     )
                 },
+                |cause| cause.message,
+            ));
+        }
+        if !writer_released {
+            return Err(outcome.cause.map_or_else(
+                || "persistence writer has not finished releasing ownership".into(),
                 |cause| cause.message,
             ));
         }
@@ -2978,7 +3111,7 @@ impl ConversationRuntime {
             };
             let session = match self
                 .document
-                .prepare_turn_batch(&mut self.session, metadata)
+                .capture_turn_batch(&mut self.session, metadata)
             {
                 Ok(session) => session,
                 Err(super::session_document::SessionBatchPreparationError::HydrationPending) => {
@@ -3083,15 +3216,17 @@ impl ConversationRuntime {
             .retain(|operation| operation.command_id != command_id);
     }
 
+    /// A matching publication can settle its command while newer document work
+    /// stays dirty. The value reports whether the current document is clean.
     fn apply_persistence_acknowledgement(
         &mut self,
         acknowledgement: &crate::persist::PersistenceAcknowledgement,
-    ) -> bool {
+    ) -> Option<bool> {
         if !self
             .document
             .adopt_archive_publication(acknowledgement, &mut self.session)
         {
-            return false;
+            return None;
         }
         let applied = self.document.acknowledge_coalesced_batch(
             acknowledgement,
@@ -3108,7 +3243,7 @@ impl ConversationRuntime {
         if applied || acknowledgement.generation <= self.document.durable_generation() {
             self.confirm_superseded_nonterminal_commands(acknowledgement.generation);
         }
-        applied
+        Some(applied)
     }
 
     fn confirm_superseded_nonterminal_commands(
@@ -3266,6 +3401,77 @@ mod tests {
     }
 
     #[test]
+    fn streaming_save_publishes_its_capture_without_consuming_newer_deltas() {
+        let mut app = crate::app::test_harness::TestApp::builder().build();
+        app.start_submitted_turn("initial request");
+        let release = app.app.conversation.pause_persistence();
+        app.feed_one(crate::event_source::SourceEvent::engine(
+            protocol::EngineEvent::TextDelta {
+                delta: "captured streaming text α".into(),
+            },
+        ));
+        app.render_silent();
+        app.app.save_session();
+        let generation = app.app.conversation.persistence_generation();
+        app.feed_one(crate::event_source::SourceEvent::engine(
+            protocol::EngineEvent::TextDelta {
+                delta: " newer text 界".into(),
+            },
+        ));
+        app.render_silent();
+        assert!(app.app.conversation.persistence_generation() > generation);
+        release.send(()).unwrap();
+        let actor = app.app.conversation.persistence.as_ref().unwrap();
+        assert!(matches!(
+            actor.flush(generation, Instant::now() + Duration::from_secs(5)),
+            PersistenceFlushOutcome::Durable { .. }
+        ));
+        let acknowledgement = actor.status().acknowledgement.unwrap();
+        assert_eq!(acknowledgement.generation, generation);
+        let row = acknowledgement
+            .frame
+            .command()
+            .transcript_records
+            .as_ref()
+            .unwrap()
+            .records
+            .last()
+            .unwrap()
+            .clone();
+        let record = smelt_core::TranscriptBlockRecord::try_from(row).unwrap();
+        assert_eq!(
+            record.block.raw_text().unwrap(),
+            "captured streaming text α"
+        );
+        assert_eq!(record.content_hash, record.block.content_hash());
+        app.app.drain_persist_reports();
+        assert!(app.app.conversation.has_unflushed_work());
+        app.save_session_and_flush();
+        let reader = smelt_store::LineageSessionReader::open_existing(
+            app.app.core.sessions.sessions_dir(),
+            &app.session_snapshot().id,
+        )
+        .unwrap();
+        let count = reader
+            .store_head()
+            .unwrap()
+            .transcript_record_count
+            .as_usize()
+            .unwrap();
+        let saved = reader
+            .transcript_record_slice_with_total((count - 1..count).into(), count)
+            .unwrap();
+        let record =
+            smelt_core::TranscriptBlockRecord::try_from(saved.records.into_iter().next().unwrap())
+                .unwrap();
+        assert_eq!(
+            record.block.raw_text().unwrap(),
+            "captured streaming text α newer text 界"
+        );
+        assert_eq!(record.content_hash, record.block.content_hash());
+    }
+
+    #[test]
     fn first_message_rewind_after_a_late_persistence_confirmation_can_resubmit() {
         for vim in [false, true] {
             let mut app = crate::app::test_harness::TestApp::builder()
@@ -3393,7 +3599,8 @@ mod tests {
             app.press(crossterm::event::KeyCode::Esc);
             assert_eq!(app.state().prompt_text, "first request");
             app.press(crossterm::event::KeyCode::Enter);
-            assert_eq!(app.state().queued_inputs, vec!["first request"]);
+            assert!(app.app.turn_submission_is_pending());
+            assert!(app.state().queued_inputs.is_empty());
             let generation = app.app.conversation.persistence_generation();
             let actor = app.app.conversation.persistence.as_ref().unwrap();
             assert!(matches!(

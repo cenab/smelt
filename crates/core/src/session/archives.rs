@@ -333,26 +333,135 @@ fn store_accounting(state: &SessionContextSnapshotState) -> SessionAccounting {
     }
 }
 
-fn rows<T: Serialize>(
+/// Immutable changed archive rows under the original session and table scopes.
+/// Only changed suffixes are copied, so holding a capture cannot detach a whole table
+/// on the next owner-thread mutation. Shared message and checkpoint bodies stay shared.
+#[derive(Clone, Debug)]
+pub struct CapturedArchiveSave {
+    frame: PreparedArchiveSave,
+    turn_metas: Option<(usize, Vec<(usize, protocol::TurnMeta)>)>,
+    metadata_snapshots: Option<(usize, Vec<(usize, super::SessionMetadataSnapshot)>)>,
+    context_snapshots: Option<(usize, Vec<(usize, super::ContextSnapshot)>)>,
+    checkpoint_events: Option<(usize, Vec<super::ContextCheckpointEvent>)>,
+}
+
+fn capture_rows<T: Clone>(
     table: &HistorySnapshots<T>,
     base: Option<SnapshotVersion>,
+) -> Option<(usize, Vec<(usize, T)>)> {
+    table
+        .suffix_from(base)
+        .map(|suffix| (suffix.retain_records, suffix.records.to_vec()))
+}
+
+fn prepare_rows<T: Serialize>(
+    suffix: Option<(usize, Vec<(usize, T)>)>,
 ) -> Result<ArchiveEdit<ArchiveRow>, StoreError> {
-    let Some(suffix) = table.suffix_from(base) else {
+    let Some((retain_records, records)) = suffix else {
         return Ok(ArchiveEdit::Retain);
     };
     Ok(ArchiveEdit::ReplaceSuffix {
-        retain_records: suffix.retain_records as u64,
-        records: suffix
-            .records
-            .iter()
+        retain_records: retain_records as u64,
+        records: records
+            .into_iter()
             .map(|(index, value)| {
                 Ok(ArchiveRow {
-                    index: HistoryIndex::new(*index as u64),
+                    index: HistoryIndex::new(index as u64),
                     value: serde_json::to_value(value)?,
                 })
             })
             .collect::<Result<_, StoreError>>()?,
     })
+}
+
+impl CapturedArchiveSave {
+    pub fn session_id(&self) -> &str {
+        &self.frame.command.session_id
+    }
+
+    pub fn archive_base(&self) -> Option<&SessionArchiveBase> {
+        self.frame.command.archive_base.as_ref()
+    }
+
+    pub fn same_snapshot(&self, other: &Self) -> bool {
+        self.frame.same_snapshot(&other.frame)
+    }
+
+    pub fn prepare(
+        self,
+        history: HistorySuffix,
+        transcript_records: Option<TranscriptRecordSuffix>,
+    ) -> Result<PreparedArchiveSave, StoreError> {
+        let _perf = smelt_perf::perf::begin("session:prepare_archives");
+        let mut frame = self.frame;
+        if history.final_len != frame.command.history.final_len {
+            return Err(StoreError::Integrity(
+                "captured archive history boundary changed".into(),
+            ));
+        }
+        let archives = &mut frame.command.archives;
+        archives.turn_metas = prepare_rows(self.turn_metas)?;
+        archives.context_snapshots = prepare_rows(self.context_snapshots)?;
+        archives.metadata_snapshots = match self.metadata_snapshots {
+            None => ArchiveEdit::Retain,
+            Some((retain_records, records)) => ArchiveEdit::ReplaceSuffix {
+                retain_records: retain_records as u64,
+                records: records
+                    .into_iter()
+                    .map(|(index, snapshot)| {
+                        let mut fields = json!({ "title": snapshot.title, "slug": snapshot.slug });
+                        let message = match &snapshot.first_user_message {
+                            None => {
+                                fields["first_user_message"] = Value::Null;
+                                MetadataMessage::None
+                            }
+                            Some(_)
+                                if same_message(&snapshot.first_user_message, &frame.message) =>
+                            {
+                                MetadataMessage::Active
+                            }
+                            Some(text) => MetadataMessage::New { text: text.clone() },
+                        };
+                        MetadataArchiveRow {
+                            index: HistoryIndex::new(index as u64),
+                            fields,
+                            message,
+                        }
+                    })
+                    .collect(),
+            },
+        };
+        archives.checkpoint_events = match self.checkpoint_events {
+            None => CheckpointEventsEdit::Retain,
+            Some((0, records)) if records.is_empty() => CheckpointEventsEdit::Clear,
+            Some((retain_records, records)) => CheckpointEventsEdit::ReplaceRecordsSuffix {
+                retain_records: retain_records as u64,
+                records: records
+                    .into_iter()
+                    .map(|event| CheckpointRecord {
+                        fields: json!({
+                            "kind": event.kind,
+                            "first_live_index": event.first_live_index,
+                            "completed_at_history_len": event.completed_at_history_len,
+                            "created_at_ms": event.created_at_ms,
+                        }),
+                        summary: if frame.checkpoint.as_ref().is_some_and(|checkpoint| {
+                            Arc::ptr_eq(&event.summary, &checkpoint.summary)
+                        }) {
+                            CheckpointSummary::Checkpoint
+                        } else {
+                            CheckpointSummary::New {
+                                text: event.summary,
+                            }
+                        },
+                    })
+                    .collect(),
+            },
+        };
+        frame.command.history = history;
+        frame.command.transcript_records = transcript_records;
+        Ok(frame)
+    }
 }
 
 impl Session {
@@ -420,6 +529,17 @@ impl Session {
         history: HistorySuffix,
         transcript_records: Option<TranscriptRecordSuffix>,
     ) -> Result<PreparedArchiveSave, StoreError> {
+        self.capture_archive_save(expected, history.final_len)?
+            .prepare(history, transcript_records)
+    }
+
+    /// Capture immutable changed suffixes without serializing their rows or cloning
+    /// session history. The returned frame keeps this instance's exact owner scope.
+    pub fn capture_archive_save(
+        &self,
+        expected: StoreHead,
+        history_len: smelt_store::HistoryLen,
+    ) -> Result<CapturedArchiveSave, StoreError> {
         let owner = &self.archive_owner;
         if owner.session_id.as_ref().is_some_and(|id| id != &self.id)
             || (owner.base.is_none() && expected != StoreHead::default())
@@ -436,7 +556,7 @@ impl Session {
         let checkpoint = self
             .checkpoint
             .as_ref()
-            .filter(|checkpoint| checkpoint.first_live_index as u64 <= history.final_len.get())
+            .filter(|checkpoint| checkpoint.first_live_index as u64 <= history_len.get())
             .cloned();
         let checkpoint_edit = match (&checkpoint, &owner.checkpoint) {
             (None, None) if owner.base.is_some() => CheckpointEdit::Retain,
@@ -471,72 +591,14 @@ impl Session {
                     value: self.first_user_message.clone(),
                 }
             };
-        let metadata_snapshots = match self
-            .metadata_snapshots
-            .suffix_from(owner.versions.map(|v| v.metadata_snapshots))
-        {
-            None => ArchiveEdit::Retain,
-            Some(suffix) => ArchiveEdit::ReplaceSuffix {
-                retain_records: suffix.retain_records as u64,
-                records: suffix
-                    .records
-                    .iter()
-                    .map(|(index, snapshot)| {
-                        let mut fields = json!({ "title": snapshot.title, "slug": snapshot.slug });
-                        let message = match &snapshot.first_user_message {
-                            None => {
-                                fields["first_user_message"] = Value::Null;
-                                MetadataMessage::None
-                            }
-                            Some(_)
-                                if same_message(
-                                    &snapshot.first_user_message,
-                                    &self.first_user_message,
-                                ) =>
-                            {
-                                MetadataMessage::Active
-                            }
-                            Some(text) => MetadataMessage::New { text: text.clone() },
-                        };
-                        MetadataArchiveRow {
-                            index: HistoryIndex::new(*index as u64),
-                            fields,
-                            message,
-                        }
-                    })
-                    .collect(),
-            },
-        };
-        let checkpoint_events = match self
+        let metadata_snapshots = capture_rows(
+            &self.metadata_snapshots,
+            owner.versions.map(|v| v.metadata_snapshots),
+        );
+        let checkpoint_events = self
             .checkpoint_events
             .suffix_from(owner.versions.map(|v| v.checkpoint_events))
-        {
-            None => CheckpointEventsEdit::Retain,
-            Some((0, [])) => CheckpointEventsEdit::Clear,
-            Some((retain_records, records)) => CheckpointEventsEdit::ReplaceRecordsSuffix {
-                retain_records: retain_records as u64,
-                records: records
-                    .iter()
-                    .map(|event| CheckpointRecord {
-                        fields: json!({
-                            "kind": event.kind,
-                            "first_live_index": event.first_live_index,
-                            "completed_at_history_len": event.completed_at_history_len,
-                            "created_at_ms": event.created_at_ms,
-                        }),
-                        summary: if checkpoint.as_ref().is_some_and(|checkpoint| {
-                            Arc::ptr_eq(&event.summary, &checkpoint.summary)
-                        }) {
-                            CheckpointSummary::Checkpoint
-                        } else {
-                            CheckpointSummary::New {
-                                text: event.summary.clone(),
-                            }
-                        },
-                    })
-                    .collect(),
-            },
-        };
+            .map(|(retain_records, records)| (retain_records, records.to_vec()));
         let accounting = super::context_snapshot_state_from_session(self);
         // Scalar retain resolves against the expected head, not the archive source base.
         let accounting_edit = if owner.accounting.as_ref() == Some(&accounting)
@@ -571,32 +633,39 @@ impl Session {
                 StoreError::Integrity("session update time exceeds SQLite range".into())
             })?,
         };
-        Ok(PreparedArchiveSave {
-            command: CompactSessionCommit {
-                session_id: self.id.clone(),
-                expected,
-                identity: super::store_identity_from_session(self)?,
-                scalars,
-                archive_base: owner.base.clone(),
-                archives: CompactSessionArchives {
-                    first_user_message,
-                    checkpoint: checkpoint_edit,
-                    checkpoint_events,
-                    turn_metas: rows(&self.turn_metas, owner.versions.map(|v| v.turn_metas))?,
-                    metadata_snapshots,
-                    context_snapshots: rows(
-                        &self.context_snapshots,
-                        owner.versions.map(|v| v.context_snapshots),
-                    )?,
+        Ok(CapturedArchiveSave {
+            frame: PreparedArchiveSave {
+                command: CompactSessionCommit {
+                    session_id: self.id.clone(),
+                    expected,
+                    identity: super::store_identity_from_session(self)?,
+                    scalars,
+                    archive_base: owner.base.clone(),
+                    archives: CompactSessionArchives {
+                        first_user_message,
+                        checkpoint: checkpoint_edit,
+                        ..Default::default()
+                    },
+                    history: HistorySuffix {
+                        start: HistoryIndex::new(history_len.get()),
+                        final_len: history_len,
+                        items: Vec::new(),
+                    },
+                    transcript_records: None,
                 },
-                history,
-                transcript_records,
+                scope: owner.scope.clone(),
+                versions: versions(self),
+                message: self.first_user_message.clone(),
+                checkpoint,
+                accounting,
             },
-            scope: owner.scope.clone(),
-            versions: versions(self),
-            message: self.first_user_message.clone(),
-            checkpoint,
-            accounting,
+            turn_metas: capture_rows(&self.turn_metas, owner.versions.map(|v| v.turn_metas)),
+            metadata_snapshots,
+            context_snapshots: capture_rows(
+                &self.context_snapshots,
+                owner.versions.map(|v| v.context_snapshots),
+            ),
+            checkpoint_events,
         })
     }
 
@@ -809,6 +878,110 @@ mod tests {
         let result = writer.commit_compact_session(prepared.command()).unwrap();
         assert!(session.acknowledge_archive_save(&prepared, &result));
         result
+    }
+
+    #[test]
+    fn captured_archives_keep_original_scope_versions_and_changed_suffixes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = session(4, 32_768);
+        let mut writer = OwnedLineageWriter::open(root.path(), &session.id).unwrap();
+        let first = save(&mut session, &mut writer, StoreHead::default());
+        session.title = Some("captured title".into());
+        session.snapshot_metadata_at(1);
+        let captured = session
+            .capture_archive_save(first.receipt.current, HistoryLen::new(1))
+            .unwrap();
+        assert_eq!(captured.metadata_snapshots.as_ref().unwrap().1.len(), 1);
+        assert!(captured.turn_metas.is_none());
+        assert!(captured.context_snapshots.is_none());
+        assert!(captured.checkpoint_events.is_none());
+        assert!(Arc::ptr_eq(
+            &captured.frame.scope,
+            &session.archive_owner.scope
+        ));
+        let captured_versions = captured.frame.versions;
+        session.title = Some("newer title".into());
+        session.snapshot_metadata_at(1);
+        session.checkpoint_events.push(ContextCheckpointEvent {
+            kind: "newer".into(),
+            summary: "newer summary".into(),
+            first_live_index: 1,
+            completed_at_history_len: 1,
+            created_at_ms: 100,
+        });
+        let frame = captured
+            .prepare(
+                HistorySuffix {
+                    start: HistoryIndex::new(1),
+                    final_len: HistoryLen::new(1),
+                    items: Vec::new(),
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(frame.versions, captured_versions);
+        assert_eq!(
+            frame.command.scalars.title.as_deref(),
+            Some("captured title")
+        );
+        let result = writer.commit_compact_session(frame.command()).unwrap();
+        assert!(session.acknowledge_archive_save(&frame, &result));
+        assert_eq!(session.title.as_deref(), Some("newer title"));
+        assert!(session.metadata_snapshots.changed_suffix().is_some());
+        assert!(session.checkpoint_events.changed_suffix().is_some());
+        let next = prepare(&session, result.receipt.current);
+        assert!(matches!(
+            next.command.archives.metadata_snapshots,
+            ArchiveEdit::ReplaceSuffix { .. }
+        ));
+        assert!(matches!(
+            next.command.archives.checkpoint_events,
+            CheckpointEventsEdit::ReplaceRecordsSuffix { .. }
+        ));
+        let foreign = session
+            .clone()
+            .capture_archive_save(result.receipt.current, HistoryLen::new(1))
+            .unwrap();
+        assert!(!foreign.same_snapshot(
+            &session
+                .capture_archive_save(result.receipt.current, HistoryLen::new(1))
+                .unwrap()
+        ));
+    }
+
+    #[test]
+    fn archive_capture_does_not_share_whole_snapshot_vectors_with_the_writer() {
+        let mut session = session(0, 0);
+        let mut metadata = Vec::with_capacity(16_385);
+        for index in 0..16_384 {
+            metadata.push((
+                index,
+                super::super::SessionMetadataSnapshot {
+                    title: Some(format!("title {index}")),
+                    slug: None,
+                    first_user_message: None,
+                },
+            ));
+        }
+        session.metadata_snapshots = metadata.into();
+        let before = session.metadata_snapshots.as_slice().as_ptr();
+        let capture = session
+            .capture_archive_save(StoreHead::default(), HistoryLen::new(16_385))
+            .unwrap();
+        session.metadata_snapshots.push((
+            16_384,
+            super::super::SessionMetadataSnapshot {
+                title: Some("newer title".into()),
+                slug: None,
+                first_user_message: None,
+            },
+        ));
+        assert_eq!(
+            session.metadata_snapshots.as_slice().as_ptr(),
+            before,
+            "an outstanding archive capture must not cause a full-table copy on the next append"
+        );
+        assert_eq!(capture.metadata_snapshots.as_ref().unwrap().1.len(), 16_384);
     }
 
     #[test]
@@ -2134,6 +2307,7 @@ mod tests {
             let live = crate::session_runtime::LiveSession::from_store(
                 resumed.header,
                 resumed.store_address,
+                resumed.user_turn_count,
             );
             let mut materialized = live
                 .materialize_full_session(&resumed.session, "synthetic:materialize")

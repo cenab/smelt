@@ -526,6 +526,20 @@ local function external_or_err(start)
 end
 
 if smelt.session then
+  --- Read a bounded page of rewindable user turns off the UI thread, newest
+  --- page first and each page in chronological order. Uses the transcript
+  --- index without decoding assistant output. Returns `{ turns, next_before? }`;
+  --- pass `next_before` to read older turns. Must run in a yieldable task.
+  ---@tier ui_host
+  ---@type fun(before?: integer): table
+  function smelt.session.turns_page(before)
+    local request = internal.session.__prepare_turns_page(before)
+    if type(request) == "table" then return request end
+    local result = smelt.task.external(function(id) internal.session.__start_turns_page(id, request) end)
+    if result.err then error(result.err, 2) end
+    return result.page
+  end
+
   --- Create or open a managed git worktree off the UI thread, then request a
   --- coherent cwd transition. Must run in `smelt.spawn`, a command, or a tool.
   --- `opts.name` is required and is normalized to a safe folder/branch name;

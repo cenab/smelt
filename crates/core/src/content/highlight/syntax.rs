@@ -117,25 +117,54 @@ pub fn render_code_block(
     bctx: Option<&super::super::BoxContext>,
     fence: bool,
 ) -> u16 {
+    render_code_block_range(out, block, width, dim, bctx, fence, 0..usize::MAX)
+        .min(u16::MAX as usize) as u16
+}
+
+/// Emit only the requested visual rows, preserving syntax state and wrapped source metadata.
+/// Returns the number of emitted rows.
+pub fn render_code_block_range(
+    out: &mut LineBuilder,
+    block: &CodeBlock,
+    width: usize,
+    dim: bool,
+    bctx: Option<&super::super::BoxContext>,
+    fence: bool,
+    range: std::ops::Range<usize>,
+) -> usize {
     let _perf = smelt_perf::perf::begin("render:code_block");
+    if range.is_empty() {
+        return 0;
+    }
     let syntax = syntax_for_lang(block.lang());
     let theme = syntax_theme(out.theme());
     let content_width = if let Some(b) = bctx { b.inner_w } else { width };
     let text_w = content_width.max(1);
-    let mut rows = 0u16;
+    let mut rows = 0usize;
+    let mut emitted = 0usize;
     let mut h = HighlightLines::new(syntax, theme);
 
     let bg_group = intern("SmeltCodeBlockBg");
     let bg = out.theme().resolve(bg_group).bg.unwrap_or(Color::Reset);
     let last_idx = block.len().saturating_sub(1);
     for (line_idx, code_line) in block.lines().iter().enumerate() {
+        if rows >= range.end {
+            break;
+        }
         let line = code_line.text();
         let line_with_nl = format!("{}\n", line);
         let regions = h
             .highlight_line(&line_with_nl, &SYNTAX_SET)
             .unwrap_or_default();
         let visual_rows = split_regions_into_rows(out, &regions, text_w);
-        for segment in wrapped_segments(out, &visual_rows) {
+        for (offset, segment) in wrapped_segments(out, &visual_rows).enumerate() {
+            let row = rows.saturating_add(offset);
+            if row >= range.end {
+                break;
+            }
+            if row < range.start {
+                continue;
+            }
             segment.emit_with_source(out, line, |out, vrow, kind| {
                 out.save_style();
                 if !kind.is_continuation() && fence {
@@ -174,11 +203,12 @@ pub fn render_code_block(
                 out.pop_style();
             });
             out.newline();
+            emitted += 1;
         }
-        rows += visual_rows.len() as u16;
+        rows = rows.saturating_add(visual_rows.len());
     }
 
-    rows
+    emitted
 }
 
 pub(super) fn render_highlighted(
@@ -670,6 +700,60 @@ mod tests {
         });
         assert_eq!(block.lines[0].source_text.as_deref(), Some("a"));
         assert_eq!(block.lines[1].source_text.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn code_block_ranges_match_full_render_with_syntax_and_source_metadata() {
+        let code = crate::content::code_block::parse_code_block(
+            &[
+                "/* multiline comment",
+                "still a comment */",
+                "let text = \"界e\u{301} text\";",
+                "last",
+            ],
+            "rust",
+        );
+        let ctx = bctx(8);
+        for box_context in [None, Some(&ctx)] {
+            for fence in [false, true] {
+                let full = render_test(12, |out| {
+                    super::render_code_block(out, &code, 12, true, box_context, fence);
+                });
+                for start in 0..=full.lines.len() + 1 {
+                    for end in start..=full.lines.len() + 1 {
+                        let clipped = render_test(12, |out| {
+                            let emitted = render_code_block_range(
+                                out,
+                                &code,
+                                12,
+                                true,
+                                box_context,
+                                fence,
+                                start..end,
+                            );
+                            assert_eq!(emitted, end.min(full.lines.len()).saturating_sub(start));
+                        });
+                        let expected =
+                            &full.lines[start.min(full.lines.len())..end.min(full.lines.len())];
+                        assert_eq!(clipped.lines.len(), expected.len());
+                        for (actual, expected) in clipped.lines.iter().zip(expected) {
+                            assert_eq!(actual.text, expected.text);
+                            assert_eq!(actual.source_text, expected.source_text);
+                            assert_eq!(actual.external_source_text, expected.external_source_text);
+                            assert_eq!(actual.soft_wrapped, expected.soft_wrapped);
+                            assert_eq!(actual.copy_continuation, expected.copy_continuation);
+                            let spans = |line: &crate::content::builder::test_util::TestLine| {
+                                line.spans
+                                    .iter()
+                                    .map(|span| (span.text.clone(), span.style, span.meta.clone()))
+                                    .collect::<Vec<_>>()
+                            };
+                            assert_eq!(spans(actual), spans(expected));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ── render_highlighted / print_syntax_file ────────────────────────

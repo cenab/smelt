@@ -26,7 +26,7 @@ fn suspend_reclamation_delete_guard(tx: &Transaction<'_>, table: &str) -> Result
         "lineage_turn_transitions" => "lineage_turn_transition_delete",
         "lineage_commit_receipts" => "lineage_commit_receipt_delete",
         "lineage_completed_sequence_nodes" => "lineage_completed_sequence_node_delete",
-        "lineage_history_indexes" => "lineage_history_index_delete",
+        "lineage_history_semantic_roots" => "lineage_history_index_delete",
         "lineage_history_index_nodes" => "lineage_history_index_node_delete",
         _ => return Ok(None),
     };
@@ -231,7 +231,7 @@ fn expand_mark(
             )?;
             mark(tx, epoch, MARK_NODE, node.as_deref())?;
             let index: Option<Option<String>> = tx.query_row(
-                "SELECT index_node_id FROM lineage_history_indexes WHERE lineage_id = ?1 AND history_root_id = ?2",
+                "SELECT index_node_id FROM lineage_history_semantic_roots WHERE lineage_id = ?1 AND history_root_id = ?2",
                 (lineage.as_str(), id), |row| row.get(0),
             ).optional()?;
             mark(tx, epoch, MARK_HISTORY_INDEX, index.flatten().as_deref())?;
@@ -624,7 +624,7 @@ const SWEEP_SPECS: &[(&str, &str)] = &[
     ) AND NOT EXISTS (
         SELECT 1 FROM lineage_commit_receipts receipt WHERE receipt.lineage_id = candidate.lineage_id AND receipt.prior_revision_id = candidate.revision_id
     )"),
-    ("lineage_history_indexes", "NOT EXISTS (
+    ("lineage_history_semantic_roots", "NOT EXISTS (
         SELECT 1 FROM smelt_reachable_roots mark WHERE mark.root_id = candidate.history_root_id
     ) AND NOT EXISTS (
         SELECT 1 FROM lineage_revisions revision WHERE revision.lineage_id = candidate.lineage_id AND revision.history_root_id = candidate.history_root_id
@@ -632,7 +632,7 @@ const SWEEP_SPECS: &[(&str, &str)] = &[
     ("lineage_history_index_nodes", "NOT EXISTS (
         SELECT 1 FROM smelt_reachable_history_indexes mark WHERE mark.node_id = candidate.node_id
     ) AND NOT EXISTS (
-        SELECT 1 FROM lineage_history_indexes semantic WHERE semantic.lineage_id = candidate.lineage_id AND semantic.index_node_id = candidate.node_id
+        SELECT 1 FROM lineage_history_semantic_roots semantic WHERE semantic.lineage_id = candidate.lineage_id AND semantic.index_node_id = candidate.node_id
     ) AND NOT EXISTS (
         SELECT 1 FROM lineage_history_index_nodes parent WHERE parent.lineage_id = candidate.lineage_id AND parent.left_node_id = candidate.node_id
     ) AND NOT EXISTS (
