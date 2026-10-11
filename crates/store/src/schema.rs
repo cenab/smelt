@@ -82,7 +82,7 @@ pub(crate) fn initialize_lineage_schema(conn: &mut Connection) -> Result<()> {
 
 pub(crate) fn validate_lineage_schema(conn: &Connection) -> Result<()> {
     let version = user_version(conn)?;
-    if !matches!(version, 3 | 4 | 5 | LINEAGE_SCHEMA_VERSION) {
+    if !matches!(version, 3..=5 | LINEAGE_SCHEMA_VERSION) {
         return Err(StoreError::UnsupportedSchema {
             found: version,
             expected: LINEAGE_SCHEMA_VERSION,

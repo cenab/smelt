@@ -696,7 +696,7 @@ pub(crate) fn history_user_count_cancellable(
         return Ok((0, stats));
     }
     // COMPAT(lineage-schema-v4): old read-only layouts have no authoritative ordinals.
-    if matches!(crate::schema::user_version(conn)?, 3 | 4 | 5) {
+    if matches!(crate::schema::user_version(conn)?, 3..=5) {
         let mut count = 0;
         let mut start = 0;
         while start < end {

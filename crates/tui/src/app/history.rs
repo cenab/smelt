@@ -3310,7 +3310,7 @@ mod checkpoint_tests {
     fn legacy_steering_rewind_refuses_unsaved_same_length_history_changes() {
         let mut app = saved_unlinked_steering_app(|_, _| {});
         let target = user("old follow-up").with_sent_at_ms(200);
-        app.app.session_truncate_from(0);
+        app.app.session_truncate_from(0).unwrap();
         for item in [target.clone(), assistant("changed prior output"), target] {
             app.app.session_append_history(item);
         }
