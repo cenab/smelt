@@ -38,7 +38,10 @@ pub(super) enum TranscriptWork {
         event: EngineEvent,
         arrived_at: std::time::Instant,
     },
-    AuxiliaryContinuation(EngineEvent),
+    AuxiliaryContinuation {
+        event: EngineEvent,
+        arrived_at: std::time::Instant,
+    },
     ToolOutputAppend(PendingToolOutputAppend),
     DeferredReasoningSummary {
         event: EngineEvent,
@@ -89,8 +92,12 @@ impl TranscriptWorkQueue {
         self.push_back(TranscriptWork::ProviderContinuation { event, arrived_at });
     }
 
-    pub(super) fn push_auxiliary_continuation(&mut self, event: EngineEvent) {
-        self.push_back(TranscriptWork::AuxiliaryContinuation(event));
+    pub(super) fn push_auxiliary_continuation(
+        &mut self,
+        event: EngineEvent,
+        arrived_at: std::time::Instant,
+    ) {
+        self.push_back(TranscriptWork::AuxiliaryContinuation { event, arrived_at });
     }
 
     pub(super) fn push_deferred_reasoning_summary(
@@ -167,11 +174,12 @@ impl TranscriptWorkQueue {
     pub(super) fn has_auxiliary_work(&self, id: u64) -> bool {
         self.items.iter().any(|work| {
             matches!(work,
-                TranscriptWork::AuxiliaryContinuation(
-                    EngineEvent::EngineAskDelta { id: queued, .. }
+                TranscriptWork::AuxiliaryContinuation {
+                    event: EngineEvent::EngineAskDelta { id: queued, .. }
                     | EngineEvent::EngineAskDraftRejected { id: queued }
-                    | EngineEvent::EngineAskResponse { id: queued, .. }
-                ) if *queued == id
+                    | EngineEvent::EngineAskResponse { id: queued, .. },
+                    ..
+                } if *queued == id
             )
         })
     }

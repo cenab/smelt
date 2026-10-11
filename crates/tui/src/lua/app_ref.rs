@@ -425,6 +425,23 @@ impl ConversationLuaHost<'_> {
         }
     }
 
+    pub(crate) fn stream_arrival_time(&self) -> std::time::Instant {
+        self.app
+            .stream_event_arrived_at
+            .unwrap_or_else(|| self.app.core.clock.instant_now())
+    }
+
+    pub(crate) fn register_transcript_stream(
+        &mut self,
+        stream: crate::lua::api::transcript::WeakTranscriptStream,
+    ) {
+        self.app.plugin_streams.push(stream);
+    }
+
+    pub(crate) fn request_stream_frame(&mut self) {
+        self.app.request_continuation_render();
+    }
+
     pub(crate) fn render_transcript_stream(
         &mut self,
         buffer_id: crate::smelt_edit::BufId,

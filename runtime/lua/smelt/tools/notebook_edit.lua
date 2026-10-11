@@ -61,7 +61,22 @@ local function retained_layout(block)
 end
 
 smelt.transcript.register_tool("edit_notebook", {
-  cache_key = "smelt.tool-presentation.edit_notebook:v3",
+  cache_key = "smelt.tool-presentation.edit_notebook:v4",
+  draft = function(block)
+    local args = block.args or {}
+    if args.edit_mode == "delete" then return nil end
+    for _, field in ipairs(block.argument_fields or {}) do
+      if field.name == "new_source" and field.content_id then
+        local body = smelt.layout.content(field.content_id, {
+          format = "file",
+          path = args.notebook_path or "",
+          lang = args.cell_type == "markdown" and "md" or nil,
+        })
+        return smelt.layout.vbox({ smelt.layout.text("new cell source (not validated)"), body })
+      end
+    end
+    return nil
+  end,
   body = function(block)
     return retained_layout(block)
   end,

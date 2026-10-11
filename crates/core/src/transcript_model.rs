@@ -3774,6 +3774,11 @@ impl BlockHistory {
         self.add_block(None, block, None)
     }
 
+    pub(crate) fn insert_before(&mut self, before: BlockId, block: Block) -> Option<BlockId> {
+        let index = self.order_index(before)?;
+        Some(self.add_block(Some(index), block, None))
+    }
+
     pub(crate) fn push_with_origin(&mut self, block: Block, origin: BlockOrigin) -> BlockId {
         self.add_block(None, block, Some(origin))
     }

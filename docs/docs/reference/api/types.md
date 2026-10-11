@@ -1418,7 +1418,7 @@ Transcript-shaped streaming renderer for plugin-owned buffers. Append model text
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
-| `append` | `fun(delta: string): nil` | yes | Append one assistant text delta and re-render the target buffer. |
+| `append` | `fun(delta: string): nil` | yes | Queue one received assistant text delta for grapheme-safe, frame-paced display. Callback delivery is immediate; finish drains pending text and reset discards it. |
 | `finish` | `fun(final_text: string?): nil` | yes | Finalize the streaming block. If `final_text` is provided and differs from the streamed text, the final text is rendered instead. |
 | `reset` | `fun(): nil` | yes | Clear the stream and the target buffer. |
 | `width` | `fun(width: integer?): integer?` | yes | Read or set the render width in terminal cells. |

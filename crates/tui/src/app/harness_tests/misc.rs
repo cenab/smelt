@@ -405,6 +405,7 @@ fn streaming_search_tool_summaries_keep_patterns_while_absolute_paths_collapse()
             tool_name: Some(tool_name.into()),
             delta: format!(r#"{{"pattern":{}"#, serde_json::to_string(pattern).unwrap()),
         }));
+        app.clock.advance(std::time::Duration::from_millis(250));
         let pattern_frame = app.render_to_frame().text();
         let expected_pattern = format!("* {tool_name} {pattern}");
         assert!(
@@ -423,6 +424,7 @@ fn streaming_search_tool_summaries_keep_patterns_while_absolute_paths_collapse()
             tool_name: Some(tool_name.into()),
             delta: format!(r#","path":{}"#, partial_cwd),
         }));
+        app.clock.advance(std::time::Duration::from_millis(250));
         let hidden_path_frame = app.render_to_frame().text();
         assert!(
             hidden_path_frame.contains(&expected_pattern),
@@ -439,7 +441,7 @@ fn streaming_search_tool_summaries_keep_patterns_while_absolute_paths_collapse()
             tool_name: Some(tool_name.into()),
             delta: "/crates/core/src/content".into(),
         }));
-        app.feed_one(SourceEvent::Tick(50));
+        app.feed_one(SourceEvent::Tick(250));
         let relative_path_frame = app.render_to_frame().text();
         assert!(
             relative_path_frame.contains(&format!(
@@ -1878,9 +1880,10 @@ fn prepared_edit_file_diff_survives_promotion_until_tool_finish() {
     }));
     let draft_frame = app.render_to_frame().text();
     assert!(
-        !draft_frame.contains("flicker-old") && !draft_frame.contains("flicker-new"),
-        "unprepared draft rendered a diff: {draft_frame}"
+        draft_frame.contains("replacement snippet (not validated)"),
+        "{draft_frame}"
     );
+    assert_edit_file_diff_visible(&draft_frame, "received-snippet");
     assert_eq!(
         evaluate_tool_decision(&mut app, 1, &call_id, "edit_file", &args),
         protocol::Decision::Ask
@@ -2014,7 +2017,7 @@ struct InvalidEditFileCase {
 }
 
 #[test]
-fn invalid_edit_files_are_rejected_without_a_speculative_diff() {
+fn invalid_edit_file_drafts_are_labeled_before_preflight_rejection() {
     let cases = [
         InvalidEditFileCase {
             name: "unread",
@@ -2112,7 +2115,10 @@ fn assert_invalid_edit_file_lifecycle(case: &InvalidEditFileCase, request_id: u6
 
     let draft_frame = app.render_to_frame().text();
     assert!(draft_frame.contains("* edit_file"), "frame: {draft_frame}");
-    assert_no_speculative_edit(&draft_frame, case, "draft");
+    assert!(
+        draft_frame.contains("replacement snippet (not validated)"),
+        "{draft_frame}"
+    );
 
     let invocation_id = protocol::InvocationId::new(request_id);
     let decision = evaluate_tool_decision(&mut app, request_id, &call_id, "edit_file", &args);

@@ -30,7 +30,7 @@ pub(crate) mod session_document;
 pub(crate) mod session_load;
 pub(crate) mod session_preview;
 pub(crate) mod shell_panel;
-mod stream_animation;
+pub(crate) mod stream_animation;
 #[cfg(any(test, feature = "harness"))]
 pub mod test_harness;
 pub(crate) mod transcript;
@@ -338,6 +338,8 @@ pub struct TuiApp {
     frame_scheduler: crate::app::render_loop::FrameScheduler,
     transcript_work: crate::app::transcript_work::TranscriptWorkQueue,
     continuing_engine_ask_ids: std::collections::HashSet<u64>,
+    pub(crate) stream_event_arrived_at: Option<Instant>,
+    pub(crate) plugin_streams: Vec<crate::lua::api::transcript::WeakTranscriptStream>,
     pub(crate) last_width: u16,
     pub(crate) last_height: u16,
     managed_models: crate::app::managed_models::ManagedModelState,
@@ -2132,6 +2134,8 @@ impl TuiApp {
             frame_scheduler: crate::app::render_loop::FrameScheduler::default(),
             transcript_work: crate::app::transcript_work::TranscriptWorkQueue::default(),
             continuing_engine_ask_ids: std::collections::HashSet::new(),
+            stream_event_arrived_at: None,
+            plugin_streams: Vec::new(),
             last_width: term_w,
             last_height: term_h,
             managed_models,

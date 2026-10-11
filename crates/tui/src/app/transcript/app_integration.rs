@@ -25,7 +25,13 @@ impl TuiApp {
     pub(crate) fn update_compaction_preview(&mut self, summary: String) {
         let follow_tail = self.transcript_win().is_following_tail();
         let existing = self.conversation.transcript_compaction_preview_id();
-        let Some(id) = self.conversation.update_compaction_preview(summary) else {
+        let arrived_at = self
+            .stream_event_arrived_at
+            .unwrap_or_else(|| self.core.clock.instant_now());
+        let Some(id) = self
+            .conversation
+            .update_compaction_preview(summary, arrived_at)
+        else {
             return;
         };
         if existing.is_none() {
@@ -40,7 +46,11 @@ impl TuiApp {
         if follow_tail {
             self.transcript_win_mut().follow_tail();
         }
-        self.request_urgent_render();
+        if existing.is_none() {
+            self.request_urgent_render();
+        } else {
+            self.request_continuation_render();
+        }
     }
 
     pub(crate) fn clear_compaction_preview(&mut self) {

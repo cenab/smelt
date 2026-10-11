@@ -40,7 +40,7 @@ fn is_reasoning_summary(event: &EngineEvent) -> bool {
 }
 
 impl TuiApp {
-    fn dispatch_engine_ask_event(&mut self, event: &EngineEvent) {
+    fn dispatch_engine_ask_event(&mut self, event: &EngineEvent, arrived_at: std::time::Instant) {
         match event {
             EngineEvent::EngineAskDelta { id, .. } => {
                 self.continuing_engine_ask_ids.insert(*id);
@@ -52,7 +52,9 @@ impl TuiApp {
             _ => unreachable!("auxiliary request event"),
         }
         let lua = self.lua.execution();
+        let previous = self.stream_event_arrived_at.replace(arrived_at);
         crate::lua::scope_app(self, || lua.fire_ask_event(event));
+        self.stream_event_arrived_at = previous;
     }
 
     pub(crate) fn publish_visible_token_usage(&mut self, usage: protocol::TokenUsage) {
@@ -220,50 +222,18 @@ impl TuiApp {
     }
 
     fn complete_reasoning_summary_part(&mut self, title: Option<String>, content: String) -> bool {
-        let title = title
-            .map(|title| smelt_buffer::text::trim_whitespace(&title).to_string())
-            .filter(|title| !title.is_empty());
-        let content = smelt_buffer::text::trim_whitespace(&content).to_string();
-        if title.is_none() && content.is_empty() {
+        if title.as_deref().is_none_or(|title| title.trim().is_empty()) && content.trim().is_empty()
+        {
             return false;
         }
-
         self.flush_streaming_thinking();
-        let Some(previous) = self.conversation.promote_last_reasoning_summary() else {
-            self.push_block(Block::Thinking {
-                summary_titles: title.iter().cloned().collect(),
-                title,
-                content: content.into(),
-                kind: protocol::ReasoningKind::Summary,
-            });
-            return true;
-        };
-        let id = previous.id;
-        let previous_title = previous.title;
-        let mut summary_titles = previous.summary_titles;
-        let previous_content = previous.content;
-
-        if let Some(title) = title.as_ref() {
-            if summary_titles.last() != Some(title) {
-                summary_titles.push(title.clone());
-            }
+        let previous = self.conversation.promote_last_reasoning_summary();
+        let block = super::transcript::reasoning_summary_block(previous.as_ref(), title, &content);
+        if let Some(previous) = previous {
+            self.conversation.rewrite_block(previous.id, block);
+        } else {
+            self.push_block(block);
         }
-        let mut combined_content = previous_content;
-        if !content.is_empty() {
-            if !combined_content.is_empty() {
-                combined_content.push_owned("\n".to_string());
-            }
-            combined_content.push_owned(content);
-        }
-        self.conversation.rewrite_block(
-            id,
-            Block::Thinking {
-                title: title.or(previous_title),
-                summary_titles,
-                content: combined_content,
-                kind: protocol::ReasoningKind::Summary,
-            },
-        );
         true
     }
 
@@ -288,7 +258,8 @@ impl TuiApp {
         arrived_at: std::time::Instant,
     ) {
         if matches!(event, EngineEvent::EngineAskDelta { .. }) {
-            self.transcript_work.push_auxiliary_continuation(event);
+            self.transcript_work
+                .push_auxiliary_continuation(event, arrived_at);
         } else {
             self.transcript_work
                 .push_provider_continuation(event, arrived_at);
@@ -317,8 +288,8 @@ impl TuiApp {
                     debug_assert!(keep_streaming, "a continuation cannot terminate its turn");
                     self.transcript_work.front_is_tool_output_append()
                 }
-                TranscriptWork::AuxiliaryContinuation(event) => {
-                    self.dispatch_engine_event_now(event);
+                TranscriptWork::AuxiliaryContinuation { event, arrived_at } => {
+                    self.dispatch_engine_event_now_at(event, arrived_at);
                     false
                 }
                 TranscriptWork::ToolOutputAppend(mut pending) => {
@@ -376,7 +347,8 @@ impl TuiApp {
         | EngineEvent::EngineAskResponse { id, .. } = &ev
         {
             if self.transcript_work.has_auxiliary_work(*id) {
-                self.transcript_work.push_auxiliary_continuation(ev);
+                self.transcript_work
+                    .push_auxiliary_continuation(ev, arrived_at);
                 self.request_continuation_render();
                 return true;
             }
@@ -416,7 +388,7 @@ impl TuiApp {
         arrived_at: std::time::Instant,
     ) -> bool {
         if !self.conversation.is_active() {
-            self.handle_idle_engine_event(ev);
+            self.handle_idle_engine_event(ev, arrived_at);
             return true;
         }
 
@@ -571,13 +543,20 @@ impl TuiApp {
                 }
                 SessionControl::Continue
             }
-            EngineEvent::ReasoningPartStarted { kind, .. } => {
+            EngineEvent::ReasoningPartStarted { id, kind } => {
                 if kind == protocol::ReasoningKind::Raw {
                     self.flush_streaming_thinking();
+                } else {
+                    self.conversation.start_summary_part(id);
                 }
                 SessionControl::Continue
             }
-            EngineEvent::ReasoningPartDelta { kind, delta, .. } => {
+            EngineEvent::ReasoningPartDelta {
+                id,
+                kind,
+                title,
+                delta,
+            } => {
                 assistant_output_started = !delta.is_empty();
                 let bytes = delta.len();
                 if kind == protocol::ReasoningKind::Raw
@@ -586,6 +565,13 @@ impl TuiApp {
                         delta.clone(),
                         arrived_at,
                     )
+                {
+                    self.request_continuation_render();
+                }
+                if kind == protocol::ReasoningKind::Summary
+                    && self
+                        .conversation
+                        .queue_summary_delta(id, title, delta.clone(), arrived_at)
                 {
                     self.request_continuation_render();
                 }
@@ -602,13 +588,18 @@ impl TuiApp {
                 SessionControl::Continue
             }
             EngineEvent::ReasoningPartFinished {
+                id,
                 kind,
                 title,
                 content,
-                ..
             } => {
                 if kind == protocol::ReasoningKind::Raw {
                     self.flush_streaming_thinking();
+                } else if self
+                    .conversation
+                    .finish_summary_part(&id, title.as_deref(), &content)
+                {
+                    assistant_output_started = true;
                 } else {
                     assistant_output_started = self.complete_reasoning_summary_part(title, content);
                 }
@@ -677,7 +668,7 @@ impl TuiApp {
                 delta,
             } => {
                 assistant_output_started = !delta.is_empty();
-                self.handle_tool_draft_delta(stream_id, call_id, tool_name, delta);
+                self.handle_tool_draft_delta(stream_id, call_id, tool_name, delta, arrived_at);
                 SessionControl::Continue
             }
             EngineEvent::ToolCallDraftFinished {
@@ -850,7 +841,7 @@ impl TuiApp {
             event @ (EngineEvent::EngineAskDelta { .. }
             | EngineEvent::EngineAskDraftRejected { .. }
             | EngineEvent::EngineAskResponse { .. }) => {
-                self.dispatch_engine_ask_event(&event);
+                self.dispatch_engine_ask_event(&event, arrived_at);
                 SessionControl::Continue
             }
             EngineEvent::HistoryAppended { turn_id: id, delta } => {
@@ -1067,7 +1058,11 @@ impl TuiApp {
     }
 
     /// Handle engine events that arrive when no turn is active.
-    pub(crate) fn handle_idle_engine_event(&mut self, ev: EngineEvent) {
+    pub(crate) fn handle_idle_engine_event(
+        &mut self,
+        ev: EngineEvent,
+        arrived_at: std::time::Instant,
+    ) {
         match ev {
             // Stale history snapshots from cancelled/completed turns would overwrite a freshly cleared history.
             EngineEvent::HistoryUpdated { .. } => {}
@@ -1082,7 +1077,7 @@ impl TuiApp {
             event @ (EngineEvent::EngineAskDelta { .. }
             | EngineEvent::EngineAskDraftRejected { .. }
             | EngineEvent::EngineAskResponse { .. }) => {
-                self.dispatch_engine_ask_event(&event);
+                self.dispatch_engine_ask_event(&event, arrived_at);
             }
             EngineEvent::TurnError { message, .. } => {
                 self.working.finish(TurnOutcome::Errored);

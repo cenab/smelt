@@ -10,7 +10,7 @@ const STARTUP_WINDOW: Duration = Duration::from_millis(100);
 const MAX_LAG: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum StreamKind {
+pub(crate) enum StreamKind {
     Text,
     Thinking,
 }
@@ -22,7 +22,7 @@ struct Chunk {
 }
 
 #[derive(Default)]
-pub(super) struct StreamAnimation {
+pub(crate) struct StreamAnimation {
     kind: Option<StreamKind>,
     chunks: VecDeque<Chunk>,
     pending_chars: usize,
@@ -33,25 +33,25 @@ pub(super) struct StreamAnimation {
 }
 
 impl StreamAnimation {
-    pub(super) fn kind(&self) -> Option<StreamKind> {
+    pub(crate) fn kind(&self) -> Option<StreamKind> {
         self.kind
     }
 
-    pub(super) fn is_pending(&self) -> bool {
+    pub(crate) fn is_pending(&self) -> bool {
         self.pending_chars > 0
     }
 
-    pub(super) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         *self = Self::default();
     }
 
-    pub(super) fn finish(&mut self) -> Option<(StreamKind, String)> {
+    pub(crate) fn finish(&mut self) -> Option<(StreamKind, String)> {
         let kind = self.kind?;
         let mut animation = std::mem::take(self);
         Some((kind, animation.take_chars(animation.pending_chars)))
     }
 
-    pub(super) fn push(&mut self, kind: StreamKind, text: String, now: Instant) -> String {
+    pub(crate) fn push(&mut self, kind: StreamKind, text: String, now: Instant) -> String {
         if text.is_empty() {
             return String::new();
         }
@@ -104,7 +104,7 @@ impl StreamAnimation {
         }
     }
 
-    pub(super) fn advance(&mut self, now: Instant) -> String {
+    pub(crate) fn advance(&mut self, now: Instant) -> String {
         let Some(oldest) = self.chunks.front().map(|chunk| chunk.arrived_at) else {
             return String::new();
         };
@@ -456,6 +456,647 @@ mod tests {
                 .text()
                 .contains("Current streaming answer"));
             assert!(app.agent_running());
+            app.assert_invariants();
+        }
+    }
+
+    #[test]
+    fn auxiliary_buffers_reveal_without_new_provider_events() {
+        let mut app = TestApp::builder().build();
+        app.run_lua_result(
+            r#"
+            smooth_buf = smelt.buf.new({ readonly = true })
+            smooth_stream = smelt.transcript.stream(smooth_buf)
+            smooth_stream:append("Auxiliary answer arriving in one chunk")
+            smelt.spawn(function()
+                smelt.dialog.open({
+                    title = "Side answer",
+                    panels = {{ leaf = smelt.dialog.content({ buf = smooth_buf }) }},
+                })
+            end)
+        "#,
+        )
+        .expect("create auxiliary stream dialog");
+        app.drive_lua_tasks();
+        assert!(!app
+            .render_to_frame()
+            .text()
+            .contains("Auxiliary answer arriving in one chunk"));
+        app.clock.advance(MAX_LAG);
+        let frame = app.render_to_frame().text();
+        assert!(
+            frame.contains("Auxiliary answer arriving in one chunk"),
+            "{frame}"
+        );
+        assert!(app.run_lua("smooth_stream:reset()"));
+        app.clock.advance(MAX_LAG);
+        assert!(!app.render_to_frame().text().contains("Auxiliary answer"));
+    }
+
+    #[test]
+    fn compaction_preview_reveals_and_reset_discards_pending_text() {
+        let mut app = TestApp::builder().build();
+        app.push_compaction_preview("Compaction summary arriving in one chunk");
+        assert!(!app
+            .render_to_frame()
+            .text()
+            .contains("Compaction summary arriving in one chunk"));
+        app.clock.advance(MAX_LAG);
+        assert!(app
+            .render_to_frame()
+            .text()
+            .contains("Compaction summary arriving in one chunk"));
+        app.push_compaction_preview("Replacement preview");
+        app.app.clear_compaction_preview();
+        app.clock.advance(MAX_LAG);
+        assert!(!app.render_to_frame().text().contains("Replacement preview"));
+    }
+
+    #[test]
+    fn tool_draft_source_is_frame_paced() {
+        let mut app = TestApp::builder().build();
+        app.start_turn(1);
+        app.feed_one(SourceEvent::engine(EngineEvent::ToolCallDraftStarted {
+            stream_id: "write".into(),
+            call_id: Some("write-call".into()),
+            tool_name: Some("write_file".into()),
+        }));
+        app.feed_one(SourceEvent::engine(EngineEvent::ToolCallDraftDelta {
+            stream_id: "write".into(),
+            call_id: Some("write-call".into()),
+            tool_name: Some("write_file".into()),
+            delta: r#"{"file_path":"/tmp/example.rs","content":"Generated source arriving in one chunk"}"#.into(),
+        }));
+        assert!(!app
+            .render_to_frame()
+            .text()
+            .contains("Generated source arriving in one chunk"));
+        app.clock.advance(MAX_LAG);
+        let frame = app.render_to_frame().text();
+        assert!(
+            frame.contains("Generated source arriving in one chunk"),
+            "{frame}"
+        );
+        app.feed_one(SourceEvent::engine(EngineEvent::ResponseDraftRejected));
+        app.clock.advance(MAX_LAG);
+        assert!(!app.render_to_frame().text().contains("Generated source"));
+        app.assert_invariants();
+    }
+
+    #[test]
+    fn structured_reasoning_summary_streams_before_part_finish() {
+        let mut app = TestApp::builder().build();
+        app.start_turn(1);
+        app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartDelta {
+            id: "summary".into(),
+            kind: protocol::ReasoningKind::Summary,
+            title: Some("Planning".into()),
+            delta: "**Planning**\nA structured summary before completion".into(),
+        }));
+        app.render_to_frame();
+        app.clock.advance(MAX_LAG);
+        let frame = app.render_to_frame().text();
+        assert!(
+            frame.contains("A structured summary before completion"),
+            "{frame}"
+        );
+        app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartFinished {
+            id: "summary".into(),
+            kind: protocol::ReasoningKind::Summary,
+            title: Some("Planning".into()),
+            content: "A structured summary before completion".into(),
+        }));
+        let frame = app.render_to_frame().text();
+        assert_eq!(
+            frame
+                .matches("A structured summary before completion")
+                .count(),
+            1,
+            "{frame}"
+        );
+        app.assert_invariants();
+    }
+
+    #[test]
+    fn auxiliary_finish_reset_and_gc_are_independent() {
+        let mut app = TestApp::builder().build();
+        app.run_lua_result(
+            r#"
+            first_buf = smelt.buf.new({ readonly = true })
+            second_buf = smelt.buf.new({ readonly = true })
+            first_stream = smelt.transcript.stream(first_buf)
+            second_stream = smelt.transcript.stream(second_buf)
+            first_stream:append("First pending answer")
+            second_stream:append("Second pending answer")
+            first_stream:finish("Reconciled answer")
+            second_stream:reset()
+        "#,
+        )
+        .expect("independent auxiliary streams");
+        app.clock.advance(MAX_LAG);
+        app.render_to_frame();
+        app.run_lua_result(
+            r#"
+            local first_text = table.concat(first_buf:lines(), "\n")
+            assert(first_text:find("Reconciled answer", 1, true), "actual buffer: " .. first_text)
+            assert(not table.concat(second_buf:lines(), "\n"):find("pending answer", 1, true))
+            second_stream:append("New answer after reset")
+            second_stream:finish()
+            local second_text = table.concat(second_buf:lines(), "\n")
+            assert(second_text:find("New answer after reset", 1, true), "actual buffer: " .. second_text)
+            first_stream = nil
+            second_stream = nil
+            collectgarbage("collect")
+        "#,
+        )
+        .expect("finish and release auxiliary streams");
+        app.render_to_frame();
+        assert!(app.app.plugin_streams.is_empty());
+    }
+
+    #[test]
+    fn closed_btw_dialog_discards_pending_text_and_ignores_tool_retry() {
+        let mut app = TestApp::builder().build();
+        app.apply_lua_command("btw short answer");
+        app.drive_lua_tasks();
+        let id = app.pending_ask_id().expect("side request");
+        app.drain_engine_sends();
+        app.feed_one(SourceEvent::engine(EngineEvent::EngineAskDelta {
+            id,
+            delta: "Pending side answer".into(),
+        }));
+        app.render_to_frame();
+        app.run_lua_result("smelt.dialog.current().close()")
+            .expect("close side dialog");
+        app.feed_one(SourceEvent::engine(EngineEvent::EngineAskResponse {
+            id,
+            message: Some(protocol::Message::assistant(
+                None,
+                None,
+                Some(vec![protocol::ToolCall::new(
+                    "denied".into(),
+                    protocol::FunctionCall {
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    },
+                )]),
+            )),
+            error: None,
+        }));
+        app.drive_lua_tasks();
+        app.clock.advance(MAX_LAG);
+        assert!(!app.render_to_frame().text().contains("Pending side answer"));
+        assert!(app.drain_engine_sends().is_empty());
+        app.assert_invariants();
+    }
+
+    #[test]
+    fn live_edit_and_notebook_drafts_render_received_content_only() {
+        for (name, arguments, marker) in [
+            (
+                "edit_file",
+                r#"{"file_path":"/tmp/example.rs","old_string":"old snippet","new_string":"new replacement snippet"}"#,
+                "new replacement snippet",
+            ),
+            (
+                "edit_file",
+                r#"{"file_path":"/tmp/example.rs","old_string":"old snippet","new_string":"partial replacement"#,
+                "partial replacement",
+            ),
+            (
+                "edit_notebook",
+                r#"{"notebook_path":"/tmp/example.ipynb","cell_type":"code","new_source":"generated notebook source"}"#,
+                "generated notebook source",
+            ),
+        ] {
+            let mut app = TestApp::builder().build();
+            app.start_turn(1);
+            app.feed_one(SourceEvent::engine(EngineEvent::ToolCallDraftStarted {
+                stream_id: name.into(),
+                call_id: Some(name.into()),
+                tool_name: Some(name.into()),
+            }));
+            app.feed_one(SourceEvent::engine(EngineEvent::ToolCallDraftDelta {
+                stream_id: name.into(),
+                call_id: Some(name.into()),
+                tool_name: Some(name.into()),
+                delta: arguments.into(),
+            }));
+            assert!(!app.render_to_frame().text().contains(marker));
+            app.clock.advance(MAX_LAG);
+            let frame = app.render_to_frame().text();
+            assert!(frame.contains(marker), "{name}: {frame}");
+            if marker == "partial replacement" {
+                assert!(
+                    !frame.contains("old snippet"),
+                    "unfinished source showed speculative deletions: {frame}"
+                );
+            }
+            app.assert_invariants();
+        }
+    }
+
+    #[test]
+    fn interleaved_tool_drafts_finish_independently_and_do_not_reappear() {
+        let mut app = TestApp::builder().build();
+        app.start_turn(1);
+        for id in ["first", "second"] {
+            app.feed_one(SourceEvent::engine(EngineEvent::ToolCallDraftStarted {
+                stream_id: id.into(),
+                call_id: Some(id.into()),
+                tool_name: Some("write_file".into()),
+            }));
+            app.feed_one(SourceEvent::engine(EngineEvent::ToolCallDraftDelta {
+                stream_id: id.into(),
+                call_id: Some(id.into()),
+                tool_name: Some("write_file".into()),
+                delta: format!(r#"{{"file_path":"/tmp/{id}","content":"{id} draft source"}}"#),
+            }));
+        }
+        app.render_to_frame();
+        app.feed_one(SourceEvent::engine(EngineEvent::ToolCallDraftFinished {
+            stream_id: "first".into(),
+            call_id: "first".into(),
+            tool_name: "write_file".into(),
+            arguments: r#"{"file_path":"/tmp/first","content":"final canonical source"}"#.into(),
+        }));
+        let frame = app.render_to_frame().text();
+        assert!(frame.contains("final canonical source"), "{frame}");
+        assert!(!frame.contains("second draft source"), "{frame}");
+        app.clock.advance(MAX_LAG);
+        let frame = app.render_to_frame().text();
+        assert!(frame.contains("second draft source"), "{frame}");
+        assert!(!frame.contains("first draft source"), "{frame}");
+        app.assert_invariants();
+    }
+
+    #[test]
+    fn tool_draft_frames_do_not_flush_or_split_an_interleaved_answer() {
+        let mut app = TestApp::builder().build();
+        app.start_turn(1);
+        app.feed_one(SourceEvent::engine(EngineEvent::ToolCallDraftStarted {
+            stream_id: "write".into(),
+            call_id: Some("write".into()),
+            tool_name: Some("write_file".into()),
+        }));
+        app.feed_one(SourceEvent::engine(EngineEvent::TextDelta {
+            delta: "Independent streaming answer".into(),
+        }));
+        app.feed_one(SourceEvent::engine(EngineEvent::ToolCallDraftDelta {
+            stream_id: "write".into(),
+            call_id: Some("write".into()),
+            tool_name: Some("write_file".into()),
+            delta: r#"{"file_path":"/tmp/example","content":"Independent generated source"}"#
+                .into(),
+        }));
+        assert!(!app
+            .render_to_frame()
+            .text()
+            .contains("Independent streaming answer"));
+        app.clock.advance(Duration::from_millis(32));
+        app.render_to_frame();
+        app.feed_one(SourceEvent::engine(EngineEvent::ToolCallDraftFinished {
+            stream_id: "write".into(),
+            call_id: "write".into(),
+            tool_name: "write_file".into(),
+            arguments: r#"{"file_path":"/tmp/example","content":"Independent generated source"}"#
+                .into(),
+        }));
+        assert!(!app
+            .render_to_frame()
+            .text()
+            .contains("Independent streaming answer"));
+        app.clock.advance(MAX_LAG);
+        app.render_to_frame();
+        let history = app.app.conversation.transcript().history();
+        let text_blocks = history
+            .order
+            .iter()
+            .filter_map(|id| {
+                if let Some(smelt_core::transcript_model::Block::Text { content }) =
+                    history.block(*id)
+                {
+                    Some(content.snapshot())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(text_blocks, ["Independent streaming answer"]);
+        app.assert_invariants();
+    }
+
+    #[test]
+    fn cancellation_preserves_unfinished_summary_titles() {
+        for source in ["**Interrupted title", "**Standalone bold text**"] {
+            let mut app = TestApp::builder().build();
+            app.start_turn(1);
+            app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartDelta {
+                id: "summary".into(),
+                kind: protocol::ReasoningKind::Summary,
+                title: None,
+                delta: source.into(),
+            }));
+            app.render_to_frame();
+            app.cancel();
+            let frame = app.render_to_frame().text();
+            assert!(frame.contains(source.trim_matches('*')), "{frame}");
+            assert!(!app.app.conversation.has_pending_stream_animation());
+            app.assert_invariants();
+        }
+    }
+
+    #[test]
+    fn summary_materialization_keeps_order_across_frames_and_completion() {
+        let mut app = TestApp::builder().build();
+        app.start_turn(1);
+        app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartDelta {
+            id: "first".into(),
+            kind: protocol::ReasoningKind::Summary,
+            title: None,
+            delta: "**Unfinished".into(),
+        }));
+        app.render_to_frame();
+        app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartDelta {
+            id: "second".into(),
+            kind: protocol::ReasoningKind::Summary,
+            title: None,
+            delta: "Second summary body".into(),
+        }));
+        app.clock.advance(MAX_LAG);
+        assert!(app.render_to_frame().text().contains("Second summary body"));
+        app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartFinished {
+            id: "second".into(),
+            kind: protocol::ReasoningKind::Summary,
+            title: None,
+            content: "Second summary body".into(),
+        }));
+        app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartDelta {
+            id: "first".into(),
+            kind: protocol::ReasoningKind::Summary,
+            title: Some("Unfinished title".into()),
+            delta: " title**\nFirst summary body".into(),
+        }));
+        app.clock.advance(MAX_LAG);
+        let frame = app.render_to_frame().text();
+        assert!(
+            frame.find("First summary body").unwrap() < frame.find("Second summary body").unwrap(),
+            "{frame}"
+        );
+        app.feed_one(SourceEvent::engine(EngineEvent::ResponseDraftRejected));
+        app.clock.advance(MAX_LAG);
+        let frame = app.render_to_frame().text();
+        assert!(!frame.contains("First summary body") && !frame.contains("Second summary body"));
+        app.assert_invariants();
+    }
+
+    #[test]
+    fn summary_order_starts_when_the_part_is_announced() {
+        let mut app = TestApp::builder().build();
+        app.start_turn(1);
+        app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartStarted {
+            id: "first".into(),
+            kind: protocol::ReasoningKind::Summary,
+        }));
+        for (id, body) in [
+            ("second", "Second summary body"),
+            ("first", "First summary body"),
+        ] {
+            app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartDelta {
+                id: id.into(),
+                kind: protocol::ReasoningKind::Summary,
+                title: None,
+                delta: body.into(),
+            }));
+            app.clock.advance(MAX_LAG);
+            assert!(app.render_to_frame().text().contains(body));
+        }
+        let frame = app.render_to_frame().text();
+        assert!(
+            frame.find("First summary body").unwrap() < frame.find("Second summary body").unwrap(),
+            "{frame}"
+        );
+        app.assert_invariants();
+    }
+
+    #[test]
+    fn summary_positions_preserve_interleaved_raw_reasoning() {
+        let mut app = TestApp::builder().build();
+        app.start_turn(1);
+        for (id, kind, body) in [
+            (
+                "first",
+                protocol::ReasoningKind::Summary,
+                "First summary body",
+            ),
+            ("raw", protocol::ReasoningKind::Raw, "Interleaved raw body"),
+            (
+                "second",
+                protocol::ReasoningKind::Summary,
+                "Second summary body",
+            ),
+        ] {
+            app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartDelta {
+                id: id.into(),
+                kind,
+                title: None,
+                delta: body.into(),
+            }));
+            app.clock.advance(MAX_LAG);
+            assert!(app.render_to_frame().text().contains(body));
+        }
+        let frame = app.render_to_frame().text();
+        let raw = frame.find("Interleaved raw body").unwrap();
+        assert!(
+            frame.find("First summary body").unwrap() < raw
+                && raw < frame.find("Second summary body").unwrap(),
+            "{frame}"
+        );
+        app.assert_invariants();
+    }
+
+    #[test]
+    fn overlapping_summary_parts_keep_arrival_order_before_titles_are_known() {
+        for _ in 0..10 {
+            let mut app = TestApp::builder().build();
+            app.start_turn(1);
+            for (id, title) in [("z-part", "First"), ("a-part", "Second")] {
+                app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartDelta {
+                    id: id.into(),
+                    kind: protocol::ReasoningKind::Summary,
+                    title: None,
+                    delta: format!("**{title}**\n{title} summary body"),
+                }));
+            }
+            app.render_to_frame();
+            app.clock.advance(MAX_LAG);
+            app.render_to_frame();
+            let history = app.app.conversation.transcript().history();
+            let bodies = history
+                .order
+                .iter()
+                .filter_map(|id| {
+                    if let Some(smelt_core::transcript_model::Block::Thinking { content, .. }) =
+                        history.block(*id)
+                    {
+                        Some(content.snapshot())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(bodies, ["First summary body", "Second summary body"]);
+            app.assert_invariants();
+        }
+    }
+
+    #[test]
+    fn queued_auxiliary_text_uses_receipt_time() {
+        let mut app = TestApp::builder().build();
+        app.run_lua_result(
+            r#"
+            arrival_buf = smelt.buf.new({ readonly = true })
+            arrival_stream = smelt.transcript.stream(arrival_buf)
+            smelt.engine.ask_inherited({
+                messages = {{ role = "user", content = "side question" }},
+                on_delta = function(delta) arrival_stream:append(delta) end,
+                on_response = function() end,
+            })
+        "#,
+        )
+        .expect("auxiliary callback");
+        let id = app.pending_ask_id().expect("auxiliary request");
+        app.app
+            .queue_engine_continuation(EngineEvent::EngineAskDelta {
+                id,
+                delta: "Already received auxiliary text".into(),
+            });
+        app.clock.advance(MAX_LAG);
+        app.render_to_frame();
+        app.run_lua_result(r#"assert(table.concat(arrival_buf:lines(), "\n"):find("Already received auxiliary text", 1, true))"#).expect("receipt-time reveal");
+    }
+
+    #[test]
+    fn completed_summary_parts_merge_without_duplicate_prefixes() {
+        let mut app = TestApp::builder().build();
+        app.start_turn(1);
+        for title in ["First", "Second"] {
+            app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartDelta {
+                id: title.into(),
+                kind: protocol::ReasoningKind::Summary,
+                title: Some(title.into()),
+                delta: format!("**{title}**\n{title} summary body"),
+            }));
+            app.render_to_frame();
+            app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartFinished {
+                id: title.into(),
+                kind: protocol::ReasoningKind::Summary,
+                title: Some(title.into()),
+                content: format!("{title} summary body"),
+            }));
+        }
+        app.clock.advance(MAX_LAG);
+        app.render_to_frame();
+        let history = app.app.conversation.transcript().history();
+        assert_eq!(history.order.len(), 1);
+        let Some(smelt_core::transcript_model::Block::Thinking {
+            summary_titles,
+            content,
+            ..
+        }) = history.block(history.order[0])
+        else {
+            panic!("summary block");
+        };
+        assert_eq!(summary_titles, &["First", "Second"]);
+        assert_eq!(
+            content.snapshot(),
+            "First summary body\nSecond summary body"
+        );
+        app.assert_invariants();
+    }
+
+    #[test]
+    fn summary_ids_can_be_reused_after_response_acceptance() {
+        let mut app = TestApp::builder().build();
+        app.start_turn(1);
+        for body in ["First response summary", "Second response summary"] {
+            app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartDelta {
+                id: "reused-summary-id".into(),
+                kind: protocol::ReasoningKind::Summary,
+                title: None,
+                delta: body.into(),
+            }));
+            app.clock.advance(MAX_LAG);
+            let frame = app.render_to_frame().text();
+            assert!(frame.contains(body), "{frame}");
+            app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartFinished {
+                id: "reused-summary-id".into(),
+                kind: protocol::ReasoningKind::Summary,
+                title: None,
+                content: body.into(),
+            }));
+            app.feed_one(SourceEvent::engine(EngineEvent::ResponseDraftAccepted));
+        }
+        app.assert_invariants();
+    }
+
+    #[test]
+    fn late_summary_finish_reconciles_without_flushing_answer() {
+        let mut app = TestApp::builder().build();
+        app.start_turn(1);
+        app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartDelta {
+            id: "summary".into(),
+            kind: protocol::ReasoningKind::Summary,
+            title: Some("Plan".into()),
+            delta: "**Plan**\nProvisional summary body".into(),
+        }));
+        app.feed_one(SourceEvent::engine(EngineEvent::TextDelta {
+            delta: "Answer remains frame paced".into(),
+        }));
+        app.render_to_frame();
+        app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartFinished {
+            id: "summary".into(),
+            kind: protocol::ReasoningKind::Summary,
+            title: Some("Final plan".into()),
+            content: "Final summary body".into(),
+        }));
+        let frame = app.render_to_frame().text();
+        assert!(frame.contains("Final summary body"), "{frame}");
+        assert!(!frame.contains("Provisional summary body"), "{frame}");
+        assert!(!frame.contains("Answer remains frame paced"), "{frame}");
+        app.clock.advance(MAX_LAG);
+        assert!(app
+            .render_to_frame()
+            .text()
+            .contains("Answer remains frame paced"));
+        app.assert_invariants();
+    }
+
+    #[test]
+    fn rejected_summary_does_not_return_and_cancellation_drains_received_body() {
+        for reject in [true, false] {
+            let mut app = TestApp::builder().build();
+            app.start_turn(1);
+            app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartDelta {
+                id: "summary".into(),
+                kind: protocol::ReasoningKind::Summary,
+                title: Some("Plan".into()),
+                delta: "**Plan**\nReceived summary body".into(),
+            }));
+            app.render_to_frame();
+            if reject {
+                app.feed_one(SourceEvent::engine(EngineEvent::ResponseDraftRejected));
+            } else {
+                app.cancel();
+            }
+            app.clock.advance(MAX_LAG);
+            assert_eq!(
+                app.render_to_frame()
+                    .text()
+                    .contains("Received summary body"),
+                !reject
+            );
+            assert!(!app.app.conversation.has_pending_stream_animation());
             app.assert_invariants();
         }
     }

@@ -961,7 +961,7 @@
 --- Transcript-shaped streaming renderer for plugin-owned buffers. Append model text deltas and it renders through the same incremental markdown block pipeline as the main transcript.
 --- Classification: Supported - Primary alpha facade for user config and plugins.
 ---@class smelt.transcript.Stream
----@field append fun(delta: string): nil Append one assistant text delta and re-render the target buffer.
+---@field append fun(delta: string): nil Queue one received assistant text delta for grapheme-safe, frame-paced display. Callback delivery is immediate; finish drains pending text and reset discards it.
 ---@field finish fun(final_text: string?): nil Finalize the streaming block. If `final_text` is provided and differs from the streamed text, the final text is rendered instead.
 ---@field reset fun(): nil Clear the stream and the target buffer.
 ---@field width fun(width: integer?): integer? Read or set the render width in terminal cells.

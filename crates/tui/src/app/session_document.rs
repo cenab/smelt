@@ -914,6 +914,10 @@ pub(crate) enum TranscriptMutation {
     AppendBlock {
         block: Block,
     },
+    InsertBlockBefore {
+        before: BlockId,
+        block: Block,
+    },
     AppendAccepted {
         block: Block,
     },
@@ -1742,8 +1746,16 @@ impl SessionDocument {
         let applied = match mutation {
             TranscriptMutation::AppendBlock { block } => {
                 transcript.push(block);
-                transcript.history().record_dirty_generation() != before_generation
-                    || transcript.history().record_dirty_from() != before_dirty_from
+                let applied = transcript.history().record_dirty_generation() != before_generation
+                    || transcript.history().record_dirty_from() != before_dirty_from;
+                if applied {
+                    block_id = transcript.history().last_block_id();
+                }
+                applied
+            }
+            TranscriptMutation::InsertBlockBefore { before, block } => {
+                block_id = transcript.insert_before(before, block);
+                block_id.is_some()
             }
             TranscriptMutation::AppendAccepted { block } => {
                 transcript

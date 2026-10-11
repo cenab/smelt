@@ -5011,6 +5011,8 @@ mod checkpoint_tests {
         let mut app = crate::app::test_harness::TestApp::builder().build();
 
         app.app.update_compaction_preview("one".into());
+        app.clock.advance(std::time::Duration::from_millis(250));
+        app.render_to_frame();
         let id = app
             .app
             .conversation
@@ -5023,6 +5025,8 @@ mod checkpoint_tests {
         ));
 
         app.app.update_compaction_preview("one\ntwo".into());
+        app.clock.advance(std::time::Duration::from_millis(250));
+        app.render_to_frame();
         assert_eq!(
             app.app.conversation.transcript().compaction_preview_id(),
             Some(id)

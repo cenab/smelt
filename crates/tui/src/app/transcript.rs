@@ -172,6 +172,40 @@ pub(crate) struct ReasoningSummarySnapshot {
     pub(crate) content: TranscriptContent,
 }
 
+pub(super) fn reasoning_summary_block(
+    previous: Option<&ReasoningSummarySnapshot>,
+    title: Option<String>,
+    body: &str,
+) -> Block {
+    let title = title
+        .map(|title| smelt_buffer::text::trim_whitespace(&title).to_string())
+        .filter(|title| !title.is_empty());
+    let body = smelt_buffer::text::trim_whitespace(body);
+    let mut content = previous
+        .map(|previous| previous.content.clone())
+        .unwrap_or_default();
+    let mut summary_titles = previous
+        .map(|previous| previous.summary_titles.clone())
+        .unwrap_or_default();
+    if let Some(title) = &title {
+        if summary_titles.last() != Some(title) {
+            summary_titles.push(title.clone());
+        }
+    }
+    if !body.is_empty() {
+        if !content.is_empty() {
+            content.push_owned("\n".into());
+        }
+        content.push_owned(body.to_string());
+    }
+    Block::Thinking {
+        title: title.or_else(|| previous.and_then(|previous| previous.title.clone())),
+        summary_titles,
+        content,
+        kind: protocol::ReasoningKind::Summary,
+    }
+}
+
 static NEXT_TRANSCRIPT_HYDRATION_CONTEXT_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
@@ -6525,6 +6559,12 @@ impl TranscriptDocument {
     pub(crate) fn push(&mut self, block: Block) {
         self.content.transcript.push(block);
         self.clear_transcript_layout_caches();
+    }
+
+    pub(crate) fn insert_before(&mut self, before: BlockId, block: Block) -> Option<BlockId> {
+        let id = self.content.transcript.insert_before(before, block)?;
+        self.clear_transcript_layout_caches();
+        Some(id)
     }
 
     pub(crate) fn push_with_origin(

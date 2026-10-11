@@ -3796,7 +3796,7 @@ fn btw_dialog_paints_a_selected_delta_before_a_coalesced_final_response() {
 
     let streamed_frame = streamed_frame.expect("final response should paint the pending delta");
     assert!(
-        streamed_frame.contains("coalesced live dialog marker"),
+        streamed_frame.lines().any(|line| line.trim() == "c"),
         "no frame painted the selected delta: {streamed_frame}"
     );
     assert!(
@@ -3810,7 +3810,7 @@ fn btw_dialog_paints_a_selected_delta_before_a_coalesced_final_response() {
         .rows
         .iter()
         .position(|row| row.contains(text))
-        .unwrap();
+        .unwrap_or_else(|| panic!("final frame: {}", final_frame.text()));
     let col = final_frame.rows[row].find(text).unwrap();
     assert!(
         final_frame.styles[row][col..col + text.len()]
@@ -3837,6 +3837,7 @@ fn btw_dialog_resets_rejected_draft_and_recovers_without_waiting_styles() {
         id,
         delta: "rejected side answer".into(),
     }));
+    app.clock.advance(std::time::Duration::from_millis(250));
     assert!(app
         .render_to_frame()
         .text()
@@ -3914,6 +3915,7 @@ fn btw_dialog_streams_before_a_busy_engine_queue_reaches_the_final_response() {
     .expect("queue /btw response");
 
     app.drain_ready_engine_outputs_for_frame_to(&mut std::io::sink(), |_| {});
+    app.clock.advance(std::time::Duration::from_millis(250));
     let frame = app.render_to_frame().text();
     assert!(frame.contains("live dialog marker"), "frame: {frame}");
     assert!(!frame.contains("final answer"), "frame: {frame}");

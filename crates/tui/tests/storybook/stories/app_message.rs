@@ -412,6 +412,7 @@ app_story!(compaction_preview_streaming_summary, |ctx| {
         "- Kept the final checkpoint marker separate.\n\n",
         "# Next steps\nUpdate stories and run focused tests."
     ));
+    ctx.advance_time(250);
     ctx.assert_snapshot();
 });
 

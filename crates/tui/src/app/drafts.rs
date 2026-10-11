@@ -24,6 +24,7 @@ impl TuiApp {
         call_id: Option<String>,
         tool_name: Option<String>,
         delta: String,
+        arrived_at: std::time::Instant,
     ) {
         let bytes = delta.len();
         self.core.signals.emit_dyn(
@@ -38,11 +39,14 @@ impl TuiApp {
         );
         if let Some((block_id, presentation_changed)) = self
             .conversation
-            .append_tool_draft(stream_id, call_id, tool_name, delta)
+            .append_tool_draft(stream_id, call_id, tool_name, delta, arrived_at)
         {
             if presentation_changed {
                 self.transcript_work.request_tool_draft_summary(block_id);
             }
+        }
+        if self.conversation.has_pending_tool_draft_animation() {
+            self.request_continuation_render();
         }
     }
 

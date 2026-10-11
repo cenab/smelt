@@ -181,14 +181,14 @@ impl StreamParser {
         call_id: Option<String>,
         name: Option<String>,
     ) -> ToolDraftChange {
-        self.flush_streaming_thinking(history);
-        self.flush_streaming_text(history);
         if let Some(block_id) = self.tool_drafts.get(&stream_id).copied() {
             return ToolDraftChange {
                 block_id,
                 presentation_changed: false,
             };
         }
+        self.flush_streaming_thinking(history);
+        self.flush_streaming_text(history);
         let name = name
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "tool".into());

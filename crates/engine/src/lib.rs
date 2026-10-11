@@ -17,6 +17,7 @@ pub(crate) mod skills;
 pub mod tools;
 pub(crate) mod trim;
 
+pub use agent::{normalize_reasoning_summary, ReasoningSummaryPhase};
 pub use host::{HostCall, HostRequestDecision, PreparedRequestMessages};
 use protocol::{EngineEvent, UiCommand};
 use std::path::PathBuf;

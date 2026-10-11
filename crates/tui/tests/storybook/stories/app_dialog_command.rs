@@ -311,6 +311,7 @@ app_story!(btw_dialog_streaming_answer, |ctx| {
         id: ask_id,
         delta: "` and a block:\n\n```rust\nfn main() {\n".into(),
     });
+    ctx.advance_time(250);
     ctx.assert_snapshot();
 
     let final_text =
@@ -349,6 +350,7 @@ app_story!(btw_dialog_streams_table_in_tiny_deltas, |ctx| {
         assert!(!rows.iter().any(|row| row.trim() == "|"), "frame: {frame}");
     }
 
+    ctx.advance_time(250);
     let frame = ctx.frame_text();
     assert!(frame.contains("A") && frame.contains("B"), "frame: {frame}");
     assert!(frame.contains("1") && frame.contains("2"), "frame: {frame}");

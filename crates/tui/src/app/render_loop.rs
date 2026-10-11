@@ -1007,10 +1007,37 @@ impl TuiApp {
             .begin_frame(self.core.clock.instant_now());
         let _perf = smelt_perf::perf::begin("app:tick_compositor");
         self.apply_pending_transcript_work();
+        let streams = self
+            .plugin_streams
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .collect::<Vec<_>>();
+        self.plugin_streams
+            .retain(|stream| stream.strong_count() > 0);
+        let now = self.core.clock.instant_now();
+        let pending = crate::lua::scope_app(self, || {
+            let mut pending = false;
+            for stream in streams {
+                pending |= stream.borrow_mut().advance(now);
+            }
+            pending
+        });
+        if pending {
+            self.request_continuation_render();
+        }
         if self
             .conversation
             .advance_stream_animation(self.core.clock.instant_now())
         {
+            self.request_continuation_render();
+        }
+        if self.conversation.advance_compaction_animation(now) {
+            self.request_continuation_render();
+        }
+        for block_id in self.conversation.advance_tool_draft_animations(now) {
+            self.transcript_work.request_tool_draft_summary(block_id);
+        }
+        if self.conversation.has_pending_tool_draft_animation() {
             self.request_continuation_render();
         }
         self.refresh_pending_tool_draft_summaries();

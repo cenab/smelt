@@ -3323,20 +3323,47 @@ fn leading_bold_title(source: &str) -> Option<(&str, &str)> {
     let after_open = smelt_buffer::text::trim_start_whitespace(source).strip_prefix("**")?;
     let close = after_open.find("**")?;
     let title = smelt_buffer::text::trim_whitespace(&after_open[..close]);
-    (!title.is_empty()).then_some((title, &after_open[close + 2..]))
+    Some((title, &after_open[close + 2..]))
 }
 
 fn streaming_summary_title(source: &str) -> Option<String> {
-    leading_bold_title(source).map(|(title, _)| title.to_string())
+    leading_bold_title(source)
+        .filter(|(title, _)| !title.is_empty())
+        .map(|(title, _)| title.to_string())
+}
+
+/// Whether an incomplete summary heading may still receive more text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningSummaryPhase {
+    Streaming,
+    Finished,
 }
 
 fn normalize_reasoning_part(kind: ReasoningKind, source: &str) -> (Option<String>, String) {
-    let source = smelt_buffer::text::trim_whitespace(source);
     if kind == ReasoningKind::Raw {
-        return (None, source.to_string());
+        return (
+            None,
+            smelt_buffer::text::trim_whitespace(source).to_string(),
+        );
     }
+    normalize_reasoning_summary(source, ReasoningSummaryPhase::Finished)
+}
 
-    let Some((title, after_title)) = leading_bold_title(source) else {
+/// Separate summary headings from their body without flashing unfinished headings.
+pub fn normalize_reasoning_summary(
+    source: &str,
+    phase: ReasoningSummaryPhase,
+) -> (Option<String>, String) {
+    let source = smelt_buffer::text::trim_whitespace(source);
+    let heading = leading_bold_title(source);
+    if phase == ReasoningSummaryPhase::Streaming
+        && (source == "*"
+            || (source.starts_with("**")
+                && heading.is_none_or(|(_, suffix)| suffix.trim().is_empty())))
+    {
+        return (None, String::new());
+    }
+    let Some((title, after_title)) = heading.filter(|(title, _)| !title.is_empty()) else {
         return (None, source.to_string());
     };
     if after_title.trim().is_empty() || !after_title.starts_with(char::is_whitespace) {
@@ -3647,6 +3674,36 @@ mod tests {
             ),
             (Some("Checking tests".into()), "All tests passed.".into(),)
         );
+    }
+
+    #[test]
+    fn summary_prefix_normalization_distinguishes_streaming_and_finished_text() {
+        for source in [
+            "*",
+            "**Unfinished title",
+            "**Standalone bold text**",
+            "****",
+        ] {
+            assert_eq!(
+                normalize_reasoning_summary(source, ReasoningSummaryPhase::Streaming),
+                (None, String::new()),
+            );
+            assert_eq!(
+                normalize_reasoning_summary(source, ReasoningSummaryPhase::Finished),
+                (None, source.into()),
+            );
+        }
+        for source in [
+            "**Plan**\nBody",
+            "**Plan**<!-- -->",
+            "**** body",
+            "Plain body",
+        ] {
+            assert_eq!(
+                normalize_reasoning_summary(source, ReasoningSummaryPhase::Streaming),
+                normalize_reasoning_part(ReasoningKind::Summary, source),
+            );
+        }
     }
 
     #[test]
