@@ -90,7 +90,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-fn consume_http_request(stream: &mut TcpStream) {
+fn read_http_request(stream: &mut TcpStream) -> serde_json::Value {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set request read timeout");
@@ -109,10 +109,18 @@ fn consume_http_request(stream: &mut TcpStream) {
             }
         }
     }
-    let content_length = content_length.expect("POST request has content length");
-    let consumed = std::io::copy(&mut reader.take(content_length), &mut std::io::sink())
-        .expect("consume request body");
-    assert_eq!(consumed, content_length, "truncated request body");
+    let content_length = content_length.unwrap_or(0);
+    let mut body = Vec::new();
+    let consumed = reader
+        .take(content_length)
+        .read_to_end(&mut body)
+        .expect("read request body");
+    assert_eq!(consumed as u64, content_length, "truncated request body");
+    if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&body).expect("JSON request body")
+    }
 }
 
 fn drain_provider_requests(listener: &TcpListener) -> bool {
@@ -137,6 +145,161 @@ fn drain_provider_requests(listener: &TcpListener) -> bool {
         let _ = stream.write_all(response.as_bytes());
     }
     model_request_seen
+}
+
+#[test]
+fn queued_turn_preserves_previous_assistant_answer() {
+    for ephemeral in [false, true] {
+        check_queued_answer(false, ephemeral);
+    }
+}
+
+#[test]
+fn promoted_queued_turn_preserves_previous_assistant_answer() {
+    for ephemeral in [false, true] {
+        check_queued_answer(true, ephemeral);
+    }
+}
+
+fn check_queued_answer(promote: bool, ephemeral: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let provider = TcpListener::bind("127.0.0.1:0").unwrap();
+    provider.set_nonblocking(true).unwrap();
+    let config = root.path().join("init.lua");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+smelt.settings.autoupgrade = "off"
+smelt.settings.auto_continue = "off"
+smelt.settings.auto_reload = false
+smelt.settings.show_prediction = false
+smelt.settings.vim = false
+smelt.provider.register("local", {{
+  type = "openai-compatible", api_base = "http://{}", models = {{ "test-model" }},
+}})
+smelt.lifecycle.on_ready(function() smelt.model.set("local/test-model") end)
+smelt.keymap.set("", "<F4>", function()
+  smelt.engine.ask({{ system = "test barrier", question = "QUEUE_BARRIER", on_delta = function() end }})
+end)
+"#,
+            provider.local_addr().unwrap()
+        ),
+    )
+    .unwrap();
+    let mut command = isolated_smelt_command(root.path());
+    command
+        .args(["--config", config.to_str().unwrap()])
+        .env("TERM", "xterm-256color")
+        .env("NO_COLOR", "1");
+    if ephemeral {
+        command.arg("--ephemeral");
+    }
+    let (mut master, mut process) = spawn_in_pty(command);
+    let mut captured = Vec::new();
+    let mut terminal = vt100::Parser::new(24, 100, 0);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut submitted = false;
+    let mut queued = false;
+    let mut first_stream = None;
+    let mut main_requests = Vec::new();
+    let mut barriers = 0;
+    let finish = stream_event(serde_json::json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    })) + "data: [DONE]\n\n";
+    loop {
+        while let Ok((mut stream, _)) = provider.accept() {
+            let body = read_http_request(&mut stream);
+            let main = body["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty());
+            let barrier = body["messages"].to_string().contains("QUEUE_BARRIER");
+            let content = if main {
+                main_requests.push(body);
+                match main_requests.len() {
+                    1 => "FIRST_ANSWER",
+                    2 => "SECOND_ANSWER",
+                    _ => panic!("unexpected third turn"),
+                }
+            } else {
+                "test session"
+            };
+            let chunk = stream_event(serde_json::json!({
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": content}}],
+            }));
+            write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{chunk}\r\n", chunk.len()).unwrap();
+            if main && main_requests.len() == 1 {
+                first_stream = Some(stream);
+            } else {
+                write!(stream, "{:x}\r\n{finish}\r\n0\r\n\r\n", finish.len()).unwrap();
+            }
+            if barrier {
+                barriers += 1;
+                // This auxiliary request is dispatched after the queued input on the engine channel.
+                if let Some(mut stream) = first_stream.take() {
+                    write!(stream, "{:x}\r\n{finish}\r\n0\r\n\r\n", finish.len()).unwrap();
+                }
+            }
+        }
+        let previous_len = captured.len();
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[previous_len..]);
+        assert!(process.child.try_wait().unwrap().is_none(), "smelt exited");
+        let screen = terminal.screen().contents();
+        if !submitted && screen.contains("local/test-model") {
+            master.write_all(b"first request\r").unwrap();
+            submitted = true;
+        }
+        if !queued && screen.contains("FIRST_ANSWER") {
+            master.write_all(b"second request\r").unwrap();
+            if promote {
+                master.write_all(b"\r").unwrap();
+            }
+            master.write_all(b"\x1bOS").unwrap();
+            queued = true;
+        }
+        if screen.contains("SECOND_ANSWER") {
+            assert!(queued);
+            assert_eq!(barriers, 1);
+            assert_eq!(main_requests.len(), 2);
+            let expected = vec![
+                ("user", "first request"),
+                ("assistant", "FIRST_ANSWER"),
+                ("user", "second request"),
+            ];
+            let mut previous_position = None;
+            for text in expected
+                .iter()
+                .map(|(_, text)| *text)
+                .chain(["SECOND_ANSWER"])
+            {
+                let position = screen
+                    .find(text)
+                    .unwrap_or_else(|| panic!("missing {text}:\n{screen}"));
+                assert!(
+                    previous_position.is_none_or(|previous| previous < position),
+                    "{screen}"
+                );
+                previous_position = Some(position);
+            }
+            let conversation: Vec<_> = main_requests[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .skip_while(|message| message["content"] != "first request")
+                .map(|message| {
+                    (
+                        message["role"].as_str().unwrap(),
+                        message["content"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(conversation, expected);
+            break;
+        }
+        assert!(Instant::now() < deadline, "queued turn stalled:\n{screen}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -1156,7 +1319,7 @@ smelt.provider.register("local", {{
         drain_pty(&mut master, &mut captured);
         assert!(process.child.try_wait().unwrap().is_none(), "smelt exited");
         while let Ok((mut stream, _)) = stream_provider.accept() {
-            consume_http_request(&mut stream);
+            read_http_request(&mut stream);
             let chunk =
                 "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Starting\"}}]}\n\n";
             write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{chunk}\r\n", chunk.len()).unwrap();

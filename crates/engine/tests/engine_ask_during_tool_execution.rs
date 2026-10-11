@@ -125,6 +125,245 @@ async fn write_sse_response(sock: &mut tokio::net::TcpStream, body: &str) {
     sock.flush().await.unwrap();
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ResponseSteeringCase {
+    HookOnly,
+    ProviderAndHook,
+    Withdrawn,
+    DroppedReply,
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn response_callback_steering_commits_answer_before_follow_ups() {
+    for case in [
+        ResponseSteeringCase::HookOnly,
+        ResponseSteeringCase::ProviderAndHook,
+        ResponseSteeringCase::Withdrawn,
+        ResponseSteeringCase::DroppedReply,
+    ] {
+        tokio::time::timeout(TEST_DEADLINE, check_response_callback_steering(case))
+            .await
+            .unwrap_or_else(|_| panic!("response steering stalled: {case:?}"));
+    }
+}
+
+async fn check_response_callback_steering(case: ResponseSteeringCase) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let _ = read_json_request(&mut first).await;
+        let body = aux_text_sse();
+        let split = body.find("data: {\"type\":\"message_delta\"").unwrap();
+        first.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+        let prefix = &body[..split];
+        first
+            .write_all(format!("{:X}\r\n{prefix}\r\n", prefix.len()).as_bytes())
+            .await
+            .unwrap();
+        let (mut barrier, _) = listener.accept().await.unwrap();
+        let _ = read_json_request(&mut barrier).await;
+        write_sse_response(&mut barrier, &aux_text_sse()).await;
+        release_rx.await.unwrap();
+        let suffix = &body[split..];
+        first
+            .write_all(format!("{:X}\r\n{suffix}\r\n0\r\n\r\n", suffix.len()).as_bytes())
+            .await
+            .unwrap();
+        let (mut barrier, _) = listener.accept().await.unwrap();
+        let _ = read_json_request(&mut barrier).await;
+        write_sse_response(&mut barrier, &aux_text_sse()).await;
+        if case == ResponseSteeringCase::Withdrawn {
+            return None;
+        }
+        let (mut next, _) = listener.accept().await.unwrap();
+        let request = read_json_request(&mut next).await;
+        write_sse_response(
+            &mut next,
+            &aux_text_sse().replace("sub-answer", "final-answer"),
+        )
+        .await;
+        Some(request)
+    });
+    let config = EngineConfig {
+        system_prompt_override: Some("test system".into()),
+        ..EngineConfig::new(PathBuf::from("/tmp"), Arc::new(engine::clock::RealClock))
+    };
+    let target = ModelTarget {
+        model: "test-model".into(),
+        api_base: format!("http://{addr}"),
+        api_key: "test-key".into(),
+        provider_type: "anthropic-compatible".into(),
+        config: ModelConfig::default(),
+    };
+    let runtime = RequestRuntimeConfig {
+        request_audit: protocol::RequestAuditMode::Off,
+        ..Default::default()
+    };
+    let barrier = |id| UiCommand::EngineAsk {
+        id,
+        system: "command barrier".into(),
+        messages: vec![Message::user(Content::text("ack"))],
+        target: Box::new(target.clone()),
+        request_config: runtime,
+        response_format: None,
+        reasoning_effort: ReasoningEffort::Off,
+        fast_mode: false,
+        tools: Vec::new(),
+        session_id: "sess".into(),
+        persistence: protocol::PersistenceScope::default(),
+        stream: false,
+        visible_retries: false,
+    };
+    let mut handle = engine::start(config, Box::new(engine::tools::EmptyDispatcher));
+    while !matches!(handle.recv().await, Some(EngineEvent::Ready)) {}
+    handle.send(UiCommand::StartTurn(Box::new(StartTurnPayload {
+        turn_id: 1,
+        input: protocol::StartTurnInput::user(Content::text("initial request")),
+        mode: AgentMode::normal(),
+        model_target: target.clone(),
+        request_config: runtime,
+        reasoning_effort: ReasoningEffort::Off,
+        fast_mode: false,
+        history: protocol::ModelHistorySource::items(Vec::new()),
+        session_id: "sess".into(),
+        sessions_root: PathBuf::from("/tmp"),
+        persistence: protocol::PersistenceScope::default(),
+        permission_overrides: None,
+        system_prompt: Some("test system".into()),
+        tools: Vec::new(),
+    })));
+    let mut release = Some(release_tx);
+    let mut reply = None;
+    let mut first_delta = true;
+    let mut callbacks = 0;
+    let mut history = vec![protocol::HistoryItem::user(Content::text(
+        "initial request",
+    ))];
+    loop {
+        match handle.recv_output().await {
+            Some(engine::EngineOutput::HostCall(engine::HostCall::PrepareRequest {
+                reply,
+                ..
+            })) => {
+                reply.send(engine::HostRequestDecision::Continue).unwrap();
+            }
+            Some(engine::EngineOutput::HostCall(engine::HostCall::ProviderResponse {
+                reply: response,
+                ..
+            })) => {
+                callbacks += 1;
+                if callbacks == 1 {
+                    handle.send(UiCommand::Steer {
+                        input: protocol::StartTurnInput::user(Content::text("hook follow-up")),
+                    });
+                    if case == ResponseSteeringCase::Withdrawn {
+                        handle.send(UiCommand::Unsteer { count: 1 });
+                    }
+                    handle.send(barrier(2));
+                    reply = Some(response);
+                } else {
+                    response.send(None).unwrap();
+                }
+            }
+            Some(engine::EngineOutput::Event(event)) => match event {
+                EngineEvent::TextDelta { .. } if first_delta => {
+                    first_delta = false;
+                    if case == ResponseSteeringCase::ProviderAndHook {
+                        handle.send(UiCommand::Steer {
+                            input: protocol::StartTurnInput::user(Content::text(
+                                "provider follow-up",
+                            )),
+                        });
+                    }
+                    handle.send(barrier(1));
+                }
+                EngineEvent::EngineAskResponse { id: 1, .. } => {
+                    release.take().unwrap().send(()).unwrap();
+                }
+                EngineEvent::EngineAskResponse { id: 2, .. } => {
+                    let response = reply.take().unwrap();
+                    if case != ResponseSteeringCase::DroppedReply {
+                        response.send(None).unwrap();
+                    }
+                }
+                EngineEvent::HistoryAppended { delta, .. } | EngineEvent::Steered { delta, .. } => {
+                    assert_eq!(delta.first_index.get(), history.len(), "{case:?}");
+                    history.extend(delta.items);
+                }
+                EngineEvent::HistoryUpdated { update, .. } => {
+                    history.truncate(update.first_index.get());
+                    history.extend(update.items);
+                }
+                EngineEvent::ResponseDraftRejected => panic!("valid answer was rejected: {case:?}"),
+                EngineEvent::TurnError { message, .. } => panic!("{message}"),
+                EngineEvent::TurnComplete {
+                    history: update, ..
+                } => {
+                    if let Some(update) = update {
+                        history.truncate(update.first_index.get());
+                        history.extend(update.items);
+                    }
+                    break;
+                }
+                _ => {}
+            },
+            _ => panic!("unexpected engine output"),
+        }
+    }
+    let mut expected = vec![
+        (protocol::Role::User, "initial request"),
+        (protocol::Role::Assistant, "sub-answer"),
+    ];
+    if case == ResponseSteeringCase::ProviderAndHook {
+        expected.push((protocol::Role::User, "provider follow-up"));
+    }
+    if case != ResponseSteeringCase::Withdrawn {
+        expected.extend([
+            (protocol::Role::User, "hook follow-up"),
+            (protocol::Role::Assistant, "final-answer"),
+        ]);
+    }
+    let actual: Vec<_> = protocol::history_to_messages(&history)
+        .iter()
+        .map(|message| {
+            (
+                message.role,
+                message
+                    .content
+                    .as_ref()
+                    .unwrap()
+                    .text_content()
+                    .into_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        expected
+            .iter()
+            .map(|(role, text)| (*role, text.to_string()))
+            .collect::<Vec<_>>(),
+        "{case:?}"
+    );
+    let next = server.await.unwrap();
+    if let Some(next) = next {
+        let messages = next["messages"].to_string();
+        let mut previous = None;
+        for (_, text) in &expected[..expected.len() - 1] {
+            let position = messages
+                .find(text)
+                .unwrap_or_else(|| panic!("missing {text}: {messages}"));
+            assert!(
+                previous.is_none_or(|previous| previous < position),
+                "{messages}"
+            );
+            previous = Some(position);
+        }
+    }
+}
+
 /// Accepts connections in a loop. Request #0 is the main turn (returns
 /// a tool_use); every subsequent request is treated as an EngineAsk and
 /// gets a plain text response.

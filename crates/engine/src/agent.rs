@@ -1203,9 +1203,9 @@ impl<'a> Turn<'a> {
     }
 
     /// Run `smelt.provider.middleware{on_response=...}` hooks against
-    /// the assembled assistant `Message`. Returns the replacement when
-    /// any hook produced one; otherwise the original.
-    async fn apply_response_hooks(&mut self, message: Message) -> Message {
+    /// the assembled assistant `Message`. Steering stays deferred until the
+    /// caller commits the response, just like input received during the provider call.
+    async fn apply_response_hooks(&mut self, message: Message) -> (Message, Vec<UiCommand>) {
         match self
             .host_call(|turn_id, reply| crate::host::HostCall::ProviderResponse {
                 turn_id,
@@ -1215,14 +1215,10 @@ impl<'a> Turn<'a> {
             .await
         {
             HostCallResult::Replied(replacement, deferred) => {
-                self.apply_deferred_turn_cmds(deferred);
-                replacement.unwrap_or(message)
+                (replacement.unwrap_or(message), deferred)
             }
-            HostCallResult::Dropped(deferred) => {
-                self.apply_deferred_turn_cmds(deferred);
-                message
-            }
-            HostCallResult::Cancelled => message,
+            HostCallResult::Dropped(deferred) => (message, deferred),
+            HostCallResult::Cancelled => (message, Vec::new()),
         }
     }
 
@@ -2000,25 +1996,18 @@ impl<'a> Turn<'a> {
             let reasoning_parts = resp.reasoning_parts;
             let reasoning_details = resp.reasoning_details;
 
-            let had_injected = provider_turn_cmds
-                .iter()
-                .any(|cmd| matches!(cmd, UiCommand::Steer { .. }));
-            if tool_calls.is_empty() {
-                self.apply_deferred_turn_cmds(std::mem::take(&mut provider_turn_cmds));
-                // An injected message arrived during the LLM call. Discard this
-                // response and loop so the model can respond to the new input.
-                if had_injected {
-                    self.emit(EngineEvent::ResponseDraftRejected);
-                    continue;
-                }
-            }
             if tool_calls.is_empty()
                 && !output_limited
                 && content.as_ref().is_none_or(|content| {
                     smelt_buffer::text::trim_whitespace(content.as_text()).is_empty()
                 })
             {
+                let history_len = self.public_history_len();
+                self.apply_deferred_turn_cmds(std::mem::take(&mut provider_turn_cmds));
                 self.emit(EngineEvent::ResponseDraftRejected);
+                if self.public_history_len() > history_len {
+                    continue;
+                }
                 if unusable_retries < MAX_UNUSABLE_RETRIES {
                     unusable_retries += 1;
                     log::entry(
@@ -2078,16 +2067,18 @@ impl<'a> Turn<'a> {
                 }
             }
             self.emit(EngineEvent::ResponseDraftAccepted);
+            let terminal_response = tool_calls.is_empty();
+            let (hooked, deferred) = self
+                .apply_response_hooks(Message::assistant_with_reasoning(
+                    content,
+                    reasoning,
+                    reasoning_details,
+                    (!terminal_response).then_some(tool_calls),
+                ))
+                .await;
+            provider_turn_cmds.extend(deferred);
 
-            if tool_calls.is_empty() {
-                let hooked = self
-                    .apply_response_hooks(Message::assistant_with_reasoning(
-                        content,
-                        reasoning,
-                        reasoning_details,
-                        None,
-                    ))
-                    .await;
+            if terminal_response {
                 let turn = AssistantStep::terminal(
                     hooked.content,
                     hooked.reasoning_content,
@@ -2096,22 +2087,20 @@ impl<'a> Turn<'a> {
                 let first_index = self.public_history_len();
                 self.push_assistant_step(turn);
                 self.emit_history_appended_from(first_index);
+                // Steering changes the next request, not the answer already streamed.
+                // Commit that answer before acknowledging the follow-up's history boundary.
+                self.apply_deferred_turn_cmds(provider_turn_cmds);
                 if output_limited {
                     self.emit_output_limit_error();
+                } else if self.public_history_len() > first_index + 1 {
+                    unusable_retries = 0;
+                    continue;
                 }
                 self.emit_turn_complete(false);
                 return;
             }
 
             unusable_retries = 0;
-            let hooked = self
-                .apply_response_hooks(Message::assistant_with_reasoning(
-                    content,
-                    reasoning,
-                    reasoning_details,
-                    Some(tool_calls.clone()),
-                ))
-                .await;
             // Capture the (possibly hook-mutated) in-flight assistant shape
             // for atomic commit. The `tool_calls` that classify_tools will
             // dispatch are read from the hook output too - plugins that
