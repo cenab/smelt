@@ -156,7 +156,8 @@ pub fn render_code_block_range(
         let regions = h
             .highlight_line(&line_with_nl, &SYNTAX_SET)
             .unwrap_or_default();
-        let visual_rows = split_regions_into_rows(out, &regions, text_w);
+        let highlighted = highlighted_line(&regions);
+        let visual_rows = highlighted.wrap_fragments(text_w);
         for (offset, segment) in wrapped_segments(out, &visual_rows).enumerate() {
             let row = rows.saturating_add(offset);
             if row >= range.end {
@@ -165,7 +166,16 @@ pub fn render_code_block_range(
             if row < range.start {
                 continue;
             }
-            segment.emit_with_source(out, line, |out, vrow, kind| {
+            segment.emit_with_source(out, line, |out, fragments, kind| {
+                let vrow = fragments
+                    .iter()
+                    .map(|fragment| {
+                        (
+                            fragment.meta,
+                            highlighted.fragment_text(fragment).to_owned(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 out.save_style();
                 if !kind.is_continuation() && fence {
                     let mut external_src = String::new();
@@ -186,7 +196,7 @@ pub fn render_code_block_range(
                 if dim {
                     out.set_dim();
                 }
-                let cols = print_split_regions(out, vrow, Some(bg));
+                let cols = print_split_regions(out, &vrow, Some(bg));
                 let pad = content_width.saturating_sub(cols);
                 if pad > 0 {
                     out.set_bg(bg);
@@ -299,13 +309,8 @@ pub fn print_syntax_file_ext(
     let lines: Vec<&str> = content.lines().collect();
     render_highlighted(out, &lines, syntax, gutter, skip, max_rows)
 }
-/// Split syntax regions into visual rows that each fit within `max_width` columns.
-fn split_regions_into_rows(
-    out: &mut LineBuilder,
-    regions: &[(Style, &str)],
-    max_width: usize,
-) -> Vec<Vec<(Style, String)>> {
-    let line = InlineLine::new(
+fn highlighted_line(regions: &[(Style, &str)]) -> InlineLine<Style> {
+    InlineLine::new(
         regions
             .iter()
             .filter_map(|(style, text)| {
@@ -314,8 +319,16 @@ fn split_regions_into_rows(
                     .then(|| InlineRun::new(text.to_string(), *style, BreakPolicy::PreserveSpaces))
             })
             .collect(),
-    );
-    let rows: Vec<Vec<(Style, String)>> = line
+    )
+}
+
+/// Split syntax regions into visual rows that each fit within `max_width` columns.
+fn split_regions_into_rows(
+    out: &mut LineBuilder,
+    regions: &[(Style, &str)],
+    max_width: usize,
+) -> Vec<Vec<(Style, String)>> {
+    let rows: Vec<Vec<(Style, String)>> = highlighted_line(regions)
         .wrap_ranges(max_width.max(1))
         .into_iter()
         .map(|row| row.into_iter().map(|run| (run.meta, run.text)).collect())

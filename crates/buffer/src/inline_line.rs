@@ -195,6 +195,14 @@ impl<T: Clone> InlineLine<T> {
 
 impl<T: Clone + PartialEq> InlineLine<T> {
     pub fn wrap_rows(&self, max_cells: usize) -> usize {
+        if let [run] = self.runs.as_slice() {
+            if max_cells > 0
+                && run.break_policy == BreakPolicy::PreserveSpaces
+                && run.text.bytes().all(|byte| (b' '..=b'~').contains(&byte))
+            {
+                return run.text.len().div_ceil(max_cells).max(1);
+            }
+        }
         self.wrap_fragments(max_cells).len()
     }
 
@@ -493,6 +501,24 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn measured_preserved_rows_match_wrapped_fragments() {
+        for text in [
+            "",
+            "abcdefghij",
+            " aa bb cc ",
+            "a\tbc",
+            "a\0bc",
+            "aé漢👩‍💻e\u{301}",
+        ] {
+            for width in [0, 1, 2, 3, 8, 80] {
+                let line =
+                    InlineLine::new(vec![InlineRun::new(text, (), BreakPolicy::PreserveSpaces)]);
+                assert_eq!(line.wrap_rows(width), line.wrap_fragments(width).len());
             }
         }
     }
