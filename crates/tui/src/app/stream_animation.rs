@@ -128,6 +128,23 @@ impl StreamAnimation {
     }
 
     fn take_chars(&mut self, mut count: usize) -> String {
+        if count >= self.pending_chars {
+            let capacity = self
+                .chunks
+                .iter()
+                .map(|chunk| chunk.text.len().saturating_sub(chunk.offset))
+                .sum();
+            let mut output = String::with_capacity(capacity);
+            for chunk in self.chunks.drain(..) {
+                output.push_str(smelt_buffer::text::slice(
+                    &chunk.text,
+                    chunk.offset..chunk.text.len(),
+                ));
+            }
+            self.pending_chars = 0;
+            self.credit = 0.0;
+            return output;
+        }
         let mut output = String::new();
         while count > 0 {
             let Some(chunk) = self.chunks.front_mut() else {
@@ -180,6 +197,35 @@ mod tests {
         }
         assert_eq!(shown, source);
         assert_eq!(animation.pending_chars, 0);
+    }
+
+    #[test]
+    fn full_drains_preserve_partially_revealed_unicode_chunks() {
+        let start = Instant::now();
+        let first = "é漢🙂e\u{301}👩‍💻🇫🇷\nfirst";
+        let second = "second 👨‍👩‍👧‍👦 e\u{301}漢";
+        for finish in [false, true] {
+            let mut animation = StreamAnimation::default();
+            let mut shown = animation.push(StreamKind::Text, first.into(), start);
+            let later = start + Duration::from_millis(25);
+            shown.push_str(&animation.advance(later));
+            assert!(shown.len() > "é".len());
+            assert!(shown.len() < first.len());
+            shown.push_str(&animation.push(StreamKind::Text, second.into(), later));
+            assert!(animation.is_pending());
+            if finish {
+                let (kind, remaining) = animation.finish().unwrap();
+                assert!(kind == StreamKind::Text);
+                shown.push_str(&remaining);
+                assert!(animation.kind().is_none());
+            } else {
+                shown.push_str(&animation.advance(start + MAX_LAG));
+            }
+            assert_eq!(shown, format!("{first}{second}"));
+            assert_eq!(animation.pending_chars, 0);
+            assert!(animation.chunks.is_empty());
+            assert_eq!(animation.credit, 0.0);
+        }
     }
 
     #[test]
