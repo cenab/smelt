@@ -496,14 +496,26 @@ impl MarkdownStream {
     ) {
         let trimmed = smelt_buffer::text::trim_whitespace(&content).to_string();
         if let Some(id) = id {
-            let already_final = history.block(id).is_some_and(|block| match (kind, block) {
+            let prefix_len = history.block(id).and_then(|block| match (kind, block) {
                 (MarkdownStreamKind::Text, Block::Text { content })
                 | (MarkdownStreamKind::Thinking, Block::Thinking { content, .. }) => {
-                    content == &trimmed
+                    let len = content.len();
+                    (len <= trimmed.len()
+                        && content.eq(smelt_buffer::text::slice(&trimmed, 0..len)))
+                    .then_some(len)
                 }
-                _ => false,
+                _ => None,
             });
-            if !already_final {
+            let updated = prefix_len.is_some_and(|len| {
+                len == trimmed.len()
+                    || history
+                        .append_live_text_segments(
+                            id,
+                            [smelt_buffer::text::slice(&trimmed, len..trimmed.len())],
+                        )
+                        .is_some()
+            });
+            if !updated {
                 history.rewrite(id, kind.block(trimmed));
             }
             history.set_status(id, Status::Done);
@@ -799,6 +811,73 @@ mod tests {
                 byte_range: 1..3,
             }]
         );
+    }
+
+    #[test]
+    fn finalizing_fence_preserves_content_and_appends_only_the_delimiter() {
+        use crate::transcript_model::{ContentChannel, TranscriptPatchOperation};
+
+        for kind in [MarkdownStreamKind::Text, MarkdownStreamKind::Thinking] {
+            let mut stream = MarkdownStream::with_kind(kind);
+            let mut history = BlockHistory::new();
+            let source = "```rust\ncafé 東京\n```   ";
+            stream.append(&mut history, source);
+            let id = history.last_block_id().unwrap();
+            let content = history.content(id, ContentChannel::Primary).unwrap();
+            let content_id = content.id();
+            let start = content.len();
+            let revision = history.patch_revision();
+
+            stream.flush(&mut history);
+
+            let content = history.content(id, ContentChannel::Primary).unwrap();
+            assert_eq!(content.id(), content_id);
+            assert_eq!(content.snapshot(), source.trim_end());
+            assert_eq!(history.status(id), Some(Status::Done));
+            let operations = history
+                .patches_since(revision)
+                .unwrap()
+                .flat_map(|patch| patch.operations.iter())
+                .collect::<Vec<_>>();
+            assert!(operations.iter().any(|operation| matches!(
+                operation,
+                TranscriptPatchOperation::Append {
+                    id: appended_id,
+                    content_id: appended_content_id,
+                    channel: ContentChannel::Primary,
+                    byte_range,
+                } if *appended_id == id
+                    && *appended_content_id == content_id
+                    && *byte_range == (start..source.trim_end().len())
+            )));
+            assert!(!operations.iter().any(|operation| matches!(
+                operation,
+                TranscriptPatchOperation::Replace { id: replaced_id } if *replaced_id == id
+            )));
+        }
+    }
+
+    #[test]
+    fn finalizing_non_prefix_text_still_rewrites_trimmed_content() {
+        for kind in [MarkdownStreamKind::Text, MarkdownStreamKind::Thinking] {
+            let mut stream = MarkdownStream::with_kind(kind);
+            let mut history = BlockHistory::new();
+            stream.append(&mut history, "  café 東京  ");
+            let id = history.last_block_id().unwrap();
+            let content_id = history
+                .content(id, crate::transcript_model::ContentChannel::Primary)
+                .unwrap()
+                .id();
+
+            stream.flush(&mut history);
+
+            let content = history
+                .content(id, crate::transcript_model::ContentChannel::Primary)
+                .unwrap();
+            assert_ne!(content.id(), content_id);
+            assert_eq!(content.snapshot(), "café 東京");
+            assert_eq!(history.status(id), Some(Status::Done));
+        }
     }
 
     #[test]
