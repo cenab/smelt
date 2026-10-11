@@ -2961,7 +2961,8 @@ smelt.tools.register({{
         }
         assert!(
             Instant::now() < deadline,
-            "headless stream timed out: {}",
+            "headless stream timed out after {requests} requests; events: {}; stderr: {}",
+            std::fs::read_to_string(&stdout).unwrap(),
             std::fs::read_to_string(&stderr).unwrap()
         );
         std::thread::sleep(Duration::from_millis(10));
