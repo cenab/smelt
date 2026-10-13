@@ -3,9 +3,9 @@ source: crates/tui/tests/storybook/app_ctx.rs
 expression: frame.text()
 ---
 * edit_file src/live.rs
-  replacement snippet (not validated)
    1   pub fn live() -> i32 {
    2       2
+
 
 
 

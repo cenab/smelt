@@ -80,7 +80,7 @@ local function replacement_line_detail(block)
 end
 
 smelt.transcript.register_tool("edit_file", {
-  cache_key = "smelt.tool-presentation.edit_file:v4",
+  cache_key = "smelt.tool-presentation.edit_file:v5",
   draft = function(block)
     local old = argument_field(block, "old_string")
     local new = argument_field(block, "new_string")
@@ -95,8 +95,7 @@ smelt.transcript.register_tool("edit_file", {
       -- An unfinished replacement cannot establish which old lines are deleted.
       body = smelt.layout.content(new.content_id, { format = "file", path = path })
     end
-    if not body then return nil end
-    return smelt.layout.vbox({ smelt.layout.text("replacement snippet (not validated)"), body })
+    return body
   end,
   body = function(block, ctx, opts)
     if block.output and block.output.is_error then

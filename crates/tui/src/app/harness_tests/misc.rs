@@ -1880,7 +1880,7 @@ fn prepared_edit_file_diff_survives_promotion_until_tool_finish() {
     }));
     let draft_frame = app.render_to_frame().text();
     assert!(
-        draft_frame.contains("replacement snippet (not validated)"),
+        !draft_frame.contains("replacement snippet (not validated)"),
         "{draft_frame}"
     );
     assert_edit_file_diff_visible(&draft_frame, "received-snippet");
@@ -2017,7 +2017,7 @@ struct InvalidEditFileCase {
 }
 
 #[test]
-fn invalid_edit_file_drafts_are_labeled_before_preflight_rejection() {
+fn invalid_edit_file_drafts_are_removed_after_preflight_rejection() {
     let cases = [
         InvalidEditFileCase {
             name: "unread",
@@ -2116,7 +2116,7 @@ fn assert_invalid_edit_file_lifecycle(case: &InvalidEditFileCase, request_id: u6
     let draft_frame = app.render_to_frame().text();
     assert!(draft_frame.contains("* edit_file"), "frame: {draft_frame}");
     assert!(
-        draft_frame.contains("replacement snippet (not validated)"),
+        !draft_frame.contains("replacement snippet (not validated)"),
         "{draft_frame}"
     );
 
