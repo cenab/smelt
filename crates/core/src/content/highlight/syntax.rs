@@ -136,13 +136,18 @@ pub fn render_code_block_range(
     if range.is_empty() {
         return 0;
     }
-    let syntax = syntax_for_lang(block.lang());
     let theme = syntax_theme(out.theme());
     let content_width = if let Some(b) = bctx { b.inner_w } else { width };
     let text_w = content_width.max(1);
     let mut rows = 0usize;
     let mut emitted = 0usize;
-    let mut h = HighlightLines::new(syntax, theme);
+    // Unlabelled fences need no parser. Avoid loading the entire syntax set on
+    // the UI thread just to render plain text for the first time.
+    let plain_style = (lang_to_ext(block.lang()) == "txt")
+        .then(|| Highlighter::new(theme).style_for_stack(&[Scope::new("text.plain").unwrap()]));
+    let mut h = plain_style
+        .is_none()
+        .then(|| HighlightLines::new(syntax_for_lang(block.lang()), theme));
 
     let bg_group = intern("SmeltCodeBlockBg");
     let bg = out.theme().resolve(bg_group).bg.unwrap_or(Color::Reset);
@@ -152,11 +157,15 @@ pub fn render_code_block_range(
             break;
         }
         let line = code_line.text();
-        let line_with_nl = format!("{}\n", line);
-        let regions = h
-            .highlight_line(&line_with_nl, &SYNTAX_SET)
-            .unwrap_or_default();
-        let highlighted = highlighted_line(&regions);
+        let highlighted = if let Some(h) = &mut h {
+            let line_with_nl = format!("{}\n", line);
+            let regions = h
+                .highlight_line(&line_with_nl, &SYNTAX_SET)
+                .unwrap_or_default();
+            highlighted_line(&regions)
+        } else {
+            highlighted_line(&[(plain_style.unwrap(), line)])
+        };
         let visual_rows = highlighted.wrap_fragments(text_w);
         for (offset, segment) in wrapped_segments(out, &visual_rows).enumerate() {
             let row = rows.saturating_add(offset);
@@ -534,6 +543,34 @@ mod tests {
     // ── render_code_block ─────────────────────────────────────────────
 
     #[test]
+    fn plain_code_style_matches_syntax_parser() {
+        let syntax = SYNTAX_SET.find_syntax_plain_text();
+        let mut theme = syntect::highlighting::Theme::default();
+        theme.scopes.push(syntect::highlighting::ThemeItem {
+            scope: "text.plain".parse().unwrap(),
+            style: syntect::highlighting::StyleModifier {
+                foreground: Some(SyntectColor::BLACK),
+                font_style: Some(FontStyle::BOLD),
+                ..Default::default()
+            },
+        });
+        for theme in [syntect::highlighting::Theme::default(), theme] {
+            let plain_style =
+                Highlighter::new(&theme).style_for_stack(&[Scope::new("text.plain").unwrap()]);
+            let mut parser = HighlightLines::new(syntax, &theme);
+            for line in ["", "plain text  ", "é界👩‍💻", "trailing carriage return\r"] {
+                let with_newline = format!("{line}\n");
+                let regions = parser.highlight_line(&with_newline, &SYNTAX_SET).unwrap();
+                assert_eq!(
+                    highlighted_line(&[(plain_style, line)]),
+                    highlighted_line(&regions),
+                    "line={line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn render_code_block_unknown_lang_falls_back_to_plain_text() {
         let block = render_test(80, |out| {
             render_code_block(
@@ -717,51 +754,62 @@ mod tests {
 
     #[test]
     fn code_block_ranges_match_full_render_with_syntax_and_source_metadata() {
-        let code = crate::content::code_block::parse_code_block(
-            &[
-                "/* multiline comment",
-                "still a comment */",
-                "let text = \"界e\u{301} text\";",
-                "last",
-            ],
-            "rust",
-        );
-        let ctx = bctx(8);
-        for box_context in [None, Some(&ctx)] {
-            for fence in [false, true] {
-                let full = render_test(12, |out| {
-                    super::render_code_block(out, &code, 12, true, box_context, fence);
-                });
-                for start in 0..=full.lines.len() + 1 {
-                    for end in start..=full.lines.len() + 1 {
-                        let clipped = render_test(12, |out| {
-                            let emitted = render_code_block_range(
-                                out,
-                                &code,
-                                12,
-                                true,
-                                box_context,
-                                fence,
-                                start..end,
-                            );
-                            assert_eq!(emitted, end.min(full.lines.len()).saturating_sub(start));
-                        });
-                        let expected =
-                            &full.lines[start.min(full.lines.len())..end.min(full.lines.len())];
-                        assert_eq!(clipped.lines.len(), expected.len());
-                        for (actual, expected) in clipped.lines.iter().zip(expected) {
-                            assert_eq!(actual.text, expected.text);
-                            assert_eq!(actual.source_text, expected.source_text);
-                            assert_eq!(actual.external_source_text, expected.external_source_text);
-                            assert_eq!(actual.soft_wrapped, expected.soft_wrapped);
-                            assert_eq!(actual.copy_continuation, expected.copy_continuation);
-                            let spans = |line: &crate::content::builder::test_util::TestLine| {
-                                line.spans
-                                    .iter()
-                                    .map(|span| (span.text.clone(), span.style, span.meta.clone()))
-                                    .collect::<Vec<_>>()
-                            };
-                            assert_eq!(spans(actual), spans(expected));
+        for lang in ["rust", "", "txt"] {
+            let code = crate::content::code_block::parse_code_block(
+                &[
+                    "/* multiline comment",
+                    "still a comment */",
+                    "let text = \"界e\u{301} text\";",
+                    "last",
+                ],
+                lang,
+            );
+            let ctx = bctx(8);
+            for box_context in [None, Some(&ctx)] {
+                for fence in [false, true] {
+                    let full = render_test(12, |out| {
+                        super::render_code_block(out, &code, 12, true, box_context, fence);
+                    });
+                    for start in 0..=full.lines.len() + 1 {
+                        for end in start..=full.lines.len() + 1 {
+                            let clipped = render_test(12, |out| {
+                                let emitted = render_code_block_range(
+                                    out,
+                                    &code,
+                                    12,
+                                    true,
+                                    box_context,
+                                    fence,
+                                    start..end,
+                                );
+                                assert_eq!(
+                                    emitted,
+                                    end.min(full.lines.len()).saturating_sub(start)
+                                );
+                            });
+                            let expected =
+                                &full.lines[start.min(full.lines.len())..end.min(full.lines.len())];
+                            assert_eq!(clipped.lines.len(), expected.len());
+                            for (actual, expected) in clipped.lines.iter().zip(expected) {
+                                assert_eq!(actual.text, expected.text);
+                                assert_eq!(actual.source_text, expected.source_text);
+                                assert_eq!(
+                                    actual.external_source_text,
+                                    expected.external_source_text
+                                );
+                                assert_eq!(actual.soft_wrapped, expected.soft_wrapped);
+                                assert_eq!(actual.copy_continuation, expected.copy_continuation);
+                                let spans =
+                                    |line: &crate::content::builder::test_util::TestLine| {
+                                        line.spans
+                                            .iter()
+                                            .map(|span| {
+                                                (span.text.clone(), span.style, span.meta.clone())
+                                            })
+                                            .collect::<Vec<_>>()
+                                    };
+                                assert_eq!(spans(actual), spans(expected));
+                            }
                         }
                     }
                 }

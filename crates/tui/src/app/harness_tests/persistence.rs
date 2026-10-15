@@ -1532,6 +1532,9 @@ fn large_response_keeps_history_append_and_follow_up_enter_responsive() {
     let accepted = app.app.turn_submission_is_pending();
     release.send(()).unwrap();
     let timings = smelt_perf::perf::snapshot_top(12);
+    eprintln!(
+        "large response UI: append={append_elapsed:?}, completion={completion_elapsed:?}, enter={enter_elapsed:?}: {timings:?}"
+    );
     assert!(
         append_elapsed < Duration::from_millis(250),
         "history append blocked UI for {append_elapsed:?}: {timings:?}"
