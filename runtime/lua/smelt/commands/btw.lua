@@ -52,6 +52,7 @@ smelt.cmd.register("btw", function(args)
   smelt.spawn(function()
     local buf = smelt.buf.new({ readonly = true })
     local stream = smelt.transcript.stream(buf)
+    local closed = false
     local waiting = false
     local waiting_frame = 0
     local waiting_timer
@@ -84,17 +85,25 @@ smelt.cmd.register("btw", function(args)
     local restarts = 0
 
     local function send(messages, retrying_after_tool_denial)
+      if closed then return end
       start_waiting()
       smelt.engine.ask_inherited({
         messages = messages,
         model = smelt.model.preferred("btw"),
+        on_draft_rejected = function()
+          if closed then return end
+          stream:reset()
+          start_waiting()
+        end,
         on_delta = function(delta)
+          if closed then return end
           if delta ~= "" then
             stop_waiting()
             stream:append(delta)
           end
         end,
         on_response = function(response, err)
+          if closed then return end
           stop_waiting()
           if err then
             stream:reset()
@@ -131,7 +140,11 @@ smelt.cmd.register("btw", function(args)
       min_height = "30%",
       max_height = "70%",
       panels     = { { leaf = leaf, height = "fill" } },
-      on_close   = stop_waiting,
+      on_close   = function()
+        closed = true
+        stop_waiting()
+        stream:reset()
+      end,
       close_with_q = true,
     })
   end)

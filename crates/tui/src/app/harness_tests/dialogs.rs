@@ -603,6 +603,7 @@ fn usage_dialog_opened_during_active_turn_stays_dismissible() {
         let mut app = TestApp::builder().build();
         app.type_text("start working");
         app.press(KeyCode::Enter);
+        app.wait_for_turn_persistence();
         assert!(
             app.agent_running(),
             "submitting a prompt should start a turn"
@@ -2271,6 +2272,7 @@ fn evaluate_tool(
             mode,
         },
     ));
+    app.wait_for_tool_evaluation(request_id);
 
     app.actions()
         .iter()
@@ -2305,6 +2307,47 @@ fn tool_evaluation_uses_the_mode_carried_by_the_turn_event() {
         protocol::AgentMode::parse("apply").unwrap(),
     );
     assert_eq!(decision, protocol::Decision::Allow);
+}
+
+#[test]
+fn tool_evaluation_denies_commands_inside_nested_shells() {
+    let mut app = TestApp::builder().build();
+    let permissions = app.core_probe().permissions.snapshot().as_ref().clone();
+    let permissions = permissions.with_overrides(&protocol::PermissionOverrides {
+        tools: None,
+        subcommands: std::collections::HashMap::from([(
+            "bash".to_string(),
+            protocol::RuleSetOverride {
+                allow: vec!["bash *".into(), "flock *".into()],
+                deny: vec!["rm *".into()],
+                ask: vec![],
+            },
+        )]),
+    });
+    app.replace_permissions_for_harness(permissions);
+    app.start_turn(1);
+    let _ = app.drain_engine_sends();
+
+    for (id, command) in [
+        (301, "bash -c 'rm scratch.txt'"),
+        (302, "flock lockfile bash -c 'rm scratch.txt'"),
+        (303, "flock lockfile -c 'rm scratch.txt'"),
+        (304, "env -i bash -c 'rm scratch.txt'"),
+        (305, "flock lockfile env -i bash -c 'rm scratch.txt'"),
+    ] {
+        let decision = evaluate_tool(
+            &mut app,
+            id,
+            "nested-command",
+            "bash",
+            std::collections::HashMap::from([(
+                "command".to_string(),
+                serde_json::Value::String(command.to_string()),
+            )]),
+            protocol::AgentMode::parse("yolo").unwrap(),
+        );
+        assert_eq!(decision, protocol::Decision::Deny, "command={command}");
+    }
 }
 
 #[test]
@@ -2390,6 +2433,7 @@ fn switch_cwd_outside_workspace_requires_destination_permission() {
         tool_name: "switch_cwd".into(),
         args,
     }));
+    app.wait_for_tool_result("switch-cwd");
 
     assert_eq!(app.core_probe().env.cwd(), target);
     assert_eq!(std::env::current_dir().unwrap(), target);
@@ -3481,6 +3525,16 @@ fn ask_user_question_custom_input_accepts_question_mark() {
 
 #[test]
 fn ask_user_question_multiple_questions_wakes_between_dialogs() {
+    fn drain_wakeups(app: &mut TestApp) {
+        for _ in 0..64 {
+            if !app.try_receive_lua_wakeup() {
+                return;
+            }
+            app.feed_one(SourceEvent::LuaWakeup);
+        }
+        panic!("dialog Lua work did not settle");
+    }
+
     let mut app = TestApp::builder().with_vim(false).build();
     app.start_turn(1);
 
@@ -3516,6 +3570,7 @@ fn ask_user_question_multiple_questions_wakes_between_dialogs() {
         tool_name: "ask_user_question".into(),
         args,
     }));
+    drain_wakeups(&mut app);
 
     let first = app
         .state()
@@ -3528,6 +3583,7 @@ fn ask_user_question_multiple_questions_wakes_between_dialogs() {
         "resolving the first dialog should wake the Lua task runtime"
     );
     app.feed_one(SourceEvent::LuaWakeup);
+    drain_wakeups(&mut app);
 
     let second = app
         .state()
@@ -3541,6 +3597,7 @@ fn ask_user_question_multiple_questions_wakes_between_dialogs() {
         "resolving the final dialog should wake the Lua task runtime"
     );
     app.feed_one(SourceEvent::LuaWakeup);
+    drain_wakeups(&mut app);
 
     assert!(app.state().active_modal.is_none());
     let result = app
@@ -3739,7 +3796,7 @@ fn btw_dialog_paints_a_selected_delta_before_a_coalesced_final_response() {
 
     let streamed_frame = streamed_frame.expect("final response should paint the pending delta");
     assert!(
-        streamed_frame.contains("coalesced live dialog marker"),
+        streamed_frame.lines().any(|line| line.trim() == "c"),
         "no frame painted the selected delta: {streamed_frame}"
     );
     assert!(
@@ -3753,7 +3810,7 @@ fn btw_dialog_paints_a_selected_delta_before_a_coalesced_final_response() {
         .rows
         .iter()
         .position(|row| row.contains(text))
-        .unwrap();
+        .unwrap_or_else(|| panic!("final frame: {}", final_frame.text()));
     let col = final_frame.rows[row].find(text).unwrap();
     assert!(
         final_frame.styles[row][col..col + text.len()]
@@ -3767,6 +3824,59 @@ fn btw_dialog_paints_a_selected_delta_before_a_coalesced_final_response() {
         "frame: {final_frame}"
     );
     app.clear_timers();
+}
+
+#[test]
+fn btw_dialog_resets_rejected_draft_and_recovers_without_waiting_styles() {
+    let mut app = TestApp::builder().build();
+    app.set_terminal_size(70, 22);
+    app.apply_lua_command("btw explain the retry");
+    app.drive_lua_tasks();
+    let id = app.pending_ask_id().expect("/btw registered ask callback");
+    app.feed_one(SourceEvent::engine(protocol::EngineEvent::EngineAskDelta {
+        id,
+        delta: "rejected side answer".into(),
+    }));
+    app.clock.advance(std::time::Duration::from_millis(250));
+    assert!(app
+        .render_to_frame()
+        .text()
+        .contains("rejected side answer"));
+    app.feed_one(SourceEvent::engine(
+        protocol::EngineEvent::EngineAskDraftRejected { id },
+    ));
+    assert!(!app
+        .render_to_frame()
+        .text()
+        .contains("rejected side answer"));
+    app.feed_one(SourceEvent::engine(protocol::EngineEvent::EngineAskDelta {
+        id,
+        delta: "accepted side answer".into(),
+    }));
+    app.feed_one(SourceEvent::engine(
+        protocol::EngineEvent::EngineAskResponse {
+            id,
+            message: Some(protocol::Message::assistant(
+                Some(protocol::Content::text("accepted side answer")),
+                None,
+                None,
+            )),
+            error: None,
+        },
+    ));
+    let frame = app.render_to_frame();
+    let row = frame
+        .rows
+        .iter()
+        .position(|row| row.contains("accepted side answer"))
+        .expect("recovered side answer");
+    let col = frame.rows[row].find("accepted side answer").unwrap();
+    assert!(frame.styles[row][col..col + "accepted side answer".len()]
+        .iter()
+        .all(|style| !style.dim && !style.italic));
+    assert!(!frame.text().contains("rejected side answer"));
+    app.clear_timers();
+    app.assert_invariants();
 }
 
 #[test]
@@ -3805,6 +3915,7 @@ fn btw_dialog_streams_before_a_busy_engine_queue_reaches_the_final_response() {
     .expect("queue /btw response");
 
     app.drain_ready_engine_outputs_for_frame_to(&mut std::io::sink(), |_| {});
+    app.clock.advance(std::time::Duration::from_millis(250));
     let frame = app.render_to_frame().text();
     assert!(frame.contains("live dialog marker"), "frame: {frame}");
     assert!(!frame.contains("final answer"), "frame: {frame}");

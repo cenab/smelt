@@ -1,4 +1,4 @@
-use crate::error::{classify_openai_error, OpenAiErrorPayload};
+use crate::error::classify_openai_stream_error;
 use crate::sse;
 use crate::{
     non_empty, non_empty_blocks,
@@ -315,7 +315,7 @@ pub fn parse_response(data: &serde_json::Value) -> Result<ParsedResponse, Provid
             Some("function_call") => {
                 let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
                 let name = item["name"].as_str().unwrap_or_default().to_string();
-                let arguments = item["arguments"].as_str().unwrap_or("{}").to_string();
+                let arguments = item["arguments"].as_str().unwrap_or_default().to_string();
                 tool_calls.push(ToolCall::new(call_id, FunctionCall { name, arguments }));
             }
             Some("reasoning") => {
@@ -367,6 +367,9 @@ pub fn parse_response(data: &serde_json::Value) -> Result<ParsedResponse, Provid
     let usage = parse_usage(&data["usage"]);
 
     Ok(ParsedResponse {
+        finish_reason: None,
+        stop_reason: None,
+        system_fingerprint: None,
         content,
         reasoning,
         reasoning_parts,
@@ -394,6 +397,8 @@ struct StreamState {
     usage: TokenUsage,
     error: Option<ProviderError>,
     saw_completed: bool,
+    finish_reason: Option<&'static str>,
+    invalid_tool_metadata: bool,
 }
 
 impl StreamState {
@@ -401,10 +406,19 @@ impl StreamState {
         if let Some(err) = self.error {
             return Err(err);
         }
-        if !self.saw_completed {
+        if !self.saw_completed && self.finish_reason != Some("length") {
             return Err(ProviderError::Stream(
                 "stream ended without response.completed".into(),
             ));
+        }
+        if self.invalid_tool_metadata {
+            return Err(ProviderError::MalformedResponse {
+                issue: "incomplete tool-call stream metadata".into(),
+                finish_reason: self.finish_reason.map(str::to_owned),
+                stop_reason: None,
+                system_fingerprint: None,
+                usage: Box::new(self.usage),
+            });
         }
         let mut tool_order = self.tool_order;
         if tool_order.is_empty() {
@@ -414,7 +428,6 @@ impl StreamState {
         let tool_calls: Vec<ToolCall> = tool_order
             .into_iter()
             .filter_map(|item_id| self.tool_calls.get(&item_id).cloned())
-            .filter(|(call_id, name, _)| !call_id.is_empty() && !name.is_empty())
             .map(|(call_id, name, args)| {
                 ToolCall::new(
                     call_id,
@@ -434,6 +447,9 @@ impl StreamState {
             })
             .collect();
         Ok(ParsedResponse {
+            finish_reason: self.finish_reason.map(str::to_owned),
+            stop_reason: None,
+            system_fingerprint: None,
             content: non_empty(self.content),
             reasoning: non_empty(self.reasoning),
             reasoning_parts: Vec::new(),
@@ -451,7 +467,11 @@ pub fn parse_stream_events<'a>(
 ) -> Result<ParsedResponse, ProviderError> {
     let mut state = StreamState::default();
     for ev in events {
+        crate::error::check_openai_stream_error(ev)?;
         apply_sse_event(&mut state, ev, on_delta, unix_now());
+        if let Some(error) = state.error.take() {
+            return Err(error);
+        }
     }
     state.finalize()
 }
@@ -480,6 +500,7 @@ fn apply_sse_event(
             let item = &ev["item"];
             let id = item["id"].as_str().unwrap_or("").to_string();
             if id.is_empty() {
+                state.invalid_tool_metadata = true;
                 return;
             }
             let call_id = item["call_id"].as_str().unwrap_or("").to_string();
@@ -513,36 +534,34 @@ fn apply_sse_event(
             let item = &ev["item"];
             let id = item["id"].as_str().unwrap_or("").to_string();
             if id.is_empty() {
+                state.invalid_tool_metadata = true;
                 return;
             }
-            let call_id = item["call_id"].as_str().unwrap_or("").to_string();
-            let name = item["name"].as_str().unwrap_or("").to_string();
-            let arguments = item["arguments"].as_str().unwrap_or("").to_string();
             if !state.tool_order.contains(&id) {
                 state.tool_order.push(id.clone());
             }
-            let mut metadata_changed = false;
             let entry = state
                 .tool_calls
                 .entry(id.clone())
                 .or_insert_with(|| (String::new(), String::new(), String::new()));
-            if !call_id.is_empty() && entry.0.is_empty() {
-                entry.0 = call_id;
-                metadata_changed = true;
+            // Supplied terminal fields are authoritative, including invalid values.
+            // Omitted fields retain their streamed values.
+            if let Some(call_id) = item.get("call_id") {
+                entry.0 = call_id.as_str().unwrap_or_default().to_string();
             }
-            if !name.is_empty() && entry.1.is_empty() {
-                entry.1 = name;
-                metadata_changed = true;
+            if let Some(name) = item.get("name") {
+                entry.1 = name.as_str().unwrap_or_default().to_string();
             }
-            if !arguments.is_empty() && entry.2.is_empty() {
-                entry.2 = arguments;
+            if let Some(arguments) = item.get("arguments") {
+                entry.2 = arguments.as_str().unwrap_or_default().to_string();
             }
-            if metadata_changed {
+            if !entry.0.is_empty() && !entry.1.is_empty() {
                 on_delta(ProviderStreamEvent::ToolCall(
-                    ToolCallStreamEvent::Started {
+                    ToolCallStreamEvent::Finished {
                         stream_id: &id,
-                        call_id: (!entry.0.is_empty()).then_some(entry.0.as_str()),
-                        tool_name: (!entry.1.is_empty()).then_some(entry.1.as_str()),
+                        call_id: &entry.0,
+                        tool_name: &entry.1,
+                        arguments: &entry.2,
                     },
                 ));
             }
@@ -593,7 +612,7 @@ fn apply_sse_event(
         "response.function_call_arguments.done" => {
             if let Some(item_id) = ev["item_id"].as_str() {
                 if let Some(entry) = state.tool_calls.get_mut(item_id) {
-                    entry.2 = ev["arguments"].as_str().unwrap_or("{}").to_string();
+                    entry.2 = ev["arguments"].as_str().unwrap_or_default().to_string();
                     if !entry.0.is_empty() && !entry.1.is_empty() {
                         on_delta(ProviderStreamEvent::ToolCall(
                             ToolCallStreamEvent::Finished {
@@ -670,19 +689,7 @@ fn apply_sse_event(
                 state.usage = parse_usage(u);
             }
         }
-        "response.failed" => {
-            if let Some(error) = ev.get("response").and_then(|r| r.get("error")) {
-                let error = OpenAiErrorPayload::from_value(error);
-                state.error = Some(
-                    classify_openai_error(&error, None, now_secs).unwrap_or_else(|| {
-                        ProviderError::Server {
-                            status: 0,
-                            body: error.message().to_string(),
-                        }
-                    }),
-                );
-            }
-        }
+        "response.failed" => state.error = Some(classify_openai_stream_error(ev, now_secs)),
         "response.incomplete" => {
             let reason = ev
                 .get("response")
@@ -690,9 +697,19 @@ fn apply_sse_event(
                 .and_then(|d| d.get("reason"))
                 .and_then(|r| r.as_str())
                 .unwrap_or("unknown");
-            state.error = Some(ProviderError::Stream(format!(
-                "incomplete response returned, reason: {reason}"
-            )));
+            if reason == "max_output_tokens" {
+                state.finish_reason = Some("length");
+                if let Some(usage) = ev.get("response").and_then(|r| r.get("usage")) {
+                    state.usage = parse_usage(usage);
+                }
+            } else {
+                let message = format!("incomplete response returned, reason: {reason}");
+                state.error = Some(if reason == "content_filter" {
+                    ProviderError::InvalidResponse(message)
+                } else {
+                    ProviderError::Stream(message)
+                });
+            }
         }
         _ => {}
     }
@@ -706,8 +723,13 @@ pub async fn read_stream(
 ) -> Result<ParsedResponse, ProviderError> {
     let mut state = StreamState::default();
 
-    sse::read_events(resp, cancel, |ev| {
-        apply_sse_event(&mut state, ev, &mut |d| on_delta(d), now_secs);
+    sse::read_events(resp, cancel, |event| {
+        let ev = crate::error::parse_openai_stream_event(event)?;
+        apply_sse_event(&mut state, &ev, &mut |d| on_delta(d), now_secs);
+        if let Some(error) = state.error.take() {
+            return Err(error);
+        }
+        Ok(())
     })
     .await?;
 
@@ -1251,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_function_call_missing_arguments_defaults_to_empty_object() {
+    fn parse_response_preserves_missing_arguments_for_validation() {
         let v = json!({
             "output": [
                 {"type": "function_call", "call_id": "c1", "name": "f"}
@@ -1259,7 +1281,11 @@ mod tests {
             "usage": {}
         });
         let r = parse_response(&v).unwrap();
-        assert_eq!(r.tool_calls[0].function.arguments, "{}");
+        assert!(r.tool_calls[0].function.arguments.is_empty());
+        assert!(matches!(
+            r.validate(),
+            Err(ProviderError::MalformedResponse { .. })
+        ));
     }
 
     #[test]
@@ -1470,15 +1496,21 @@ mod tests {
     fn sse_function_call_metadata_can_arrive_after_started() {
         let mut state = completed_state();
         let mut got = Vec::new();
-        let mut on_delta = |event: ProviderStreamEvent<'_>| {
-            if let ProviderStreamEvent::ToolCall(ToolCallStreamEvent::Started {
+        let mut on_delta = |event: ProviderStreamEvent<'_>| match event {
+            ProviderStreamEvent::ToolCall(ToolCallStreamEvent::Started {
                 stream_id,
                 call_id,
                 tool_name,
-            }) = event
-            {
-                got.push(format!("start:{stream_id}:{call_id:?}:{tool_name:?}"));
-            }
+            }) => got.push(format!("start:{stream_id}:{call_id:?}:{tool_name:?}")),
+            ProviderStreamEvent::ToolCall(ToolCallStreamEvent::Finished {
+                stream_id,
+                call_id,
+                tool_name,
+                arguments,
+            }) => got.push(format!(
+                "finish:{stream_id}:{call_id}:{tool_name}:{arguments}"
+            )),
+            _ => {}
         };
 
         apply_sse_event(
@@ -1506,13 +1538,148 @@ mod tests {
             1_000,
         );
 
-        assert_eq!(
-            got,
-            vec!["start:i1:None:None", "start:i1:Some(\"c1\"):Some(\"bash\")",]
-        );
+        assert_eq!(got, vec!["start:i1:None:None", "finish:i1:c1:bash:{}",]);
         let response = state.finalize().unwrap();
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].id, "c1");
+    }
+
+    #[test]
+    fn sse_terminal_tool_fields_override_drafts_and_update_presentation() {
+        let mut state = completed_state();
+        step(
+            &mut state,
+            json!({
+                "type": "response.output_item.added",
+                "item": {"type": "function_call", "id": "i1", "call_id": "draft-id", "name": "draft-name"}
+            }),
+        );
+        step(
+            &mut state,
+            json!({
+                "type": "response.function_call_arguments.delta", "item_id": "i1", "delta": "{\"partial\":"
+            }),
+        );
+        let mut finished = Vec::new();
+        apply_sse_event(
+            &mut state,
+            &json!({
+                "type": "response.output_item.done",
+                "item": {"type": "function_call", "id": "i1", "call_id": "final-id", "name": "final-name", "arguments": "{\"complete\":true}"}
+            }),
+            &mut |event| {
+                if let ProviderStreamEvent::ToolCall(ToolCallStreamEvent::Finished {
+                    call_id,
+                    tool_name,
+                    arguments,
+                    ..
+                }) = event
+                {
+                    finished.push((
+                        call_id.to_string(),
+                        tool_name.to_string(),
+                        arguments.to_string(),
+                    ));
+                }
+            },
+            1_000,
+        );
+        let parsed = state.finalize().unwrap();
+        parsed.validate().unwrap();
+        let call = &parsed.tool_calls[0];
+        assert_eq!(call.id, "final-id");
+        assert_eq!(call.function.name, "final-name");
+        assert_eq!(call.function.arguments, "{\"complete\":true}");
+        assert_eq!(
+            finished,
+            vec![(
+                call.id.clone(),
+                call.function.name.clone(),
+                call.function.arguments.clone()
+            )]
+        );
+    }
+
+    #[test]
+    fn sse_invalid_terminal_tool_fields_cannot_hide_behind_valid_drafts() {
+        for (field, invalid) in [
+            ("arguments", json!("[1,2]")),
+            ("arguments", json!("{\"private-argument\":")),
+            ("arguments", json!("")),
+            ("arguments", json!({})),
+            ("arguments", serde_json::Value::Null),
+            ("call_id", json!("")),
+            ("call_id", json!(17)),
+            ("call_id", serde_json::Value::Null),
+            ("name", json!("")),
+            ("name", json!(17)),
+            ("name", serde_json::Value::Null),
+        ] {
+            let mut state = completed_state();
+            step(
+                &mut state,
+                json!({
+                    "type": "response.output_item.added",
+                    "item": {"type": "function_call", "id": "i1", "call_id": "c1", "name": "test"}
+                }),
+            );
+            step(
+                &mut state,
+                json!({
+                    "type": "response.function_call_arguments.done", "item_id": "i1", "arguments": "{}"
+                }),
+            );
+            let mut item = json!({"type": "function_call", "id": "i1"});
+            item[field] = invalid;
+            step(
+                &mut state,
+                json!({"type": "response.output_item.done", "item": item}),
+            );
+            step(
+                &mut state,
+                json!({"type": "response.completed", "response": {
+                    "usage": {"input_tokens": 7, "output_tokens": 4}
+                }}),
+            );
+            let parsed = state.finalize().unwrap();
+            let error = parsed
+                .validate()
+                .expect_err("invalid terminal field must reject draft");
+            assert!(!format!("{error:?}").contains("private-argument"));
+            assert!(
+                matches!(error, ProviderError::MalformedResponse { usage, .. }
+                if usage.prompt_tokens == Some(7) && usage.completion_tokens == Some(4))
+            );
+        }
+    }
+
+    #[test]
+    fn sse_omitted_terminal_tool_fields_retain_streamed_values() {
+        let mut state = completed_state();
+        step(
+            &mut state,
+            json!({
+                "type": "response.output_item.added",
+                "item": {"type": "function_call", "id": "i1", "call_id": "c1", "name": "test"}
+            }),
+        );
+        step(
+            &mut state,
+            json!({
+                "type": "response.function_call_arguments.done", "item_id": "i1", "arguments": "{}"
+            }),
+        );
+        step(
+            &mut state,
+            json!({
+                "type": "response.output_item.done", "item": {"type": "function_call", "id": "i1"}
+            }),
+        );
+        let parsed = state.finalize().unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(parsed.tool_calls[0].id, "c1");
+        assert_eq!(parsed.tool_calls[0].function.name, "test");
+        assert_eq!(parsed.tool_calls[0].function.arguments, "{}");
     }
 
     #[test]
@@ -1575,7 +1742,7 @@ mod tests {
     }
 
     #[test]
-    fn sse_function_call_added_skipped_when_id_or_name_empty() {
+    fn sse_function_call_added_rejects_missing_metadata() {
         let mut state = completed_state();
         step(
             &mut state,
@@ -1591,8 +1758,10 @@ mod tests {
                 "item": {"type": "function_call", "id": "i1", "call_id": "c1", "name": ""}
             }),
         );
-        let r = state.finalize().unwrap();
-        assert!(r.tool_calls.is_empty());
+        assert!(matches!(
+            state.finalize(),
+            Err(ProviderError::MalformedResponse { .. })
+        ));
     }
 
     #[test]
@@ -1622,7 +1791,7 @@ mod tests {
     }
 
     #[test]
-    fn sse_args_done_defaults_to_empty_object_when_arguments_missing() {
+    fn sse_args_done_preserves_missing_arguments_for_validation() {
         let mut state = completed_state();
         step(
             &mut state,
@@ -1639,7 +1808,11 @@ mod tests {
             }),
         );
         let r = state.finalize().unwrap();
-        assert_eq!(r.tool_calls[0].function.arguments, "{}");
+        assert!(r.tool_calls[0].function.arguments.is_empty());
+        assert!(matches!(
+            r.validate(),
+            Err(ProviderError::MalformedResponse { .. })
+        ));
     }
 
     #[test]
@@ -1840,7 +2013,7 @@ mod tests {
                     ProviderStreamEvent::TextDelta(text) => {
                         events.push(format!("text:{text}"));
                     }
-                    ProviderStreamEvent::ToolCall(_) => {}
+                    ProviderStreamEvent::ToolCall(_) | ProviderStreamEvent::DraftRejected => {}
                 },
                 1_000,
             );
@@ -2023,7 +2196,7 @@ mod tests {
     }
 
     #[test]
-    fn sse_failed_unknown_code_falls_through_to_server_error() {
+    fn sse_failed_unknown_code_is_terminal_and_sanitized() {
         let mut state = StreamState::default();
         step(
             &mut state,
@@ -2033,27 +2206,35 @@ mod tests {
             }),
         );
         match state.error.unwrap() {
-            ProviderError::Server { status, body } => {
-                assert_eq!(status, 0);
-                assert_eq!(body, "oops");
-            }
-            e => panic!("expected Server, got {e:?}"),
+            ProviderError::InvalidResponse(message) => assert_eq!(message, "upstream error event"),
+            e => panic!("expected InvalidResponse, got {e:?}"),
         }
     }
 
     #[test]
-    fn sse_incomplete_sets_stream_error() {
-        let mut state = StreamState::default();
-        step(
-            &mut state,
-            json!({
-                "type": "response.incomplete",
-                "response": {"incomplete_details": {"reason": "max_output_tokens"}}
-            }),
-        );
-        match state.error.unwrap() {
-            ProviderError::Stream(message) => assert!(message.contains("max_output_tokens")),
-            e => panic!("expected Stream, got {e:?}"),
+    fn sse_incomplete_retries_only_transient_failures() {
+        for reason in ["max_output_tokens", "content_filter", "interrupted"] {
+            let mut state = StreamState::default();
+            step(
+                &mut state,
+                json!({
+                    "type": "response.incomplete",
+                    "response": {"incomplete_details": {"reason": reason}}
+                }),
+            );
+            if reason == "max_output_tokens" {
+                assert_eq!(
+                    state.finalize().unwrap().finish_reason.as_deref(),
+                    Some("length")
+                );
+            } else {
+                let error = state.error.unwrap();
+                assert!(error.to_string().contains(reason));
+                assert_eq!(
+                    crate::retry_delay_for(&error, 0, None, 0).is_some(),
+                    reason == "interrupted"
+                );
+            }
         }
     }
 
@@ -2090,7 +2271,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_filters_tool_calls_missing_call_id_or_name() {
+    fn finalize_preserves_entire_tool_batch_for_validation() {
         let mut state = StreamState {
             saw_completed: true,
             ..Default::default()
@@ -2105,8 +2286,36 @@ mod tests {
             .tool_calls
             .insert("i3".into(), ("c3".into(), "n3".into(), "{}".into()));
         let r = state.finalize().unwrap();
-        assert_eq!(r.tool_calls.len(), 1);
-        assert_eq!(r.tool_calls[0].id, "c3");
+        assert_eq!(r.tool_calls.len(), 3);
+        assert_eq!(r.tool_calls[2].id, "c3");
+        assert!(matches!(
+            r.validate(),
+            Err(ProviderError::MalformedResponse { .. })
+        ));
+    }
+
+    #[test]
+    fn missing_stream_item_id_rejects_batch_with_reported_usage() {
+        for event in ["response.output_item.added", "response.output_item.done"] {
+            let mut state = completed_state();
+            step(
+                &mut state,
+                json!({
+                    "type": event,
+                    "item": {"type": "function_call", "call_id": "call", "name": "test", "arguments": "{\"private-argument\":1}"}
+                }),
+            );
+            step(
+                &mut state,
+                json!({"type": "response.completed", "response": {"usage": {"input_tokens": 7, "output_tokens": 4}}}),
+            );
+            let error = state.finalize().err().expect("missing item id must fail");
+            assert!(!format!("{error:?}").contains("private-argument"));
+            assert!(
+                matches!(error, ProviderError::MalformedResponse { usage, .. }
+                if usage.prompt_tokens == Some(7) && usage.completion_tokens == Some(4))
+            );
+        }
     }
 
     #[test]

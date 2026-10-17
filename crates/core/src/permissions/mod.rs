@@ -176,6 +176,7 @@ pub enum ToolEffect {
         command: String,
         risk: ShellRisk,
         paths: Vec<PathEffect>,
+        commands: Vec<String>,
         opaque_commands: Vec<OpaqueShellCommand>,
     },
     Network,
@@ -203,6 +204,7 @@ pub enum PermissionRequirement {
     Command { tool: String, command: String },
     OpaqueCommand { tool: String, command: String },
     PathPrefix { dir: PathBuf },
+    UnresolvedPath { path: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -592,32 +594,85 @@ pub fn resolve_permissions(
     let PermissionRuntimePaths { cwd, home } = runtime_paths;
     let context =
         crate::worktree::project_context(cwd, Some(std::path::Path::new(&settings.worktree_root)));
-    let repository_key = context.repository_key.clone();
-    let mut policy = Permissions::from_raw_with_mode_behaviors(raw, tool_defaults, mode_behaviors);
-    policy.set_allowed_roots(context.active_root, context.allowed_roots);
-    policy.set_home(home.to_path_buf());
-    policy.set_restrict_to_workspace(settings.restrict_to_workspace);
-    if let Some(paths_fn) = paths_fn {
-        policy.set_paths_fn(paths_fn);
+    Ok(
+        PermissionContext::load(cwd, context, permission_store)?.resolve(
+            raw,
+            tool_defaults,
+            mode_behaviors,
+            settings,
+            home,
+            paths_fn,
+        ),
+    )
+}
+
+/// Filesystem-backed permission inputs. Load on a worker, then resolve Lua
+/// declarations without rediscovering Git or loading persisted grants.
+pub struct PermissionContext {
+    project: crate::worktree::ProjectContext,
+    workspace_approvals: store::CompiledApprovals,
+    repository_approvals: store::CompiledApprovals,
+    permission_store: store::PermissionStore,
+    store_generation: u64,
+    workspace: PathBuf,
+}
+
+impl PermissionContext {
+    pub fn load(
+        cwd: &Path,
+        project: crate::worktree::ProjectContext,
+        permission_store: &store::PermissionStore,
+    ) -> std::io::Result<Self> {
+        let store_generation = permission_store.generation();
+        let workspace_approvals = permission_store
+            .load_approvals(&cwd.to_string_lossy(), store::PersistenceScope::Workspace)?;
+        let repository_approvals = if let Some(key) = project.repository_key.as_deref() {
+            permission_store
+                .load_approvals(&key.to_string_lossy(), store::PersistenceScope::Repository)?
+        } else {
+            store::CompiledApprovals::default()
+        };
+        Ok(Self {
+            project,
+            workspace_approvals,
+            repository_approvals,
+            permission_store: permission_store.clone(),
+            store_generation,
+            workspace: cwd.to_path_buf(),
+        })
     }
-    let workspace_approvals = permission_store
-        .load_approvals(&cwd.to_string_lossy(), store::PersistenceScope::Workspace)?;
-    let repository_approvals = if let Some(repository_key) = repository_key.as_deref() {
-        permission_store.load_approvals(
-            &repository_key.to_string_lossy(),
-            store::PersistenceScope::Repository,
-        )?
-    } else {
-        store::CompiledApprovals::default()
-    };
-    Ok(PermissionResolution {
-        policy,
-        workspace_approvals,
-        repository_approvals,
-        permission_store: permission_store.clone(),
-        workspace: cwd.to_path_buf(),
-        repository_key,
-    })
+
+    /// Reject prepared grants after a local grant or revocation changed the store.
+    pub fn is_current(&self) -> bool {
+        self.store_generation == self.permission_store.generation()
+    }
+
+    pub fn resolve(
+        self,
+        raw: &RawPerms,
+        tool_defaults: &ToolDefaults,
+        mode_behaviors: HashMap<String, ModeBehavior>,
+        settings: &crate::config::ResolvedSettings,
+        home: &Path,
+        paths_fn: Option<Arc<PathsFn>>,
+    ) -> PermissionResolution {
+        let mut policy =
+            Permissions::from_raw_with_mode_behaviors(raw, tool_defaults, mode_behaviors);
+        policy.set_allowed_roots(self.project.active_root, self.project.allowed_roots);
+        policy.set_home(home.to_path_buf());
+        policy.set_restrict_to_workspace(settings.restrict_to_workspace);
+        if let Some(paths_fn) = paths_fn {
+            policy.set_paths_fn(paths_fn);
+        }
+        PermissionResolution {
+            policy,
+            workspace_approvals: self.workspace_approvals,
+            repository_approvals: self.repository_approvals,
+            permission_store: self.permission_store,
+            workspace: self.workspace,
+            repository_key: self.project.repository_key,
+        }
+    }
 }
 
 impl std::fmt::Debug for Permissions {
@@ -671,7 +726,7 @@ impl Permissions {
                 build_mode(&merge_mode(def, &raw_mode), &mode, behavior, tool_defaults),
             );
         }
-        Self {
+        let mut permissions = Self {
             modes,
             mode_behaviors,
             restrict_to_workspace: true,
@@ -683,7 +738,9 @@ impl Permissions {
             tool_effects: tool_defaults.tool_effects.clone(),
             subpattern_parsers: tool_defaults.subpattern_parsers.clone(),
             approvals: Arc::new(RwLock::new(RuntimeApprovals::new())),
-        }
+        };
+        permissions.set_home(permissions.home.clone());
+        permissions
     }
 
     /// Create a clone with per-turn permission overrides layered on top.
@@ -733,6 +790,17 @@ impl Permissions {
 
     fn set_home(&mut self, home: PathBuf) {
         self.home = home;
+        for mode in self.modes.values_mut() {
+            mode.resolved_paths = mode
+                .allowed_paths
+                .iter()
+                .filter_map(|path| {
+                    workspace::resolve_approval_path_from(path, &self.home)
+                        .resolved()
+                        .map(Path::to_path_buf)
+                })
+                .collect();
+        }
     }
 
     pub fn set_allowed_roots(&mut self, active: PathBuf, roots: Vec<PathBuf>) {
@@ -868,6 +936,7 @@ impl Permissions {
                     command,
                     risk: analysis.risk,
                     paths: analysis.paths,
+                    commands: analysis.commands,
                     opaque_commands: analysis.opaque_commands,
                 }];
                 if args
@@ -919,11 +988,23 @@ impl Permissions {
                     .iter()
                     .filter_map(PathResolution::resolved)
                     .any(|root| path.starts_with(root))
+                    || self.mode_perms(mode).is_some_and(|perms| {
+                        perms
+                            .resolved_paths
+                            .iter()
+                            .any(|prefix| path.starts_with(prefix))
+                    })
             }) {
                 continue;
             }
-            let dir = display_dir_for_effect(effect);
-            let req = PermissionRequirement::PathPrefix { dir };
+            let req = match &effect.resolution {
+                PathResolution::Resolved(_) => PermissionRequirement::PathPrefix {
+                    dir: display_dir_for_effect(effect),
+                },
+                PathResolution::Unresolved(path) => {
+                    PermissionRequirement::UnresolvedPath { path: path.clone() }
+                }
+            };
             if !out
                 .iter()
                 .any(|existing| requirements_equivalent(existing, &req))
@@ -1208,7 +1289,8 @@ impl Permissions {
                     grants.push(vec![PermissionGrant::PathPrefix { dir: dir.clone() }]);
                 }
                 PermissionRequirement::Command { .. }
-                | PermissionRequirement::OpaqueCommand { .. } => {}
+                | PermissionRequirement::OpaqueCommand { .. }
+                | PermissionRequirement::UnresolvedPath { .. } => {}
             }
         }
 
@@ -1304,13 +1386,13 @@ pub(super) fn command_patterns_satisfy(
         return command_text_satisfied(command, patterns, config_subpatterns);
     }
 
-    let subcommands = split_shell_commands(command);
-    if subcommands.is_empty() {
+    let analysis = bash::analyze_shell_command(command, Path::new(""));
+    if analysis.commands.is_empty() {
         return false;
     }
 
     let mut checked_command = false;
-    for subcommand in subcommands {
+    for subcommand in analysis.commands {
         if is_cd_command(&subcommand) {
             continue;
         }
@@ -1386,18 +1468,6 @@ fn dedupe_requirements(requirements: &mut Vec<PermissionRequirement>) {
 
 fn display_dir_for_effect(effect: &PathEffect) -> PathBuf {
     let path = effect.resolution.path();
-    if !effect.resolution.is_resolved() {
-        let absolute = if path.is_absolute() {
-            path
-        } else {
-            &effect.base_dir
-        };
-        return absolute
-            .ancestors()
-            .last()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_default();
-    }
     if effect.target_kind == PathTargetKind::Directory || path.is_dir() {
         return path.to_path_buf();
     }
@@ -1467,7 +1537,14 @@ fn bash_evaluation(
     let command = args.get("command").and_then(Value::as_str).unwrap_or("");
     let pattern = permissions
         .subcommand_ruleset(mode.clone(), "bash")
-        .and_then(|rs| shell_parser_decide_match(rs, command));
+        .and_then(|rs| {
+            effects.iter().find_map(|effect| match effect {
+                ToolEffect::Shell { commands, .. } => {
+                    shell_parser_decide_commands(rs, command, commands)
+                }
+                _ => None,
+            })
+        });
     if pattern == Some(Decision::Deny) {
         return BaseEvaluation {
             decision: Decision::Deny,
@@ -1576,7 +1653,7 @@ fn path_grant_satisfied(
     dir: &std::path::Path,
     approvals: &RuntimeApprovals,
 ) -> bool {
-    if path.access == PathAccess::Unknown {
+    if path.access == PathAccess::Unknown || !path.resolution.is_resolved() {
         return false;
     }
     let effect_dir = display_dir_for_effect(path);
@@ -1616,9 +1693,17 @@ pub fn shell_parser_decide(rs: &RuleSet, command: &str, _mode: AgentMode) -> Dec
 }
 
 fn shell_parser_decide_match(rs: &RuleSet, command: &str) -> Option<Decision> {
-    let command = smelt_buffer::text::trim_whitespace(command);
-    let subcmds = split_shell_commands(command);
-    if subcmds.len() <= 1 {
+    let commands = bash::analyze_shell_command(command, Path::new("")).commands;
+    shell_parser_decide_commands(rs, command, &commands)
+}
+
+fn shell_parser_decide_commands(
+    rs: &RuleSet,
+    command: &str,
+    commands: &[String],
+) -> Option<Decision> {
+    if commands.len() <= 1 {
+        let command = smelt_buffer::text::trim_whitespace(command);
         if is_cd_command(command) {
             return Some(Decision::Allow);
         }
@@ -1626,11 +1711,11 @@ fn shell_parser_decide_match(rs: &RuleSet, command: &str) -> Option<Decision> {
     }
     let mut worst = None;
     let mut unmatched = false;
-    for subcmd in subcmds {
-        if is_cd_command(&subcmd) {
+    for subcmd in commands {
+        if is_cd_command(subcmd) {
             continue;
         }
-        let Some(d) = check_ruleset_match(rs, &subcmd) else {
+        let Some(d) = check_ruleset_match(rs, subcmd) else {
             unmatched = true;
             continue;
         };

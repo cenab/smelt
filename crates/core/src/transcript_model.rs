@@ -5,7 +5,7 @@
 use crate::content::tool_draft::{ToolArguments, ToolDraft, ToolDraftAppend};
 use crate::paused_timer::PausedTimer;
 use crate::permissions::PermissionGrant;
-use crate::transcript_content::{ContentId, ContentStore, TranscriptContent};
+use crate::transcript_content::{ContentId, ContentStore, SharedContentSlice, TranscriptContent};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -789,8 +789,13 @@ impl TranscriptPatch {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BlockOrigin {
+    /// Visible input whose preparation has not yet entered canonical history.
+    #[serde(skip)]
+    Accepted,
     History(usize),
-    Checkpoint { history_index: usize },
+    Checkpoint {
+        history_index: usize,
+    },
 }
 
 /// How the block is presented in the transcript. Independent of [`Status`] -
@@ -937,6 +942,88 @@ pub struct TranscriptBlockRecord {
 pub struct TranscriptBlockRecordWithId {
     pub block_id: BlockId,
     pub record: TranscriptBlockRecord,
+}
+
+/// An immutable record capture whose streaming hash can be prepared off the UI.
+/// The captured block shares immutable text bodies, not mutable transcript entries.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapturedTranscriptBlockRecord {
+    record: TranscriptBlockRecordWithId,
+    contents: Vec<Vec<SharedContentSlice>>,
+    hash_pending: bool,
+}
+
+impl CapturedTranscriptBlockRecord {
+    fn capture(mut record: TranscriptBlockRecordWithId, hash_pending: bool) -> Self {
+        let mut contents = Vec::new();
+        visit_record_contents_mut(&mut record.record, |content| {
+            contents.push(content.read().chunks().to_vec());
+            *content = TranscriptContent::new();
+        });
+        Self {
+            record,
+            contents,
+            hash_pending,
+        }
+    }
+
+    pub fn prepare(mut self) -> TranscriptBlockRecordWithId {
+        let mut contents = self.contents.into_iter();
+        visit_record_contents_mut(&mut self.record.record, |content| {
+            *content = TranscriptContent::new();
+            for chunk in contents.next().expect("captured content channel") {
+                content.append_shared(chunk);
+            }
+        });
+        debug_assert!(contents.next().is_none());
+        if self.hash_pending {
+            self.record.record.content_hash = self.record.record.block.content_hash();
+        }
+        self.record
+    }
+}
+
+fn visit_record_contents_mut(
+    record: &mut TranscriptBlockRecord,
+    mut visit: impl FnMut(&mut TranscriptContent),
+) {
+    match &mut record.block {
+        Block::Text { content } | Block::Thinking { content, .. } => visit(content),
+        Block::ProcessStatus { output, .. } => {
+            if let Some(output) = output {
+                visit(output);
+            }
+        }
+        Block::ToolDraft(draft) => {
+            visit(&mut draft.raw_arguments);
+            for content in draft.arguments.contents_mut() {
+                visit(content);
+            }
+        }
+        Block::ToolCall { args, .. } => {
+            for content in args.contents_mut() {
+                visit(content);
+            }
+        }
+        Block::Exec { output, .. } => visit(output),
+        Block::User { .. }
+        | Block::Mode { .. }
+        | Block::CodeLine { .. }
+        | Block::Compacted { .. }
+        | Block::CompactionPreview { .. } => {}
+    }
+    if let Some(state) = &mut record.tool_state {
+        for output in state
+            .output
+            .iter_mut()
+            .chain(state.preview_output.iter_mut())
+        {
+            visit(&mut output.content);
+            for field in &mut output.content_fields {
+                visit(&mut field.content);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2271,10 +2358,13 @@ impl BlockEntry {
             Self::Stored(stored) => {
                 stored.kind != StoredBlockKind::CompactionPreview && !stored.tool_draft
             }
-            Self::Live(live) => !matches!(
-                live.block,
-                Block::ToolDraft(_) | Block::CompactionPreview { .. }
-            ),
+            Self::Live(live) => {
+                live.metadata.origin != Some(BlockOrigin::Accepted)
+                    && !matches!(
+                        live.block,
+                        Block::ToolDraft(_) | Block::CompactionPreview { .. }
+                    )
+            }
             Self::Hydrated { block, .. } => !matches!(
                 block.as_ref(),
                 Block::ToolDraft(_) | Block::CompactionPreview { .. }
@@ -3049,27 +3139,58 @@ impl BlockHistory {
             .collect()
     }
 
+    pub fn capture_block_records_with_ids_from(
+        &self,
+        start: usize,
+    ) -> Vec<CapturedTranscriptBlockRecord> {
+        self.order
+            .iter()
+            .skip(start.min(self.order.len()))
+            .filter_map(|id| self.capture_block_record_with_id(*id))
+            .collect()
+    }
+
     fn block_record_with_id(&self, id: BlockId) -> Option<TranscriptBlockRecordWithId> {
+        let (mut record, hash_pending) = self.record_snapshot_with_id(id)?;
+        if hash_pending {
+            record.record.content_hash = record.record.block.content_hash();
+        }
+        Some(record)
+    }
+
+    fn capture_block_record_with_id(&self, id: BlockId) -> Option<CapturedTranscriptBlockRecord> {
+        let (record, hash_pending) = self.record_snapshot_with_id(id)?;
+        Some(CapturedTranscriptBlockRecord::capture(record, hash_pending))
+    }
+
+    fn record_snapshot_with_id(&self, id: BlockId) -> Option<(TranscriptBlockRecordWithId, bool)> {
         let entry = self.entries.get(&id)?;
         if !entry.is_persisted_block() {
             return None;
         }
         let block = entry.cloned_block()?;
-        let content_hash = match entry {
-            BlockEntry::Live(_) => block.content_hash(),
-            BlockEntry::Stored(stored) | BlockEntry::Hydrated { stored, .. } => stored.content_hash,
+        let (content_hash, hash_pending) = match entry {
+            BlockEntry::Live(live) => {
+                (live.metadata.content_hash, live.metadata.live_revision != 0)
+            }
+            BlockEntry::Stored(stored) | BlockEntry::Hydrated { stored, .. } => {
+                (stored.content_hash, false)
+            }
         };
         let tool_state = self.tool_state(id).cloned();
-        Some(TranscriptBlockRecordWithId {
-            block_id: id,
-            record: TranscriptBlockRecord {
-                block,
-                content_hash,
-                origin: self.block_origin(id),
-                tool_state,
-                tool_render_revision: self.sidecar_hash(id),
+        Some((
+            TranscriptBlockRecordWithId {
+                block_id: id,
+                record: TranscriptBlockRecord {
+                    block,
+                    content_hash,
+                    origin: self.block_origin(id),
+                    tool_state,
+                    tool_render_revision: self.sidecar_hash(id),
+                },
             },
-        })
+            hash_pending,
+        ))
     }
 
     pub fn stored_ref_for_materialized(
@@ -3653,8 +3774,57 @@ impl BlockHistory {
         self.add_block(None, block, None)
     }
 
+    pub(crate) fn insert_before(&mut self, before: BlockId, block: Block) -> Option<BlockId> {
+        let index = self.order_index(before)?;
+        Some(self.add_block(Some(index), block, None))
+    }
+
     pub(crate) fn push_with_origin(&mut self, block: Block, origin: BlockOrigin) -> BlockId {
         self.add_block(None, block, Some(origin))
+    }
+
+    /// Promote the accepted display in place, preserving its block identity.
+    pub fn promote_accepted(&mut self, id: BlockId, history_index: usize) -> bool {
+        if self.block_origin(id) != Some(BlockOrigin::Accepted) {
+            return false;
+        }
+        let Some(mut entry) = self.remove_entry(id) else {
+            return false;
+        };
+        let BlockEntry::Live(live) = &mut entry else {
+            unreachable!("accepted block must be live");
+        };
+        live.metadata.origin = Some(BlockOrigin::History(history_index));
+        self.insert_entry(id, entry);
+        self.bump_generation();
+        self.bump_navigation_generation();
+        self.mark_record_dirty_for_id(id);
+        self.record_patch(
+            vec![TranscriptPatchOperation::Replace { id }],
+            true,
+            true,
+            true,
+        );
+        true
+    }
+
+    pub fn remove_accepted(&mut self, id: BlockId) -> bool {
+        if self.block_origin(id) != Some(BlockOrigin::Accepted) {
+            return false;
+        }
+        self.remove_block(id);
+        true
+    }
+
+    /// Remove a staged user display without truncating later callback blocks.
+    pub fn remove_submitted_user(&mut self, id: BlockId, history_index: usize) -> bool {
+        if self.block_origin(id) != Some(BlockOrigin::History(history_index))
+            || !matches!(self.block(id), Some(Block::User { .. }))
+        {
+            return false;
+        }
+        self.remove_block(id);
+        true
     }
 
     pub fn push_hydrated_block_with_origin(
@@ -4454,6 +4624,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn accepted_origin_cannot_enter_serialized_transcript_records() {
+        assert!(serde_json::to_value(BlockOrigin::Accepted).is_err());
+        assert!(serde_json::from_str::<BlockOrigin>(r#""Accepted""#).is_err());
+    }
+
+    #[test]
     fn checkpoint_marker_origin_round_trips_with_history_boundary() {
         let origin = BlockOrigin::Checkpoint { history_index: 7 };
         let encoded = serde_json::to_value(origin).unwrap();
@@ -5137,6 +5313,113 @@ mod tests {
     }
 
     #[test]
+    fn record_projection_of_unchanged_live_content_has_body_independent_allocations() {
+        smelt_perf::alloc::enable();
+        for body_bytes in [128, 32_768, 1_048_576] {
+            let mut history = BlockHistory::new();
+            let id = history.push(Block::Text {
+                content: "x".repeat(body_bytes).into(),
+            });
+            let before = smelt_perf::alloc::thread_snapshot().1;
+            let record = history.block_record_with_id(id).unwrap();
+            let allocated = smelt_perf::alloc::thread_snapshot().1 - before;
+            assert!(
+                allocated < 65_536,
+                "capturing {body_bytes} bytes allocated {allocated} bytes"
+            );
+            assert_eq!(record.record.content_hash, history.content_hash(id));
+        }
+    }
+
+    #[test]
+    fn record_capture_freezes_tool_arguments_output_fields_and_preview_channels() {
+        let mut arguments = HashMap::new();
+        arguments.insert("command".into(), serde_json::json!("captured command 界"));
+        let output = || {
+            Box::new(ToolOutput::from_display_content(
+                "captured output é",
+                false,
+                Some(serde_json::json!({"count": 7})),
+                vec![protocol::ToolDisplayContent {
+                    name: "detail".into(),
+                    content: Arc::new("captured detail".to_owned()),
+                }],
+            ))
+        };
+        let mut original = TranscriptBlockRecordWithId {
+            block_id: BlockId::new(1),
+            record: TranscriptBlockRecord {
+                block: Block::ToolCall {
+                    call_id: "call-1".into(),
+                    name: "bash".into(),
+                    summary: protocol::StyledLines::default(),
+                    args: arguments.into(),
+                },
+                content_hash: 0,
+                origin: Some(BlockOrigin::History(1)),
+                tool_state: Some(ToolState {
+                    status: ToolStatus::Pending,
+                    elapsed: None,
+                    called_at_ms: None,
+                    elapsed_active: false,
+                    output: Some(output()),
+                    user_message: Some("captured message".into()),
+                    preview_output: Some(output()),
+                }),
+                tool_render_revision: 3,
+            },
+        };
+        let capture = CapturedTranscriptBlockRecord::capture(original.clone(), true);
+        let expected = capture.clone().prepare();
+        visit_record_contents_mut(&mut original.record, |content| {
+            content.push_str(" later append");
+            content.truncate(1);
+            content.push_str(" replacement");
+        });
+        assert_eq!(capture.clone().prepare(), expected);
+        assert_eq!(capture.prepare(), expected);
+        assert_ne!(
+            original.record.block.content_hash(),
+            expected.record.content_hash
+        );
+    }
+
+    #[test]
+    fn streaming_record_capture_is_body_independent_and_freezes_content_for_hashing() {
+        smelt_perf::alloc::enable();
+        for body_bytes in [128, 32_768, 1_048_576] {
+            let mut history = BlockHistory::new();
+            let id = history.push(Block::Text {
+                content: "start".into(),
+            });
+            history.set_status(id, Status::Streaming);
+            history.append_live_text_segments(id, ["x".repeat(body_bytes).as_str()]);
+            let before = smelt_perf::alloc::thread_snapshot().1;
+            let capture = history.capture_block_record_with_id(id).unwrap();
+            let allocated = smelt_perf::alloc::thread_snapshot().1 - before;
+            assert!(
+                allocated < 65_536,
+                "capturing {body_bytes} streaming bytes allocated {allocated} bytes"
+            );
+            assert!(capture.hash_pending);
+            history.append_live_text_segments(id, ["newer output"]);
+            let record = capture.prepare();
+            assert_eq!(
+                record.record.block.raw_text().unwrap(),
+                format!("start{}", "x".repeat(body_bytes))
+            );
+            assert_eq!(
+                record.record.content_hash,
+                record.record.block.content_hash()
+            );
+            assert_ne!(
+                record.record.content_hash,
+                history.block(id).unwrap().content_hash()
+            );
+        }
+    }
+
+    #[test]
     fn append_live_text_emits_precise_patch_and_hashes_on_commit() {
         let mut history = BlockHistory::new();
         let id = history.push(Block::Text {
@@ -5164,6 +5447,12 @@ mod tests {
             Some("hello world".into())
         );
         assert_eq!(history.content_hash(id), canonical_before);
+        let streaming_record = history.block_record_with_id(id).unwrap();
+        assert_eq!(
+            streaming_record.record.content_hash,
+            streaming_record.record.block.content_hash()
+        );
+        assert_ne!(streaming_record.record.content_hash, canonical_before);
         assert_ne!(
             history.resolve_key(
                 id,
@@ -6661,6 +6950,43 @@ mod tests {
         let navigation_generation = history.navigation_generation();
         history.truncate(1);
         assert_ne!(history.navigation_generation(), navigation_generation);
+    }
+
+    #[test]
+    fn accepted_display_promotion_and_removal_preserve_persistence_bookkeeping() {
+        let mut history = BlockHistory::new();
+        let accepted = history.push_with_origin(
+            Block::User {
+                text: "accepted input".into(),
+                image_labels: Vec::new(),
+                command: false,
+                sent_at_ms: Some(7),
+            },
+            BlockOrigin::Accepted,
+        );
+        let callback = history.push(Block::Text {
+            content: "callback display".into(),
+        });
+        assert_eq!(history.persisted_block_count(), 1);
+        assert!(!history.is_persisted_block(accepted));
+        assert_eq!(history.block_records().len(), 1);
+        let generation = history.generation();
+        let navigation = history.navigation_generation();
+        assert!(history.promote_accepted(accepted, 3));
+        assert_ne!(history.generation(), generation);
+        assert_ne!(history.navigation_generation(), navigation);
+        assert_eq!(history.order, vec![accepted, callback]);
+        assert_eq!(history.persisted_block_count(), 2);
+        assert!(history.is_persisted_block(accepted));
+        assert_eq!(history.block_records().len(), 2);
+        assert!(!history.promote_accepted(accepted, 4));
+        assert!(!history.remove_accepted(accepted));
+        assert!(!history.remove_submitted_user(accepted, 4));
+        assert!(!history.remove_submitted_user(callback, 3));
+        assert!(history.remove_submitted_user(accepted, 3));
+        assert_eq!(history.order, vec![callback]);
+        assert_eq!(history.persisted_block_count(), 1);
+        assert_eq!(history.block_records().len(), 1);
     }
 
     #[test]

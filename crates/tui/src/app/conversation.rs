@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+use super::stream_animation::{StreamAnimation, StreamKind};
+
 use super::{
     agent::TurnLifecycle, session_document::TuiSessionDocument, transcript::ResumePreviewCache,
     CommittedTranscriptView, SessionAccess, SessionPersistence, SharedSessionState,
@@ -27,7 +29,6 @@ pub(crate) enum PersistenceFailureTarget {
 }
 
 pub(crate) enum CanonicalTurnSubmitOutcome {
-    Durable(Box<crate::persist::SubmitTurnAcknowledgement>),
     PendingPersistence {
         command_id: crate::persist::CanonicalCommandId,
         generation: super::session_document::PersistenceGeneration,
@@ -39,20 +40,12 @@ pub(crate) enum CanonicalTurnSubmitOutcome {
 
 pub(crate) enum CanonicalOperationEvent {
     Submit(CanonicalTurnSubmitOutcome),
-    TransitionDurable(Box<crate::persist::TurnTransitionAcknowledgement>),
     Failed {
         command_id: crate::persist::CanonicalCommandId,
         cause: crate::persist::PersistenceCause,
     },
 }
 
-#[derive(Clone, Copy)]
-enum CanonicalTransitionDispatch {
-    Enqueue,
-    Commit,
-}
-
-#[derive(Clone)]
 enum CanonicalOperationPayload {
     Submit {
         metadata: super::session_document::RuntimeSessionMetadata,
@@ -64,14 +57,13 @@ enum CanonicalOperationPayload {
         state: smelt_store::TurnState,
         at_ms: u64,
         terminal_reason: Option<String>,
-        dispatch: CanonicalTransitionDispatch,
     },
 }
 
-#[derive(Clone)]
 struct CanonicalOperation {
     command_id: crate::persist::CanonicalCommandId,
     payload: CanonicalOperationPayload,
+    prepared: Option<super::session_document::SessionBatch>,
 }
 
 #[derive(Clone, Copy)]
@@ -86,7 +78,6 @@ enum InflightCanonicalCommand {
 enum CanonicalOperationProgress {
     DeferredPreparation,
     Submit(CanonicalTurnSubmitOutcome),
-    TransitionDurable(Box<crate::persist::TurnTransitionAcknowledgement>),
     Queued,
 }
 
@@ -107,6 +98,28 @@ struct PersistencePreparationBlock {
     cause: crate::persist::PersistenceCause,
 }
 
+#[derive(Default)]
+struct ToolDraftAnimation {
+    animation: StreamAnimation,
+    call_id: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Default)]
+struct SummaryAnimation {
+    animation: StreamAnimation,
+    visible: String,
+    title: Option<String>,
+    previous: Option<super::transcript::ReasoningSummarySnapshot>,
+}
+
+struct SummaryPart {
+    id: String,
+    block_id: Option<smelt_core::transcript_model::BlockId>,
+    after: Option<smelt_core::transcript_model::BlockId>,
+    animation: Option<SummaryAnimation>,
+}
+
 /// Owns canonical conversation state and the runtime machinery that keeps its
 /// session, transcript, turn, and durable store projections aligned.
 pub(crate) struct ConversationRuntime {
@@ -114,12 +127,21 @@ pub(crate) struct ConversationRuntime {
     document: TuiSessionDocument,
     committed_transcript_view: Option<CommittedTranscriptView>,
     parser: smelt_core::content::stream_parser::StreamParser,
+    stream_animation: StreamAnimation,
+    tool_draft_animations: std::collections::HashMap<String, ToolDraftAnimation>,
+    // Keep completed slots until response acceptance so delayed parts retain their position.
+    summary_parts: Vec<SummaryPart>,
+    compaction_animation: StreamAnimation,
+    compaction_source: String,
+    compaction_visible: String,
+    response_draft_blocks: Vec<smelt_core::transcript_model::BlockId>,
     /// Earliest canonical suffix whose transcript projection must be rebuilt
     /// after live stream-parser blocks finish.
     pending_transcript_history_rebuild_from: Option<usize>,
     resume_preview_cache: ResumePreviewCache,
     shared_session: Arc<Mutex<Option<SharedSessionState>>>,
     turn: TurnLifecycle,
+    pub(super) submissions: super::agent::TurnSubmissions,
     persistence: Option<crate::persist::SessionPersistence>,
     persistence_epoch: crate::persist::SessionEpoch,
     observed_persistence_status: Option<crate::persist::SessionPersistenceStatus>,
@@ -144,15 +166,26 @@ impl ConversationRuntime {
         storage: SessionPersistence,
     ) -> Self {
         transcript.set_store_address(storage.transcript_store_address(&sessions, &session));
+        let mut document = TuiSessionDocument::new(transcript);
+        document.navigation =
+            smelt_core::session_runtime::HistoryNavigation::from_history(&session.history);
         Self {
             session,
-            document: TuiSessionDocument::new(transcript),
+            document,
             committed_transcript_view: None,
             parser: smelt_core::content::stream_parser::StreamParser::new(),
+            stream_animation: StreamAnimation::default(),
+            tool_draft_animations: Default::default(),
+            summary_parts: Default::default(),
+            compaction_animation: StreamAnimation::default(),
+            compaction_source: String::new(),
+            compaction_visible: String::new(),
+            response_draft_blocks: Vec::new(),
             pending_transcript_history_rebuild_from: None,
             resume_preview_cache,
             shared_session,
             turn,
+            submissions: Default::default(),
             persistence: None,
             persistence_epoch: crate::persist::SessionEpoch::ZERO,
             observed_persistence_status: None,
@@ -244,6 +277,10 @@ impl ConversationRuntime {
     pub(crate) fn promote_last_reasoning_summary(
         &mut self,
     ) -> Option<super::transcript::ReasoningSummarySnapshot> {
+        let id = self.document.transcript.history().last_block_id()?;
+        if !self.response_draft_blocks.contains(&id) {
+            return None;
+        }
         self.document.transcript.promote_last_reasoning_summary()
     }
 
@@ -847,7 +884,7 @@ impl ConversationRuntime {
     }
 
     pub(crate) fn acknowledged_head(&self) -> smelt_store::StoreHead {
-        self.document.acknowledged_head()
+        self.document.published_head()
     }
 
     pub(crate) fn persistence_generation(&self) -> super::session_document::PersistenceGeneration {
@@ -878,23 +915,23 @@ impl ConversationRuntime {
         &mut self,
         forked: &mut smelt_core::session::Session,
         metadata: super::session_document::RuntimeSessionMetadata,
-    ) -> Result<Option<super::session_document::PreparedSessionBatch>, String> {
+    ) -> Result<Option<super::session_document::ProjectedSessionSave>, String> {
         self.document
             .prepare_fork_save(forked, metadata, &self.session.history)
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn refresh_live_session_header(&mut self) {
-        let Some(live) = self.document.live_session.as_mut() else {
-            return;
-        };
-        if let Some((header, _)) = self.sessions.load_store_header_for_id(live.id()) {
-            live.replace_header(header);
-        }
-    }
-
     pub(crate) fn clear_live_session(&mut self) {
         self.document.live_session = None;
+        self.document.navigation =
+            smelt_core::session_runtime::HistoryNavigation::from_history(&self.session.history);
+    }
+
+    pub(crate) fn history_navigation(&self) -> &smelt_core::session_runtime::HistoryNavigation {
+        self.document
+            .live_session
+            .as_ref()
+            .map_or(&self.document.navigation, |live| live.navigation())
     }
 
     pub(crate) fn install_loaded_full_session(
@@ -1011,7 +1048,7 @@ impl ConversationRuntime {
                     .history_len()
                     .checked_sub(1)
                     .ok_or_else(|| "tail history mutation requires an existing item".to_string())?;
-                self.truncate_history(index, identity);
+                self.truncate_history(index, identity)?;
                 if plan == HistoryAppendPlan::ReplaceLast {
                     self.append_history_item(append.item.clone());
                 }
@@ -1044,26 +1081,52 @@ impl ConversationRuntime {
         .expect("request history commit returns its canonical index")
     }
 
+    pub(crate) fn history_user_turn_count_before(&self, index: usize) -> Result<usize, String> {
+        if let Some(live) = self.live_session() {
+            live.user_turn_count_before(index)
+        } else {
+            Ok(self
+                .history_navigation()
+                .user_turn_count_before(index.min(self.history_len())))
+        }
+    }
+
     pub(crate) fn truncate_history(
         &mut self,
         index: usize,
         identity: smelt_core::session::ContextTokenIdentity,
-    ) -> Option<protocol::TurnMeta> {
-        self.apply_history_mutation(super::session_document::HistoryMutation::TruncateFrom {
-            index,
-            identity,
-        })
-        .turn_meta
+    ) -> Result<Option<protocol::TurnMeta>, String> {
+        let user_turn_count = self.history_user_turn_count_before(index)?;
+        Ok(self
+            .apply_history_mutation(super::session_document::HistoryMutation::TruncateFrom {
+                index,
+                user_turn_count: Some(user_turn_count),
+                identity,
+            })
+            .turn_meta)
     }
 
+    #[cfg(any(test, feature = "harness"))]
     pub(crate) fn rewind_history(
         &mut self,
         index: usize,
         keep_checkpoint_at_boundary: bool,
         identity: smelt_core::session::ContextTokenIdentity,
+    ) -> Result<Option<protocol::TurnMeta>, String> {
+        let count = self.history_user_turn_count_before(index)?;
+        Ok(self.rewind_history_with_count(index, count, keep_checkpoint_at_boundary, identity))
+    }
+
+    pub(crate) fn rewind_history_with_count(
+        &mut self,
+        index: usize,
+        user_turn_count: usize,
+        keep_checkpoint_at_boundary: bool,
+        identity: smelt_core::session::ContextTokenIdentity,
     ) -> Option<protocol::TurnMeta> {
         self.apply_history_mutation(super::session_document::HistoryMutation::RewindTo {
             index,
+            user_turn_count: Some(user_turn_count),
             keep_checkpoint_at_boundary,
             identity,
         })
@@ -1217,7 +1280,46 @@ impl ConversationRuntime {
         .applied
     }
 
+    pub(super) fn append_accepted_block(
+        &mut self,
+        block: smelt_core::transcript_model::Block,
+    ) -> smelt_core::transcript_model::BlockId {
+        self.apply_transcript_mutation(
+            super::session_document::TranscriptMutation::AppendAccepted { block },
+        )
+        .block_id
+        .expect("accepted user block")
+    }
+
+    pub(super) fn promote_accepted_block(
+        &mut self,
+        id: smelt_core::transcript_model::BlockId,
+        history_index: usize,
+    ) -> bool {
+        self.apply_transcript_mutation(
+            super::session_document::TranscriptMutation::PromoteAccepted { id, history_index },
+        )
+        .applied
+    }
+
+    pub(super) fn remove_accepted_block(&mut self, id: smelt_core::transcript_model::BlockId) {
+        self.apply_transcript_mutation(
+            super::session_document::TranscriptMutation::RemoveAccepted { id },
+        );
+    }
+
+    pub(super) fn remove_submitted_user_block(
+        &mut self,
+        id: smelt_core::transcript_model::BlockId,
+        history_index: usize,
+    ) {
+        self.apply_transcript_mutation(
+            super::session_document::TranscriptMutation::RemoveSubmittedUser { id, history_index },
+        );
+    }
+
     pub(crate) fn append_block(&mut self, block: smelt_core::transcript_model::Block) -> bool {
+        self.finish_stream_animation();
         self.apply_transcript_mutation(super::session_document::TranscriptMutation::AppendBlock {
             block,
         })
@@ -1287,20 +1389,58 @@ impl ConversationRuntime {
         self.clear_pending_history_appends();
         self.clear_pending_transcript_history_rebuild();
         self.apply_transcript_mutation(super::session_document::TranscriptMutation::Clear);
-        self.parser.clear();
+        self.clear_stream_parser();
     }
 
     pub(crate) fn update_compaction_preview(
         &mut self,
         summary: String,
+        arrived_at: std::time::Instant,
     ) -> Option<smelt_core::transcript_model::BlockId> {
+        let replaced = !summary.starts_with(&self.compaction_source);
+        if replaced {
+            self.compaction_animation.clear();
+            self.compaction_source.clear();
+            self.compaction_visible.clear();
+        }
+        let delta =
+            smelt_buffer::text::slice(&summary, self.compaction_source.len()..summary.len())
+                .to_string();
+        self.compaction_source = summary;
+        let visible = self
+            .compaction_animation
+            .push(StreamKind::Text, delta, arrived_at);
+        self.compaction_visible.push_str(&visible);
+        if visible.is_empty() && !replaced {
+            if let Some(id) = self.document.transcript.compaction_preview_id() {
+                return Some(id);
+            }
+        }
+        self.apply_compaction_preview()
+    }
+
+    fn apply_compaction_preview(&mut self) -> Option<smelt_core::transcript_model::BlockId> {
         self.apply_transcript_mutation(
-            super::session_document::TranscriptMutation::UpdateCompactionPreview { summary },
+            super::session_document::TranscriptMutation::UpdateCompactionPreview {
+                summary: self.compaction_visible.clone(),
+            },
         )
         .block_id
     }
 
+    pub(super) fn advance_compaction_animation(&mut self, now: std::time::Instant) -> bool {
+        let delta = self.compaction_animation.advance(now);
+        if !delta.is_empty() {
+            self.compaction_visible.push_str(&delta);
+            self.apply_compaction_preview();
+        }
+        self.compaction_animation.is_pending()
+    }
+
     pub(crate) fn clear_compaction_preview(&mut self) {
+        self.compaction_animation.clear();
+        self.compaction_source.clear();
+        self.compaction_visible.clear();
         self.apply_transcript_mutation(
             super::session_document::TranscriptMutation::ClearCompactionPreview,
         );
@@ -1318,21 +1458,257 @@ impl ConversationRuntime {
         .applied
     }
 
-    pub(crate) fn append_streaming_thinking(&mut self, delta: String) {
-        self.apply_stream_mutation(super::session_document::StreamMutation::AppendThinking {
-            delta,
+    pub(super) fn start_summary_part(&mut self, id: String) -> usize {
+        if let Some(index) = self.summary_parts.iter().position(|part| part.id == id) {
+            return index;
+        }
+        self.flush_streaming_thinking();
+        let previous = self.promote_last_reasoning_summary().filter(|previous| {
+            !self
+                .summary_parts
+                .iter()
+                .any(|part| part.animation.is_some() && part.block_id == Some(previous.id))
         });
+        let index = self.summary_parts.len();
+        self.summary_parts.push(SummaryPart {
+            id,
+            block_id: previous.as_ref().map(|previous| previous.id),
+            after: self.document.transcript.history().last_block_id(),
+            animation: Some(SummaryAnimation {
+                previous,
+                ..Default::default()
+            }),
+        });
+        index
+    }
+
+    pub(super) fn queue_summary_delta(
+        &mut self,
+        id: String,
+        title: Option<String>,
+        delta: String,
+        arrived_at: std::time::Instant,
+    ) -> bool {
+        if delta.is_empty() {
+            return false;
+        }
+        let index = self.start_summary_part(id);
+        let mut parts = std::mem::take(&mut self.summary_parts);
+        let pending = if let Some(state) = parts[index].animation.as_mut() {
+            let title_changed = title
+                .as_ref()
+                .is_some_and(|title| state.title.as_ref() != Some(title));
+            if title.is_some() {
+                state.title = title;
+            }
+            let visible = state
+                .animation
+                .push(StreamKind::Thinking, delta, arrived_at);
+            state.visible.push_str(&visible);
+            let pending = state.animation.is_pending();
+            if !visible.is_empty() || title_changed {
+                self.render_summary_prefix(
+                    &mut parts,
+                    index,
+                    engine::ReasoningSummaryPhase::Streaming,
+                );
+            }
+            pending
+        } else {
+            false
+        };
+        self.summary_parts = parts;
+        pending
+    }
+
+    fn render_summary_prefix(
+        &mut self,
+        parts: &mut [SummaryPart],
+        index: usize,
+        phase: engine::ReasoningSummaryPhase,
+    ) {
+        let Some(state) = parts[index].animation.as_ref() else {
+            return;
+        };
+        let (mut title, body) = engine::normalize_reasoning_summary(&state.visible, phase);
+        if phase == engine::ReasoningSummaryPhase::Streaming {
+            title = title.or_else(|| state.title.clone());
+        }
+        self.render_summary(parts, index, title, &body);
+    }
+
+    fn render_summary(
+        &mut self,
+        parts: &mut [SummaryPart],
+        index: usize,
+        title: Option<String>,
+        body: &str,
+    ) {
+        let part = &parts[index];
+        if part.block_id.is_none() && title.is_none() && body.is_empty() {
+            return;
+        }
+        let previous = part
+            .animation
+            .as_ref()
+            .and_then(|state| state.previous.as_ref());
+        let block = super::transcript::reasoning_summary_block(previous, title, body);
+        if let Some(id) = part.block_id {
+            self.rewrite_block(id, block);
+        } else {
+            let predecessor = parts[..index].iter().rev().find_map(|part| part.block_id);
+            let history = self.document.transcript.history();
+            let position = [predecessor, part.after]
+                .into_iter()
+                .flatten()
+                .filter_map(|id| history.order.iter().position(|candidate| *candidate == id))
+                .max()
+                .map_or(0, |index| index + 1);
+            let mutation = if let Some(before) = history.order.get(position).copied() {
+                super::session_document::TranscriptMutation::InsertBlockBefore { before, block }
+            } else {
+                super::session_document::TranscriptMutation::AppendBlock { block }
+            };
+            if let Some(id) = self.apply_transcript_mutation(mutation).block_id {
+                parts[index].block_id = Some(id);
+                self.response_draft_blocks.push(id);
+            }
+        }
+    }
+
+    pub(super) fn finish_summary_part(
+        &mut self,
+        id: &str,
+        title: Option<&str>,
+        content: &str,
+    ) -> bool {
+        let Some(index) = self.summary_parts.iter().position(|part| part.id == id) else {
+            return false;
+        };
+        let mut parts = std::mem::take(&mut self.summary_parts);
+        if parts[index].animation.is_some() {
+            self.render_summary(&mut parts, index, title.map(str::to_string), content);
+            parts[index].animation = None;
+        }
+        self.summary_parts = parts;
+        true
+    }
+
+    fn advance_summary_parts(&mut self, now: std::time::Instant) -> bool {
+        let mut parts = std::mem::take(&mut self.summary_parts);
+        let mut pending = false;
+        for index in 0..parts.len() {
+            let Some(state) = parts[index].animation.as_mut() else {
+                continue;
+            };
+            let delta = state.animation.advance(now);
+            pending |= state.animation.is_pending();
+            if !delta.is_empty() {
+                state.visible.push_str(&delta);
+                self.render_summary_prefix(
+                    &mut parts,
+                    index,
+                    engine::ReasoningSummaryPhase::Streaming,
+                );
+            }
+        }
+        self.summary_parts = parts;
+        pending
+    }
+
+    fn finish_summary_parts(&mut self) {
+        let mut parts = std::mem::take(&mut self.summary_parts);
+        for index in 0..parts.len() {
+            let Some(state) = parts[index].animation.as_mut() else {
+                continue;
+            };
+            if let Some((_, delta)) = state.animation.finish() {
+                state.visible.push_str(&delta);
+                self.render_summary_prefix(
+                    &mut parts,
+                    index,
+                    engine::ReasoningSummaryPhase::Finished,
+                );
+            }
+        }
+        self.summary_parts = parts;
+    }
+
+    pub(super) fn queue_stream_delta(
+        &mut self,
+        kind: StreamKind,
+        text: String,
+        arrived_at: std::time::Instant,
+    ) -> bool {
+        if text.is_empty() {
+            return self.stream_animation.is_pending();
+        }
+        if kind == StreamKind::Text {
+            self.finish_summary_parts();
+        }
+        if self
+            .stream_animation
+            .kind()
+            .is_some_and(|active| active != kind)
+        {
+            self.finish_stream_animation();
+        }
+        let delta = self.stream_animation.push(kind, text, arrived_at);
+        self.apply_animated_delta(kind, delta);
+        self.stream_animation.is_pending()
+    }
+
+    pub(super) fn advance_stream_animation(&mut self, now: std::time::Instant) -> bool {
+        if let Some(kind) = self.stream_animation.kind() {
+            let delta = self.stream_animation.advance(now);
+            self.apply_animated_delta(kind, delta);
+        }
+        let summary_pending = self.advance_summary_parts(now);
+        self.stream_animation.is_pending() || summary_pending
+    }
+
+    pub(super) fn finish_stream_animation(&mut self) {
+        if let Some((kind, delta)) = self.stream_animation.finish() {
+            self.apply_animated_delta(kind, delta);
+        }
+        self.finish_summary_parts();
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_pending_stream_animation(&self) -> bool {
+        self.stream_animation.is_pending()
+            || self.has_pending_tool_draft_animation()
+            || self.summary_parts.iter().any(|part| {
+                part.animation
+                    .as_ref()
+                    .is_some_and(|state| state.animation.is_pending())
+            })
+    }
+
+    fn apply_animated_delta(&mut self, kind: StreamKind, delta: String) {
+        use super::session_document::StreamMutation;
+
+        if delta.is_empty() {
+            return;
+        }
+        let first = self.response_draft_boundary();
+        self.apply_stream_mutation(match kind {
+            StreamKind::Text => StreamMutation::AppendText { delta },
+            StreamKind::Thinking => StreamMutation::AppendThinking { delta },
+        });
+        self.track_response_draft_from(first);
     }
 
     pub(crate) fn flush_streaming_thinking(&mut self) {
+        if self.stream_animation.kind() == Some(StreamKind::Thinking) {
+            self.finish_stream_animation();
+        }
         self.apply_stream_mutation(super::session_document::StreamMutation::FlushThinking);
     }
 
-    pub(crate) fn append_streaming_text(&mut self, delta: String) {
-        self.apply_stream_mutation(super::session_document::StreamMutation::AppendText { delta });
-    }
-
     pub(crate) fn flush_streaming_text(&mut self) {
+        self.finish_stream_animation();
+        self.finish_tool_draft_animations();
         self.apply_stream_mutation(super::session_document::StreamMutation::FlushText);
     }
 
@@ -1347,6 +1723,7 @@ impl ConversationRuntime {
         start: smelt_core::content::stream_parser::ToolStart,
         now: std::time::Instant,
     ) {
+        self.finish_stream_animation();
         self.apply_stream_mutation(super::session_document::StreamMutation::StartTool {
             start,
             now,
@@ -1477,6 +1854,10 @@ impl ConversationRuntime {
         start: smelt_core::content::stream_parser::ToolStart,
         now: std::time::Instant,
     ) -> bool {
+        self.finish_stream_animation();
+        if let Some(id) = &stream_id {
+            self.tool_draft_animations.remove(id);
+        }
         self.apply_stream_mutation(super::session_document::StreamMutation::PromoteToolDraft {
             stream_id,
             start,
@@ -1485,7 +1866,52 @@ impl ConversationRuntime {
         .applied
     }
 
+    pub(crate) fn response_draft_boundary(&self) -> usize {
+        self.document.transcript.history().order.len()
+    }
+
+    pub(crate) fn track_response_draft_from(&mut self, first: usize) {
+        self.response_draft_blocks.extend(
+            self.document
+                .transcript
+                .history()
+                .order
+                .iter()
+                .skip(first)
+                .copied(),
+        );
+    }
+
+    pub(crate) fn accept_response_draft(&mut self) {
+        self.flush_streaming_text();
+        self.summary_parts.clear();
+        self.response_draft_blocks.clear();
+    }
+
+    pub(crate) fn reject_response_draft(&mut self) {
+        self.stream_animation.clear();
+        self.tool_draft_animations.clear();
+        self.summary_parts.clear();
+        self.parser.clear_response_output();
+        for id in std::mem::take(&mut self.response_draft_blocks)
+            .into_iter()
+            .rev()
+        {
+            let index = self
+                .document
+                .transcript
+                .history()
+                .order
+                .iter()
+                .position(|block| *block == id);
+            if let Some(index) = index {
+                self.remove_unoriginated_block(index);
+            }
+        }
+    }
+
     pub(crate) fn clear_stream_tool_drafts(&mut self) {
+        self.tool_draft_animations.clear();
         self.apply_stream_mutation(super::session_document::StreamMutation::ClearToolDrafts);
     }
 
@@ -1495,6 +1921,14 @@ impl ConversationRuntime {
         call_id: Option<String>,
         name: Option<String>,
     ) -> Option<smelt_core::transcript_model::BlockId> {
+        self.finish_stream_animation();
+        self.tool_draft_animations
+            .entry(stream_id.clone())
+            .or_insert_with(|| ToolDraftAnimation {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                ..Default::default()
+            });
         self.apply_stream_mutation(super::session_document::StreamMutation::StartToolDraft {
             stream_id,
             call_id,
@@ -1509,7 +1943,38 @@ impl ConversationRuntime {
         call_id: Option<String>,
         name: Option<String>,
         delta: String,
+        arrived_at: std::time::Instant,
     ) -> Option<(smelt_core::transcript_model::BlockId, bool)> {
+        if !self.tool_draft_animations.contains_key(&stream_id) {
+            self.finish_stream_animation();
+        }
+        let state = self
+            .tool_draft_animations
+            .entry(stream_id.clone())
+            .or_default();
+        if call_id.is_some() {
+            state.call_id = call_id;
+        }
+        if name.is_some() {
+            state.name = name;
+        }
+        let visible = state.animation.push(StreamKind::Text, delta, arrived_at);
+        let call_id = state.call_id.clone();
+        let name = state.name.clone();
+        self.apply_tool_draft_delta(stream_id, call_id, name, visible)
+    }
+
+    fn apply_tool_draft_delta(
+        &mut self,
+        stream_id: String,
+        call_id: Option<String>,
+        name: Option<String>,
+        delta: String,
+    ) -> Option<(smelt_core::transcript_model::BlockId, bool)> {
+        if delta.is_empty() {
+            return None;
+        }
+        let first = self.response_draft_boundary();
         let change =
             self.apply_stream_mutation(super::session_document::StreamMutation::AppendToolDraft {
                 stream_id,
@@ -1517,9 +1982,45 @@ impl ConversationRuntime {
                 name,
                 delta,
             });
+        self.track_response_draft_from(first);
         change
             .block_id
             .map(|block_id| (block_id, change.presentation_changed))
+    }
+
+    pub(super) fn has_pending_tool_draft_animation(&self) -> bool {
+        self.tool_draft_animations
+            .values()
+            .any(|state| state.animation.is_pending())
+    }
+
+    pub(super) fn advance_tool_draft_animations(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Vec<smelt_core::transcript_model::BlockId> {
+        let mut states = std::mem::take(&mut self.tool_draft_animations);
+        let mut changed = Vec::new();
+        for (id, state) in &mut states {
+            let delta = state.animation.advance(now);
+            if let Some((block_id, true)) = self.apply_tool_draft_delta(
+                id.clone(),
+                state.call_id.clone(),
+                state.name.clone(),
+                delta,
+            ) {
+                changed.push(block_id);
+            }
+        }
+        self.tool_draft_animations = states;
+        changed
+    }
+
+    fn finish_tool_draft_animations(&mut self) {
+        for (id, mut state) in std::mem::take(&mut self.tool_draft_animations) {
+            if let Some((_, delta)) = state.animation.finish() {
+                self.apply_tool_draft_delta(id, state.call_id, state.name, delta);
+            }
+        }
     }
 
     pub(crate) fn finish_tool_draft(
@@ -1529,6 +2030,7 @@ impl ConversationRuntime {
         name: String,
         arguments: String,
     ) -> Option<smelt_core::transcript_model::BlockId> {
+        self.tool_draft_animations.remove(&stream_id);
         self.apply_stream_mutation(super::session_document::StreamMutation::FinishToolDraft {
             stream_id,
             call_id,
@@ -1569,6 +2071,7 @@ impl ConversationRuntime {
     }
 
     pub(crate) fn start_exec(&mut self, command: String) {
+        self.finish_stream_animation();
         self.apply_stream_mutation(super::session_document::StreamMutation::StartExec { command });
     }
 
@@ -1585,7 +2088,11 @@ impl ConversationRuntime {
     }
 
     pub(crate) fn begin_turn(&mut self) {
+        self.finish_stream_animation();
+        self.tool_draft_animations.clear();
+        self.summary_parts.clear();
         self.turn.clear_context_tokens_updated();
+        self.response_draft_blocks.clear();
         self.parser.begin_turn();
     }
 
@@ -1833,8 +2340,8 @@ impl ConversationRuntime {
 
     #[cfg(test)]
     pub(crate) fn install_session_for_harness(&mut self, session: smelt_core::session::Session) {
-        self.document.live_session = None;
         self.session = session;
+        self.clear_live_session();
     }
 
     #[cfg(test)]
@@ -1870,8 +2377,8 @@ impl ConversationRuntime {
 
     #[cfg(any(test, feature = "harness"))]
     pub(crate) fn replace_history_for_harness(&mut self, history: Vec<protocol::HistoryItem>) {
-        self.document.live_session = None;
         self.session.history = history;
+        self.clear_live_session();
     }
 
     #[cfg(any(test, feature = "harness"))]
@@ -1919,6 +2426,13 @@ impl ConversationRuntime {
     }
 
     pub(crate) fn clear_stream_parser(&mut self) {
+        self.stream_animation.clear();
+        self.tool_draft_animations.clear();
+        self.summary_parts.clear();
+        self.compaction_animation.clear();
+        self.compaction_source.clear();
+        self.compaction_visible.clear();
+        self.response_draft_blocks.clear();
         self.parser.clear();
     }
 
@@ -2051,6 +2565,10 @@ impl ConversationRuntime {
         }
         let end = range.end.min(self.session.history.len());
         let start = range.start.min(end);
+        smelt_perf::perf::record_value(
+            "session:history:scanned_items",
+            end.saturating_sub(start) as u64,
+        );
         let chunk_items = chunk_items.max(1);
         for (chunk_offset, items) in self.session.history[start..end]
             .chunks(chunk_items)
@@ -2133,7 +2651,7 @@ impl ConversationRuntime {
     pub(crate) fn is_read_only(&self) -> bool {
         self.access.is_read_only()
             && !(self.writer_is_opening()
-                && self.document.acknowledged_head() == smelt_store::StoreHead::default())
+                && self.document.published_head() == smelt_store::StoreHead::default())
     }
 
     pub(crate) fn writer_is_opening(&self) -> bool {
@@ -2198,7 +2716,7 @@ impl ConversationRuntime {
     pub(crate) fn persistence_scope(&self) -> protocol::PersistenceScope {
         self.persistence_scope_at(
             self.document.generation().get(),
-            self.document.acknowledged_head().revision.get(),
+            self.document.published_head().revision.get(),
         )
     }
 
@@ -2268,6 +2786,7 @@ impl ConversationRuntime {
         loaded: smelt_core::session::Session,
     ) -> Option<String> {
         self.session = loaded;
+        self.clear_live_session();
         self.turn.reset_session();
         self.canonical_operations.clear();
         self.inflight_canonical_commands.clear();
@@ -2294,7 +2813,7 @@ impl ConversationRuntime {
             session_id,
             epoch,
             self.document.durable_generation(),
-            self.document.acknowledged_head(),
+            self.document.published_head(),
         )?;
         self.persistence_epoch = epoch;
         self.observed_persistence_status = None;
@@ -2309,28 +2828,16 @@ impl ConversationRuntime {
         &mut self,
         startup: crate::persist::SessionPersistenceStartup,
     ) -> Result<(), crate::persist::PersistenceCause> {
-        let epoch = self.persistence_epoch;
-        self.turn.set_last_terminal_turn_id(
-            startup
-                .latest_terminal_turn_id
-                .map(smelt_store::TurnId::get),
-        );
+        if startup.epoch != self.persistence_epoch {
+            return Err(crate::persist::PersistenceCause::invariant(
+                "startup persistence epoch did not match the session document",
+            ));
+        }
         if let Some(recovery) = startup.recovery {
-            let acknowledgement = crate::persist::PersistenceAcknowledgement {
-                epoch,
-                generation: self.document.generation(),
-                record_projection:
-                    super::session_document::SessionRecordSaveProjection::persisted_head(
-                        recovery.session.current,
-                    ),
-                previous: recovery.session.previous,
-                receipt: recovery.session,
-            };
-            let acknowledged = self.document.acknowledge(
-                &acknowledgement,
-                &self.session.id,
-                self.history_len(),
-                self.session.checkpoint.as_ref(),
+            let acknowledged = self.document.acknowledge_startup_recovery(
+                startup.epoch,
+                &mut self.session,
+                &recovery,
             );
             if !acknowledged {
                 let reason =
@@ -2339,6 +2846,11 @@ impl ConversationRuntime {
                 return Err(crate::persist::PersistenceCause::invariant(reason));
             }
         }
+        self.turn.set_last_terminal_turn_id(
+            startup
+                .latest_terminal_turn_id
+                .map(smelt_store::TurnId::get),
+        );
         self.access = SessionAccess::Owned;
         Ok(())
     }
@@ -2373,23 +2885,23 @@ impl ConversationRuntime {
         self.observed_persistence_status = Some(status.clone());
 
         let mut acknowledged_session_id = None;
-        let acknowledgement_applied =
-            status
-                .acknowledgement
-                .as_ref()
-                .is_none_or(|acknowledgement| {
-                    let applied = self.apply_persistence_acknowledgement(acknowledgement);
-                    if applied {
-                        acknowledged_session_id = Some(acknowledgement.receipt.session_id.clone());
-                    }
-                    applied
-                });
+        let publication_adopted = status
+            .acknowledgement
+            .as_ref()
+            .is_none_or(|acknowledgement| {
+                let applied = self.apply_persistence_acknowledgement(acknowledgement);
+                if applied == Some(true) {
+                    acknowledged_session_id =
+                        Some(acknowledgement.result.receipt.session_id.clone());
+                }
+                applied.is_some()
+            });
         let durable_generation = self.document.durable_generation();
         let canonical_completions = status
             .canonical_completions
             .iter()
             .filter(|completion| {
-                acknowledgement_applied
+                publication_adopted
                     || match completion {
                         crate::persist::CanonicalCommandCompletion::Submit(acknowledgement) => {
                             acknowledgement.persistence.generation <= durable_generation
@@ -2492,14 +3004,10 @@ impl ConversationRuntime {
                 "live_session:suffix_items",
                 live.live_suffix_len() as u64,
             );
-            smelt_perf::perf::record_value(
-                "live_session:suffix_bytes",
-                live.live_suffix_bytes() as u64,
-            );
         }
         let intent = match self
             .document
-            .prepare_event_batch(&mut self.session, metadata)
+            .capture_event_batch(&mut self.session, metadata)
         {
             Ok(Some(intent)) => intent,
             Ok(None) => return Ok(SaveStatus::Unchanged),
@@ -2555,7 +3063,7 @@ impl ConversationRuntime {
         if prepare_latest {
             let intent = match self
                 .document
-                .prepare_event_batch(&mut self.session, metadata)
+                .capture_event_batch(&mut self.session, metadata)
             {
                 Ok(intent) => intent,
                 Err(super::session_document::SessionBatchPreparationError::HydrationPending) => {
@@ -2641,6 +3149,16 @@ impl ConversationRuntime {
             .install_commit_barrier()
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_persistence_finish_barrier(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.persistence
+            .as_ref()
+            .expect("persistence actor is running")
+            .install_finish_barrier()
+    }
+
     pub(crate) fn append_request_audit(
         &self,
         scope: protocol::PersistenceScope,
@@ -2666,6 +3184,33 @@ impl ConversationRuntime {
         Ok(true)
     }
 
+    pub(crate) fn begin_persistence_close(
+        &self,
+    ) -> Result<Option<crate::persist::PendingPersistenceClose>, String> {
+        if let Some(block) = self.persistence_preparation_block.as_ref() {
+            return Err(block.cause.message.clone());
+        }
+        Ok(self.persistence.as_ref().map(|actor| {
+            actor.begin_close(
+                self.document.generation(),
+                std::time::Instant::now() + crate::persist::INTERACTIVE_PERSISTENCE_DEADLINE,
+            )
+        }))
+    }
+
+    pub(crate) fn poll_persistence_close(
+        &mut self,
+        pending: &mut crate::persist::PendingPersistenceClose,
+        cancelled: bool,
+    ) -> Option<Result<Option<String>, String>> {
+        let persistence = self
+            .persistence
+            .as_mut()
+            .expect("closing writer remains owned");
+        let outcome = persistence.poll_close(pending, cancelled)?;
+        Some(outcome.and_then(|outcome| self.finish_persistence_close(outcome, None)))
+    }
+
     pub(crate) fn close_persistence_until(
         &mut self,
         policy: crate::persist::ClosePolicy,
@@ -2684,19 +3229,37 @@ impl ConversationRuntime {
         let Some(persistence) = self.persistence.as_mut() else {
             return Ok(preparation_failure);
         };
-        let epoch = persistence.epoch();
         let outcome = persistence.close(target, deadline, policy);
+        self.finish_persistence_close(outcome, preparation_failure)
+    }
+
+    fn finish_persistence_close(
+        &mut self,
+        outcome: crate::persist::PersistenceCloseOutcome,
+        preparation_failure: Option<String>,
+    ) -> Result<Option<String>, String> {
+        let epoch = outcome.epoch;
+        let writer_released = self
+            .persistence
+            .as_ref()
+            .is_none_or(|actor| actor.is_finished());
         if let Some(acknowledgement) = outcome.acknowledgement.as_ref() {
-            self.apply_persistence_acknowledgement(acknowledgement);
+            let _ = self.apply_persistence_acknowledgement(acknowledgement);
         }
         if outcome.durable < outcome.target && outcome.omitted.is_none() {
             return Err(outcome.cause.map_or_else(
                 || {
                     format!(
                         "generation {} did not become durable before session close",
-                        target.get()
+                        outcome.target.get()
                     )
                 },
+                |cause| cause.message,
+            ));
+        }
+        if !writer_released {
+            return Err(outcome.cause.map_or_else(
+                || "persistence writer has not finished releasing ownership".into(),
                 |cause| cause.message,
             ));
         }
@@ -2731,6 +3294,7 @@ impl ConversationRuntime {
         let operation = CanonicalOperation {
             command_id,
             payload: CanonicalOperationPayload::Submit { metadata, turn },
+            prepared: None,
         };
         let can_drive = self.canonical_operations.is_empty();
         self.canonical_operations.push_back(operation);
@@ -2742,10 +3306,7 @@ impl ConversationRuntime {
             Ok(CanonicalOperationProgress::DeferredPreparation) => {
                 Ok(CanonicalTurnSubmitOutcome::PendingPreparation { command_id })
             }
-            Ok(
-                CanonicalOperationProgress::TransitionDurable(_)
-                | CanonicalOperationProgress::Queued,
-            ) => {
+            Ok(CanonicalOperationProgress::Queued) => {
                 unreachable!("new canonical submission is the front operation")
             }
             Err(cause) => {
@@ -2771,8 +3332,8 @@ impl ConversationRuntime {
                 state,
                 at_ms: smelt_core::session::now_ms(),
                 terminal_reason,
-                dispatch: CanonicalTransitionDispatch::Enqueue,
             },
+            prepared: None,
         };
         let can_drive = self.canonical_operations.is_empty();
         self.canonical_operations.push_back(operation);
@@ -2784,59 +3345,8 @@ impl ConversationRuntime {
                 CanonicalOperationProgress::DeferredPreparation
                 | CanonicalOperationProgress::Queued,
             ) => Ok(()),
-            Ok(
-                CanonicalOperationProgress::TransitionDurable(_)
-                | CanonicalOperationProgress::Submit(_),
-            ) => {
-                unreachable!("enqueued transition cannot complete synchronously")
-            }
-            Err(cause) => {
-                self.discard_canonical_operation(command_id);
-                Err(cause)
-            }
-        }
-    }
-
-    pub(crate) fn commit_canonical_turn_transition(
-        &mut self,
-        metadata: super::session_document::RuntimeSessionMetadata,
-        turn_id: smelt_store::TurnId,
-        state: smelt_store::TurnState,
-        terminal_reason: Option<String>,
-    ) -> Result<crate::persist::TurnTransitionOutcome, crate::persist::PersistenceCause> {
-        let command_id = self.allocate_canonical_command_id();
-        let operation = CanonicalOperation {
-            command_id,
-            payload: CanonicalOperationPayload::Transition {
-                metadata,
-                turn_id,
-                state,
-                at_ms: smelt_core::session::now_ms(),
-                terminal_reason,
-                dispatch: CanonicalTransitionDispatch::Commit,
-            },
-        };
-        let can_drive = self.canonical_operations.is_empty();
-        self.canonical_operations.push_back(operation);
-        if !can_drive {
-            return Ok(crate::persist::TurnTransitionOutcome::Pending {
-                command_id,
-                generation: self.document.generation(),
-            });
-        }
-        match self.process_front_canonical_operation() {
-            Ok(CanonicalOperationProgress::TransitionDurable(acknowledgement)) => Ok(
-                crate::persist::TurnTransitionOutcome::Durable(acknowledgement),
-            ),
-            Ok(
-                CanonicalOperationProgress::DeferredPreparation
-                | CanonicalOperationProgress::Queued,
-            ) => Ok(crate::persist::TurnTransitionOutcome::Pending {
-                command_id,
-                generation: self.document.generation(),
-            }),
             Ok(CanonicalOperationProgress::Submit(_)) => {
-                unreachable!("committed transition is the front operation")
+                unreachable!("enqueued transition cannot complete synchronously")
             }
             Err(cause) => {
                 self.discard_canonical_operation(command_id);
@@ -2913,9 +3423,6 @@ impl ConversationRuntime {
                     events.push(CanonicalOperationEvent::Submit(outcome));
                     break;
                 }
-                Ok(CanonicalOperationProgress::TransitionDurable(acknowledgement)) => {
-                    events.push(CanonicalOperationEvent::TransitionDurable(acknowledgement));
-                }
                 Err(cause) => {
                     self.discard_canonical_operation(command_id);
                     events.push(CanonicalOperationEvent::Failed { command_id, cause });
@@ -2934,29 +3441,44 @@ impl ConversationRuntime {
         }
         let operation = self
             .canonical_operations
-            .front()
-            .cloned()
+            .front_mut()
             .expect("front canonical operation");
-        let metadata = match &operation.payload {
-            CanonicalOperationPayload::Submit { metadata, .. }
-            | CanonicalOperationPayload::Transition { metadata, .. } => metadata.clone(),
+        let command_id = operation.command_id;
+        let prepared = operation.prepared.take().filter(|batch| {
+            batch.generation == self.document.generation()
+                && batch.matches_archive_base(&self.session)
+        });
+        let session = if let Some(prepared) = prepared {
+            prepared
+        } else {
+            let metadata = match &operation.payload {
+                CanonicalOperationPayload::Submit { metadata, .. }
+                | CanonicalOperationPayload::Transition { metadata, .. } => metadata.clone(),
+            };
+            let session = match self
+                .document
+                .capture_turn_batch(&mut self.session, metadata)
+            {
+                Ok(session) => session,
+                Err(super::session_document::SessionBatchPreparationError::HydrationPending) => {
+                    return Ok(CanonicalOperationProgress::DeferredPreparation);
+                }
+                Err(super::session_document::SessionBatchPreparationError::Invalid(message)) => {
+                    return Err(crate::persist::PersistenceCause::invariant(message));
+                }
+            };
+            self.publish_shared_state();
+            session
         };
-        let session = match self
-            .document
-            .prepare_turn_batch(&mut self.session, metadata)
-        {
-            Ok(session) => session,
-            Err(super::session_document::SessionBatchPreparationError::HydrationPending) => {
-                return Ok(CanonicalOperationProgress::DeferredPreparation);
-            }
-            Err(super::session_document::SessionBatchPreparationError::Invalid(message)) => {
-                return Err(crate::persist::PersistenceCause::invariant(message));
-            }
-        };
-        self.publish_shared_state();
-        match operation.payload {
+        let payload = &self
+            .canonical_operations
+            .front()
+            .expect("front canonical operation")
+            .payload;
+        match payload {
             CanonicalOperationPayload::Submit { turn, .. } => {
-                let outcome = self
+                let generation = session.generation;
+                let status = self
                     .persistence
                     .as_ref()
                     .ok_or_else(|| {
@@ -2964,124 +3486,64 @@ impl ConversationRuntime {
                             "persistence actor is unavailable",
                         )
                     })?
-                    .submit_turn(
-                        crate::persist::SubmitTurnIntent {
-                            command_id: operation.command_id,
-                            session,
-                            turn,
-                        },
-                        std::time::Instant::now() + crate::persist::DEFAULT_PERSISTENCE_DEADLINE,
-                    )?;
-                match outcome {
-                    crate::persist::SubmitTurnOutcome::Durable(acknowledgement) => {
-                        if !self.apply_persistence_acknowledgement(&acknowledgement.persistence) {
-                            return Err(crate::persist::PersistenceCause::invariant(
-                                "turn submission receipt did not match the session document",
-                            ));
-                        }
-                        self.canonical_operations.pop_front();
-                        Ok(CanonicalOperationProgress::Submit(
-                            CanonicalTurnSubmitOutcome::Durable(acknowledgement),
-                        ))
-                    }
-                    crate::persist::SubmitTurnOutcome::Pending {
+                    .enqueue_turn_submission(crate::persist::SubmitTurnIntent {
+                        command_id,
+                        session,
+                        turn: turn.clone(),
+                    })?;
+                if let crate::persist::CanonicalEnqueueStatus::Backpressure(intent) = status {
+                    self.canonical_operations.front_mut().unwrap().prepared = Some(intent.session);
+                    return Ok(CanonicalOperationProgress::DeferredPreparation);
+                }
+                self.canonical_operations.pop_front();
+                self.inflight_canonical_commands
+                    .insert(command_id, InflightCanonicalCommand::Submit);
+                Ok(CanonicalOperationProgress::Submit(
+                    CanonicalTurnSubmitOutcome::PendingPersistence {
                         command_id,
                         generation,
-                    } => {
-                        self.canonical_operations.pop_front();
-                        self.inflight_canonical_commands
-                            .insert(command_id, InflightCanonicalCommand::Submit);
-                        Ok(CanonicalOperationProgress::Submit(
-                            CanonicalTurnSubmitOutcome::PendingPersistence {
-                                command_id,
-                                generation,
-                            },
-                        ))
-                    }
-                }
+                    },
+                ))
             }
             CanonicalOperationPayload::Transition {
                 turn_id,
                 state,
                 at_ms,
                 terminal_reason,
-                dispatch,
                 ..
             } => {
                 let generation = session.generation;
                 let intent = crate::persist::TurnTransitionIntent {
-                    command_id: operation.command_id,
+                    command_id,
                     session,
-                    turn_id,
-                    state,
-                    at_ms,
-                    terminal_reason,
+                    turn_id: *turn_id,
+                    state: *state,
+                    at_ms: *at_ms,
+                    terminal_reason: terminal_reason.clone(),
                 };
-                match dispatch {
-                    CanonicalTransitionDispatch::Enqueue => {
-                        self.persistence
-                            .as_ref()
-                            .ok_or_else(|| {
-                                crate::persist::PersistenceCause::unavailable(
-                                    "persistence actor is unavailable",
-                                )
-                            })?
-                            .enqueue_turn_transition(intent)?;
-                        self.canonical_operations.pop_front();
-                        self.inflight_canonical_commands.insert(
-                            operation.command_id,
-                            InflightCanonicalCommand::Transition {
-                                generation,
-                                terminal: state.is_terminal(),
-                            },
-                        );
-                        Ok(CanonicalOperationProgress::Queued)
-                    }
-                    CanonicalTransitionDispatch::Commit => {
-                        let outcome = self
-                            .persistence
-                            .as_ref()
-                            .ok_or_else(|| {
-                                crate::persist::PersistenceCause::unavailable(
-                                    "persistence actor is unavailable",
-                                )
-                            })?
-                            .transition_turn(
-                                intent,
-                                std::time::Instant::now()
-                                    + crate::persist::DEFAULT_PERSISTENCE_DEADLINE,
-                            )?;
-                        match outcome {
-                            crate::persist::TurnTransitionOutcome::Durable(acknowledgement) => {
-                                if !self
-                                    .apply_persistence_acknowledgement(&acknowledgement.persistence)
-                                {
-                                    return Err(crate::persist::PersistenceCause::invariant(
-                                        "turn transition receipt did not match the session document",
-                                    ));
-                                }
-                                self.canonical_operations.pop_front();
-                                Ok(CanonicalOperationProgress::TransitionDurable(
-                                    acknowledgement,
-                                ))
-                            }
-                            crate::persist::TurnTransitionOutcome::Pending {
-                                command_id,
-                                generation,
-                            } => {
-                                self.canonical_operations.pop_front();
-                                self.inflight_canonical_commands.insert(
-                                    command_id,
-                                    InflightCanonicalCommand::Transition {
-                                        generation,
-                                        terminal: state.is_terminal(),
-                                    },
-                                );
-                                Ok(CanonicalOperationProgress::Queued)
-                            }
-                        }
-                    }
+                let terminal = state.is_terminal();
+                let status = self
+                    .persistence
+                    .as_ref()
+                    .ok_or_else(|| {
+                        crate::persist::PersistenceCause::unavailable(
+                            "persistence actor is unavailable",
+                        )
+                    })?
+                    .enqueue_turn_transition(intent)?;
+                if let crate::persist::CanonicalEnqueueStatus::Backpressure(intent) = status {
+                    self.canonical_operations.front_mut().unwrap().prepared = Some(intent.session);
+                    return Ok(CanonicalOperationProgress::DeferredPreparation);
                 }
+                self.canonical_operations.pop_front();
+                self.inflight_canonical_commands.insert(
+                    command_id,
+                    InflightCanonicalCommand::Transition {
+                        generation,
+                        terminal,
+                    },
+                );
+                Ok(CanonicalOperationProgress::Queued)
             }
         }
     }
@@ -3100,10 +3562,18 @@ impl ConversationRuntime {
             .retain(|operation| operation.command_id != command_id);
     }
 
+    /// A matching publication can settle its command while newer document work
+    /// stays dirty. The value reports whether the current document is clean.
     fn apply_persistence_acknowledgement(
         &mut self,
         acknowledgement: &crate::persist::PersistenceAcknowledgement,
-    ) -> bool {
+    ) -> Option<bool> {
+        if !self
+            .document
+            .adopt_archive_publication(acknowledgement, &mut self.session)
+        {
+            return None;
+        }
         let applied = self.document.acknowledge_coalesced_batch(
             acknowledgement,
             &self.session.id,
@@ -3111,7 +3581,7 @@ impl ConversationRuntime {
             self.session.checkpoint.as_ref(),
         );
         if applied {
-            self.refresh_transcript_store_address(&acknowledgement.receipt);
+            self.refresh_transcript_store_address(&acknowledgement.result.receipt);
             if let Some(persistence) = self.persistence.as_ref() {
                 persistence.confirm_acknowledgement(acknowledgement);
             }
@@ -3119,7 +3589,7 @@ impl ConversationRuntime {
         if applied || acknowledgement.generation <= self.document.durable_generation() {
             self.confirm_superseded_nonterminal_commands(acknowledgement.generation);
         }
-        applied
+        Some(applied)
     }
 
     fn confirm_superseded_nonterminal_commands(
@@ -3169,6 +3639,187 @@ mod tests {
     use crate::persist::PersistenceFlushOutcome;
 
     #[test]
+    fn foreign_startup_epoch_does_not_adopt_access_or_terminal_turn() {
+        let mut app = crate::app::test_harness::TestApp::builder().build();
+        let conversation = &mut app.app.conversation;
+        conversation.access = super::SessionAccess::Opening;
+        let head = conversation.document.published_head();
+        let terminal = conversation.last_terminal_turn_id();
+        let startup = crate::persist::SessionPersistenceStartup {
+            epoch: conversation.persistence_epoch.checked_next().unwrap(),
+            recovery: None,
+            latest_terminal_turn_id: Some(smelt_store::TurnId::new(99)),
+        };
+        assert!(conversation.finish_writer_startup(startup).is_err());
+        assert!(conversation.writer_is_opening());
+        assert_eq!(conversation.last_terminal_turn_id(), terminal);
+        assert_eq!(conversation.document.published_head(), head);
+    }
+
+    #[test]
+    fn backpressure_reuses_prepared_batches_until_the_document_changes() {
+        use crossterm::event::KeyCode;
+        for change_title in [false, true] {
+            let mut app = crate::app::test_harness::TestApp::builder().build();
+            app.ensure_writer_ready();
+            let release = app
+                .app
+                .conversation
+                .persistence
+                .as_ref()
+                .unwrap()
+                .pause_with_full_control_lane();
+            app.type_text("retained request");
+            app.press(KeyCode::Enter);
+            assert!(app.app.turn_submission_is_pending());
+            assert!(!app.agent_running());
+            let generation = app
+                .app
+                .conversation
+                .canonical_operations
+                .front()
+                .unwrap()
+                .prepared
+                .as_ref()
+                .unwrap()
+                .generation;
+            if change_title {
+                app.app
+                    .set_session_title("new title".into(), "new-title".into(), None);
+                app.app.drive_canonical_operations();
+                assert_ne!(
+                    app.app
+                        .conversation
+                        .canonical_operations
+                        .front()
+                        .unwrap()
+                        .prepared
+                        .as_ref()
+                        .unwrap()
+                        .generation,
+                    generation
+                );
+            }
+            smelt_perf::perf::set_enabled(true);
+            smelt_perf::perf::clear();
+            app.type_text("new draft");
+            for _ in 0..20 {
+                app.app.drive_canonical_operations();
+                app.render_unsettled_silent();
+            }
+            let snapshot = smelt_perf::perf::snapshot();
+            smelt_perf::perf::set_enabled(false);
+            assert!(
+                !snapshot
+                    .durations
+                    .iter()
+                    .any(|row| row.label == "session:prepare_save_batch"),
+                "unchanged backpressure rebuilt a batch"
+            );
+            assert!(app
+                .app
+                .conversation
+                .canonical_operations
+                .front()
+                .unwrap()
+                .prepared
+                .is_some());
+            assert_eq!(app.state().prompt_text, "new draft");
+            assert!(app
+                .drain_engine_sends()
+                .iter()
+                .all(|command| !matches!(command, protocol::UiCommand::StartTurn(_))));
+            release.send(()).unwrap();
+            app.wait_for_turn_persistence();
+            assert!(app.agent_running());
+            assert_eq!(app.state().prompt_text, "new draft");
+            assert_eq!(
+                app.drain_engine_sends()
+                    .iter()
+                    .filter(|command| matches!(command, protocol::UiCommand::StartTurn(_)))
+                    .count(),
+                1
+            );
+            if change_title {
+                assert_eq!(app.session_snapshot().title.as_deref(), Some("new title"));
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_save_publishes_its_capture_without_consuming_newer_deltas() {
+        let mut app = crate::app::test_harness::TestApp::builder().build();
+        app.start_submitted_turn("initial request");
+        let release = app.app.conversation.pause_persistence();
+        app.feed_one(crate::event_source::SourceEvent::engine(
+            protocol::EngineEvent::TextDelta {
+                delta: "captured streaming text α".into(),
+            },
+        ));
+        app.clock.advance(Duration::from_millis(250));
+        app.render_silent();
+        app.app.save_session();
+        let generation = app.app.conversation.persistence_generation();
+        app.feed_one(crate::event_source::SourceEvent::engine(
+            protocol::EngineEvent::TextDelta {
+                delta: " newer text 界".into(),
+            },
+        ));
+        app.clock.advance(Duration::from_millis(250));
+        app.render_silent();
+        assert!(app.app.conversation.persistence_generation() > generation);
+        release.send(()).unwrap();
+        let actor = app.app.conversation.persistence.as_ref().unwrap();
+        assert!(matches!(
+            actor.flush(generation, Instant::now() + Duration::from_secs(5)),
+            PersistenceFlushOutcome::Durable { .. }
+        ));
+        let acknowledgement = actor.status().acknowledgement.unwrap();
+        assert_eq!(acknowledgement.generation, generation);
+        let row = acknowledgement
+            .frame
+            .command()
+            .transcript_records
+            .as_ref()
+            .unwrap()
+            .records
+            .last()
+            .unwrap()
+            .clone();
+        let record = smelt_core::TranscriptBlockRecord::try_from(row).unwrap();
+        assert_eq!(
+            record.block.raw_text().unwrap(),
+            "captured streaming text α"
+        );
+        assert_eq!(record.content_hash, record.block.content_hash());
+        app.app.drain_persist_reports();
+        assert!(app.app.conversation.has_unflushed_work());
+        app.save_session_and_flush();
+        let reader = smelt_store::LineageSessionReader::open_existing(
+            app.app.core.sessions.sessions_dir(),
+            &app.session_snapshot().id,
+        )
+        .unwrap();
+        let count = reader
+            .store_head()
+            .unwrap()
+            .transcript_record_count
+            .as_usize()
+            .unwrap();
+        let saved = reader
+            .transcript_record_slice_with_total((count - 1..count).into(), count)
+            .unwrap();
+        let record =
+            smelt_core::TranscriptBlockRecord::try_from(saved.records.into_iter().next().unwrap())
+                .unwrap();
+        assert_eq!(
+            record.block.raw_text().unwrap(),
+            "captured streaming text α newer text 界"
+        );
+        assert_eq!(record.content_hash, record.block.content_hash());
+    }
+
+    #[test]
     fn first_message_rewind_after_a_late_persistence_confirmation_can_resubmit() {
         for vim in [false, true] {
             let mut app = crate::app::test_harness::TestApp::builder()
@@ -3185,7 +3836,10 @@ mod tests {
                 }),
                 Some("first request".into()),
             );
-            let super::CanonicalTurnSubmitOutcome::Durable(submitted) = app
+            let super::CanonicalTurnSubmitOutcome::PendingPersistence {
+                command_id,
+                generation,
+            } = app
                 .app
                 .submit_canonical_turn(smelt_store::NewTurn {
                     kind: smelt_store::TurnKind::User,
@@ -3195,8 +3849,31 @@ mod tests {
                 })
                 .unwrap()
             else {
-                panic!("first turn submission was not durable");
+                panic!("first turn submission was not queued");
             };
+            let actor = app.app.conversation.persistence.as_ref().unwrap();
+            assert!(matches!(
+                actor.flush(generation, Instant::now() + Duration::from_secs(5)),
+                PersistenceFlushOutcome::Durable { .. }
+            ));
+            let submitted = actor
+                .status()
+                .canonical_completions
+                .iter()
+                .find_map(|completion| match completion {
+                    crate::persist::CanonicalCommandCompletion::Submit(submitted)
+                        if submitted.command_id == command_id =>
+                    {
+                        Some(submitted.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            app.app.conversation.drain_persistence_report().unwrap();
+            assert!(app
+                .app
+                .conversation
+                .confirm_canonical_completion(command_id));
 
             // Engine dispatch can be active while Ready -> Running is still queued.
             app.start_turn(submitted.receipt.turn_id.get());
@@ -3245,14 +3922,20 @@ mod tests {
             app.app.drain_persist_reports();
             let conversation = &app.app.conversation;
             assert_eq!(conversation.persistence_generation(), generation);
-            assert_eq!(conversation.acknowledged_head(), saved.receipt.current);
+            assert_eq!(
+                conversation.acknowledged_head(),
+                saved.result.receipt.current
+            );
             let status = conversation.persistence.as_ref().unwrap().status();
             let running = status.acknowledgement.as_ref().unwrap();
             assert_eq!(running.generation, saved.generation);
-            assert_eq!(running.receipt.previous, saved.receipt.current);
+            assert_eq!(
+                running.result.receipt.previous,
+                saved.result.receipt.current
+            );
             // A turn-state-only commit keeps the saved session revision unchanged.
-            assert_eq!(running.receipt.current, saved.receipt.current);
-            assert_ne!(running.receipt, saved.receipt);
+            assert_eq!(running.result.receipt.current, saved.result.receipt.current);
+            assert_ne!(running.result.receipt, saved.result.receipt);
             assert_eq!(status.canonical_completions.len(), 1);
             assert!(matches!(
                 status.canonical_completions.front(),
@@ -3264,7 +3947,8 @@ mod tests {
             app.press(crossterm::event::KeyCode::Esc);
             assert_eq!(app.state().prompt_text, "first request");
             app.press(crossterm::event::KeyCode::Enter);
-            assert_eq!(app.state().queued_inputs, vec!["first request"]);
+            assert!(app.app.turn_submission_is_pending());
+            assert!(app.state().queued_inputs.is_empty());
             let generation = app.app.conversation.persistence_generation();
             let actor = app.app.conversation.persistence.as_ref().unwrap();
             assert!(matches!(

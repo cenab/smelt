@@ -232,6 +232,12 @@ pub struct LuaTranscriptStreamOpts {
 /// main transcript, so streaming markdown, fenced code, tables, highlights,
 /// and block finalization behave identically outside the transcript pane.
 pub struct LuaTranscriptStream {
+    state: std::rc::Rc<std::cell::RefCell<TranscriptStreamState>>,
+}
+
+pub(crate) type WeakTranscriptStream = std::rc::Weak<std::cell::RefCell<TranscriptStreamState>>;
+
+pub(crate) struct TranscriptStreamState {
     buf: LuaBuf,
     transcript: Transcript,
     parser: StreamParser,
@@ -239,11 +245,12 @@ pub struct LuaTranscriptStream {
     width: Option<u16>,
     raw_text: String,
     saw_delta: bool,
+    animation: crate::app::stream_animation::StreamAnimation,
 }
 
 impl LuaTranscriptStream {
     fn new(buf: LuaBuf, opts: Option<LuaTranscriptStreamOpts>) -> Self {
-        Self {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(TranscriptStreamState {
             buf,
             transcript: Transcript::new(),
             parser: StreamParser::new(),
@@ -251,6 +258,27 @@ impl LuaTranscriptStream {
             width: opts.and_then(|opts| opts.width),
             raw_text: String::new(),
             saw_delta: false,
+            animation: Default::default(),
+        }));
+        crate::lua::with_conversation_host(|host| {
+            host.register_transcript_stream(std::rc::Rc::downgrade(&state));
+        });
+        Self { state }
+    }
+}
+
+impl TranscriptStreamState {
+    pub(crate) fn advance(&mut self, now: std::time::Instant) -> bool {
+        let delta = self.animation.advance(now);
+        self.append_visible(&delta);
+        self.animation.is_pending()
+    }
+
+    fn append_visible(&mut self, delta: &str) {
+        if !delta.is_empty() {
+            self.parser
+                .append_streaming_text(&mut self.transcript.history, delta);
+            self.render();
         }
     }
 
@@ -275,46 +303,67 @@ impl LuaType for LuaTranscriptStream {
 impl mlua::UserData for LuaTranscriptStream {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method_mut("append", |_, this, delta: String| {
+            let mut state = this.state.borrow_mut();
             if !delta.is_empty() {
-                this.saw_delta = true;
-                this.raw_text.push_str(&delta);
-                this.parser
-                    .append_streaming_text(&mut this.transcript.history, &delta);
-                this.render();
+                state.saw_delta = true;
+                state.raw_text.push_str(&delta);
+                let now = crate::lua::with_conversation_host(|host| host.stream_arrival_time());
+                let visible = state.animation.push(
+                    crate::app::stream_animation::StreamKind::Text,
+                    delta,
+                    now,
+                );
+                state.append_visible(&visible);
+                if state.animation.is_pending() {
+                    crate::lua::with_conversation_host(|host| host.request_stream_frame());
+                }
             }
             Ok(())
         });
         methods.add_method_mut("finish", |_, this, final_text: Option<String>| {
+            let mut state = this.state.borrow_mut();
+            if let Some((_, delta)) = state.animation.finish() {
+                state.append_visible(&delta);
+            }
             if let Some(text) = final_text.as_deref().filter(|text| !text.is_empty()) {
-                if !this.saw_delta || text != this.raw_text {
-                    this.transcript = Transcript::new();
-                    this.parser.clear();
-                    this.parser
-                        .append_streaming_text(&mut this.transcript.history, text);
-                    this.raw_text.clear();
-                    this.raw_text.push_str(text);
-                    this.saw_delta = true;
+                if !state.saw_delta || text != state.raw_text {
+                    state.transcript = Transcript::new();
+                    state.projection = crate::content::transcript_buf::TranscriptProjection::new();
+                    state.parser.clear();
+                    let state = &mut *state;
+                    state
+                        .parser
+                        .append_streaming_text(&mut state.transcript.history, text);
+                    state.raw_text.clear();
+                    state.raw_text.push_str(text);
+                    state.saw_delta = true;
                 }
             }
-            this.parser
-                .flush_streaming_text(&mut this.transcript.history);
-            this.render();
+            let state = &mut *state;
+            state
+                .parser
+                .flush_streaming_text(&mut state.transcript.history);
+            state.render();
             Ok(())
         });
         methods.add_method_mut("reset", |_, this, ()| {
-            this.transcript = Transcript::new();
-            this.parser.clear();
-            this.raw_text.clear();
-            this.saw_delta = false;
-            this.render();
+            let mut state = this.state.borrow_mut();
+            state.animation.clear();
+            state.transcript = Transcript::new();
+            state.projection = crate::content::transcript_buf::TranscriptProjection::new();
+            state.parser.clear();
+            state.raw_text.clear();
+            state.saw_delta = false;
+            state.render();
             Ok(())
         });
         methods.add_method_mut("width", |_, this, width: Option<u16>| {
+            let mut state = this.state.borrow_mut();
             if let Some(width) = width {
-                this.width = Some(width.max(1));
-                this.render();
+                state.width = Some(width.max(1));
+                state.render();
             }
-            Ok(this.width)
+            Ok(state.width)
         });
     }
 }
@@ -424,7 +473,7 @@ pub(super) fn register(lua: &Lua, smelt: &mlua::Table) -> LuaResult<()> {
         classification: smelt_core::lua::doc::classification_for_type("smelt.transcript.Stream"),
         doc: "Transcript-shaped streaming renderer for plugin-owned buffers. Append model text deltas and it renders through the same incremental markdown block pipeline as the main transcript.",
         fields: smelt_core::class_methods! {
-            "append" => fn(delta: String) -> (), "Append one assistant text delta and re-render the target buffer.",
+            "append" => fn(delta: String) -> (), "Queue one received assistant text delta for grapheme-safe, frame-paced display. Callback delivery is immediate; finish drains pending text and reset discards it.",
             "finish" => fn(final_text: Option<String>) -> (), "Finalize the streaming block. If `final_text` is provided and differs from the streamed text, the final text is rendered instead.",
             "reset" => fn() -> (), "Clear the stream and the target buffer.",
             "width" => fn(width: Option<u16>) -> Option<u16>, "Read or set the render width in terminal cells.",

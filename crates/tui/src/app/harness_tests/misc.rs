@@ -8,6 +8,221 @@ use crate::app::TuiApp;
 use crate::smelt_edit::RowIndex;
 
 #[test]
+fn response_draft_rejection_removes_only_attempt_output() {
+    let mut app = TestApp::builder().build();
+    app.start_turn(1);
+    app.feed_one(SourceEvent::engine(EngineEvent::ToolStarted {
+        invocation_id: protocol::InvocationId::new(99),
+        call_id: "background".into(),
+        tool_name: "background_probe".into(),
+        args: Default::default(),
+        called_at_ms: 0,
+    }));
+    let before = app.conversation_probe().transcript().history().len();
+    app.feed_one(SourceEvent::engine(EngineEvent::ReasoningPartDelta {
+        id: "raw:0".into(),
+        kind: protocol::ReasoningKind::Raw,
+        delta: "rejected thought".into(),
+        title: None,
+    }));
+    app.feed_one(SourceEvent::engine(EngineEvent::TextDelta {
+        delta: "rejected answer".into(),
+    }));
+    app.feed_one(SourceEvent::engine(EngineEvent::ToolCallDraftStarted {
+        stream_id: "draft".into(),
+        call_id: Some("bad-call".into()),
+        tool_name: Some("read_file".into()),
+    }));
+    // Background factual output must survive rejection of a model response.
+    app.feed_one(SourceEvent::engine(EngineEvent::ToolOutput {
+        invocation_id: protocol::InvocationId::new(99),
+        call_id: "background".into(),
+        line: "background output".into(),
+    }));
+    app.feed_one(SourceEvent::engine(EngineEvent::ResponseDraftRejected));
+    assert_eq!(
+        app.conversation_probe().transcript().history().len(),
+        before
+    );
+    let frame = app.render_to_frame().text();
+    assert!(!frame.contains("rejected thought"));
+    assert!(!frame.contains("rejected answer"));
+    app.feed_one(SourceEvent::engine(EngineEvent::TextDelta {
+        delta: "valid answer".into(),
+    }));
+    app.render_to_frame();
+    app.feed_one(SourceEvent::Tick(250));
+    assert!(app.render_to_frame().text().contains("valid answer"));
+    app.assert_invariants();
+}
+
+#[test]
+fn response_draft_acceptance_separates_attempts() {
+    let mut app = TestApp::builder().build();
+    app.start_turn(1);
+    for event in [
+        EngineEvent::TextDelta {
+            delta: "accepted answer".into(),
+        },
+        EngineEvent::ResponseDraftAccepted,
+        EngineEvent::TextDelta {
+            delta: "rejected answer".into(),
+        },
+        EngineEvent::ResponseDraftRejected,
+    ] {
+        app.feed_one(SourceEvent::engine(event));
+    }
+    let frame = app.render_to_frame().text();
+    assert!(frame.contains("accepted answer"));
+    assert!(!frame.contains("rejected answer"));
+    app.assert_invariants();
+}
+
+#[test]
+fn response_draft_rejection_preserves_cancelled_previous_turn() {
+    let mut app = TestApp::builder().build();
+    app.start_turn(1);
+    app.feed_one(SourceEvent::engine(EngineEvent::TextDelta {
+        delta: "retained partial answer".into(),
+    }));
+    app.feed_one(SourceEvent::engine(EngineEvent::TurnComplete {
+        turn_id: 1,
+        history: None,
+        meta: Some(protocol::TurnMeta {
+            elapsed_ms: 1,
+            avg_tps: None,
+            display_tps: None,
+            interrupted: true,
+        }),
+    }));
+    assert!(app
+        .render_to_frame()
+        .text()
+        .contains("retained partial answer"));
+    app.start_turn(2);
+    app.feed_one(SourceEvent::engine(EngineEvent::TextDelta {
+        delta: "rejected next answer".into(),
+    }));
+    app.feed_one(SourceEvent::engine(EngineEvent::ResponseDraftRejected));
+    let frame = app.render_to_frame().text();
+    assert!(frame.contains("retained partial answer"));
+    assert!(!frame.contains("rejected next answer"));
+    app.assert_invariants();
+}
+
+#[test]
+fn response_draft_acceptance_separates_reasoning_summaries() {
+    let mut app = TestApp::builder().build();
+    app.start_turn(1);
+    let summary = |title: &str| EngineEvent::ReasoningPartFinished {
+        id: title.into(),
+        kind: protocol::ReasoningKind::Summary,
+        title: Some(title.into()),
+        content: title.into(),
+    };
+    for event in [
+        summary("accepted summary"),
+        EngineEvent::ResponseDraftAccepted,
+        summary("rejected summary"),
+        EngineEvent::ResponseDraftRejected,
+    ] {
+        app.feed_one(SourceEvent::engine(event));
+    }
+    let frame = app.render_to_frame().text();
+    assert!(frame.contains("accepted summary"));
+    assert!(!frame.contains("rejected summary"));
+    app.assert_invariants();
+}
+
+#[test]
+fn response_draft_acceptance_separates_batched_output() {
+    let mut app = TestApp::builder().build();
+    app.start_turn(1);
+    for (label, boundary) in [
+        ("accepted", EngineEvent::ResponseDraftAccepted),
+        ("rejected", EngineEvent::ResponseDraftRejected),
+    ] {
+        app.feed_one(SourceEvent::engine(EngineEvent::Reasoning {
+            kind: protocol::ReasoningKind::Summary,
+            title: Some(format!("{label} summary")),
+            content: format!("{label} summary"),
+        }));
+        app.feed_one(SourceEvent::engine(EngineEvent::Text {
+            content: format!("{label} answer"),
+        }));
+        app.feed_one(SourceEvent::engine(boundary));
+    }
+    let frame = app.render_to_frame().text();
+    assert!(frame.contains("accepted summary"));
+    assert!(frame.contains("accepted answer"));
+    assert!(!frame.contains("rejected summary"));
+    assert!(!frame.contains("rejected answer"));
+    app.assert_invariants();
+}
+
+#[test]
+fn response_draft_rejection_survives_unrelated_tool_start() {
+    let mut app = TestApp::builder().build();
+    app.start_turn(1);
+    app.feed_one(SourceEvent::engine(EngineEvent::TextDelta {
+        delta: "rejected answer".into(),
+    }));
+    app.feed_one(SourceEvent::engine(EngineEvent::ToolStarted {
+        invocation_id: protocol::InvocationId::new(99),
+        call_id: "background".into(),
+        tool_name: "background_probe".into(),
+        args: Default::default(),
+        called_at_ms: 0,
+    }));
+    app.feed_one(SourceEvent::engine(EngineEvent::ToolOutput {
+        invocation_id: protocol::InvocationId::new(99),
+        call_id: "background".into(),
+        line: "factual output".into(),
+    }));
+    app.feed_one(SourceEvent::engine(EngineEvent::ResponseDraftRejected));
+    let frame = app.render_to_frame().text();
+    assert!(!frame.contains("rejected answer"));
+    assert!(frame.contains("background_probe"));
+    app.assert_invariants();
+}
+
+#[test]
+fn auxiliary_draft_callbacks_respect_expired_lifecycle_guard() {
+    let mut app = TestApp::builder().build();
+    assert!(app.run_lua(
+        r#"
+        __ask_guard = smelt.lifecycle.guard()
+        __ask_callbacks = 0
+        local function count() __ask_callbacks = __ask_callbacks + 1 end
+        smelt.engine.ask({ system = "test", question = "test", guard = __ask_guard,
+            on_delta = count, on_draft_rejected = count, on_response = count })
+    "#
+    ));
+    let id = app.pending_ask_id().expect("guarded ask callbacks");
+    app.feed_one(SourceEvent::engine(EngineEvent::EngineAskDraftRejected {
+        id,
+    }));
+    assert!(app.run_lua("assert(__ask_callbacks == 1); __ask_guard:cancel()"));
+    for event in [
+        EngineEvent::EngineAskDelta {
+            id,
+            delta: "stale".into(),
+        },
+        EngineEvent::EngineAskDraftRejected { id },
+        EngineEvent::EngineAskResponse {
+            id,
+            message: None,
+            error: None,
+        },
+    ] {
+        app.feed_one(SourceEvent::engine(event));
+    }
+    assert!(app.run_lua("assert(__ask_callbacks == 1)"));
+    assert!(app.pending_ask_id().is_none());
+    app.assert_invariants();
+}
+
+#[test]
 fn notification_highlight_uses_terminal_width_for_unicode() {
     let summary = "besta\u{308}tigt 日本 👩\u{200d}💻";
     let (line, _, _, msg_start, msg_end) =
@@ -190,6 +405,7 @@ fn streaming_search_tool_summaries_keep_patterns_while_absolute_paths_collapse()
             tool_name: Some(tool_name.into()),
             delta: format!(r#"{{"pattern":{}"#, serde_json::to_string(pattern).unwrap()),
         }));
+        app.clock.advance(std::time::Duration::from_millis(250));
         let pattern_frame = app.render_to_frame().text();
         let expected_pattern = format!("* {tool_name} {pattern}");
         assert!(
@@ -208,6 +424,7 @@ fn streaming_search_tool_summaries_keep_patterns_while_absolute_paths_collapse()
             tool_name: Some(tool_name.into()),
             delta: format!(r#","path":{}"#, partial_cwd),
         }));
+        app.clock.advance(std::time::Duration::from_millis(250));
         let hidden_path_frame = app.render_to_frame().text();
         assert!(
             hidden_path_frame.contains(&expected_pattern),
@@ -224,7 +441,7 @@ fn streaming_search_tool_summaries_keep_patterns_while_absolute_paths_collapse()
             tool_name: Some(tool_name.into()),
             delta: "/crates/core/src/content".into(),
         }));
-        app.feed_one(SourceEvent::Tick(50));
+        app.feed_one(SourceEvent::Tick(250));
         let relative_path_frame = app.render_to_frame().text();
         assert!(
             relative_path_frame.contains(&format!(
@@ -430,26 +647,28 @@ fn fast_streaming_keeps_thinking_before_answer() {
         assert!(
             frames
                 .iter()
-                .any(|frame| frame.contains("The lighthouse stood on the cliff.")),
-            "no frame painted the answer while draining the stream"
+                .any(|frame| frame.lines().any(|line| line.trim() == "T")),
+            "no frame painted the first answer character while draining the stream"
         );
+        frames.push(app.render_to_frame().text());
+        assert!(
+            !frames
+                .last()
+                .unwrap()
+                .contains("The lighthouse stood on the cliff."),
+            "late reasoning completion flushed the answer animation"
+        );
+        app.clock.advance(Duration::from_millis(250));
         frames.push(app.render_to_frame().text());
         assert!(frames
             .last()
             .unwrap()
             .contains("The lighthouse stood on the cliff."));
-        if paint_after_event {
-            assert!(
-                frames
-                    .iter()
-                    .any(|frame| frame.lines().any(|line| line.trim() == "The")),
-                "no frame painted the answer prefix"
-            );
-        }
         for frame in frames {
             let Some(answer_row) = frame.lines().position(|line| {
                 let text = line.trim().trim_start_matches('│').trim_start();
-                text == "The" || text.starts_with("The lighthouse")
+                text.starts_with("The lighthouse")
+                    || (!line.contains('│') && matches!(text, "T" | "The"))
             }) else {
                 continue;
             };
@@ -499,11 +718,14 @@ fn main_transcript_paints_a_selected_delta_before_a_coalesced_turn_completion() 
 
     let streamed_frame = streamed_frame.expect("turn completion should paint the pending delta");
     assert!(
-        streamed_frame.contains("coalesced live transcript marker"),
+        streamed_frame.lines().any(|line| line.trim() == "c"),
         "no frame painted the selected delta: {streamed_frame}"
     );
 
-    app.render_to_frame();
+    assert!(app
+        .render_to_frame()
+        .text()
+        .contains("coalesced live transcript marker"));
     assert!(!app.agent_running(), "turn completion was not dispatched");
 }
 
@@ -529,6 +751,8 @@ fn main_transcript_streams_before_a_busy_engine_queue_completes_the_turn() {
     .expect("queue turn completion");
 
     app.drain_ready_engine_outputs_for_frame_to(&mut std::io::sink(), |_| {});
+    app.render_to_frame();
+    app.feed_one(SourceEvent::Tick(16));
     let frame = app.render_to_frame().text();
     assert!(frame.contains("live transcript marker"), "frame: {frame}");
     assert!(
@@ -1597,7 +1821,7 @@ fn system_prompt_omits_tool_guidance_when_tool_calling_disabled() {
 }
 
 #[test]
-fn edit_file_diff_survives_draft_promotion_until_tool_finish() {
+fn prepared_edit_file_diff_survives_promotion_until_tool_finish() {
     let mut app = TestApp::builder().build();
     app.set_terminal_size(120, 40);
     app.start_turn(7);
@@ -1626,7 +1850,7 @@ fn edit_file_diff_survives_draft_promotion_until_tool_finish() {
         .unwrap());
     assert!(app
         .eval_lua::<bool>(
-            "local p = smelt.transcript.get_tool_presentation('edit_file'); return p ~= nil and type(p.draft) == 'function'",
+            "local p = smelt.transcript.get_tool_presentation('edit_file'); return p ~= nil and type(p.body) == 'function'",
         )
         .unwrap());
     let args = std::collections::HashMap::from([
@@ -1655,7 +1879,15 @@ fn edit_file_diff_survives_draft_promotion_until_tool_finish() {
         arguments,
     }));
     let draft_frame = app.render_to_frame().text();
-    assert_edit_file_diff_visible(&draft_frame, "draft-finished");
+    assert!(
+        !draft_frame.contains("replacement snippet (not validated)"),
+        "{draft_frame}"
+    );
+    assert_edit_file_diff_visible(&draft_frame, "received-snippet");
+    assert_eq!(
+        evaluate_tool_decision(&mut app, 1, &call_id, "edit_file", &args),
+        protocol::Decision::Ask
+    );
 
     let invocation_id = protocol::InvocationId::new(1);
     app.feed_one(SourceEvent::engine(EngineEvent::ToolStarted {
@@ -1751,6 +1983,7 @@ fn evaluate_tool_decision(
         args: args.clone(),
         mode: protocol::AgentMode::parse("apply").unwrap(),
     }));
+    app.wait_for_tool_evaluation(request_id);
     app.actions()
         .iter()
         .rev()
@@ -1784,7 +2017,7 @@ struct InvalidEditFileCase {
 }
 
 #[test]
-fn invalid_edit_files_are_rejected_without_a_speculative_diff() {
+fn invalid_edit_file_drafts_are_removed_after_preflight_rejection() {
     let cases = [
         InvalidEditFileCase {
             name: "unread",
@@ -1882,7 +2115,10 @@ fn assert_invalid_edit_file_lifecycle(case: &InvalidEditFileCase, request_id: u6
 
     let draft_frame = app.render_to_frame().text();
     assert!(draft_frame.contains("* edit_file"), "frame: {draft_frame}");
-    assert_no_speculative_edit(&draft_frame, case, "draft");
+    assert!(
+        !draft_frame.contains("replacement snippet (not validated)"),
+        "{draft_frame}"
+    );
 
     let invocation_id = protocol::InvocationId::new(request_id);
     let decision = evaluate_tool_decision(&mut app, request_id, &call_id, "edit_file", &args);

@@ -17,8 +17,8 @@ use smelt_core::content::builder::{display_width, wrapped_segments, LineBuilder}
 use smelt_core::content::code_block::{measure_code_block, parse_code_block};
 use smelt_core::content::highlight::{
     emit_inline_spans, inline_spans_width, measure_markdown_table_with_prepare,
-    parse_inline_spans_with_options, render_code_block, render_markdown_table_with_prepare,
-    wrap_inline_spans, InlineOptions, InlineSpan, InlineStyle,
+    parse_inline_spans_with_options, render_code_block, render_code_block_range,
+    render_markdown_table_with_prepare, wrap_inline_spans, InlineOptions, InlineSpan, InlineStyle,
 };
 use smelt_core::content::inline_line::BreakPolicy;
 use smelt_core::content::markdown_ir::{
@@ -1491,17 +1491,35 @@ fn render_markdown_docs_from_state<'a>(
                                 smelt_core::buffer::BufId(0),
                                 smelt_core::buffer::BufCreateOpts::default(),
                             );
+                            let start = clip.start.saturating_sub(state.rows).min(rows);
+                            let end = clip.end.saturating_sub(state.rows).min(rows);
                             let outcome = {
                                 let mut col =
                                     LineBuilder::new(&mut buf, out.theme(), width.max(1) as u16);
                                 col.push(None, inherited_style);
-                                render_code_block(&mut col, &code_block, width, dim, bctx, true);
+                                render_code_block_range(
+                                    &mut col,
+                                    &code_block,
+                                    width,
+                                    dim,
+                                    bctx,
+                                    true,
+                                    start..end,
+                                );
                                 col.finish()
                             };
                             if outcome.was_wrapped {
                                 out.mark_wrapped();
                             }
-                            emit_temp_rows(out, &buf, width, state.rows, rows, clip, None);
+                            emit_temp_rows(
+                                out,
+                                &buf,
+                                width,
+                                state.rows.saturating_add(start),
+                                end - start,
+                                clip,
+                                None,
+                            );
                         }
                         state.rows = state.rows.saturating_add(rows);
                     } else {

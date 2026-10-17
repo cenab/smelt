@@ -311,6 +311,7 @@ app_story!(btw_dialog_streaming_answer, |ctx| {
         id: ask_id,
         delta: "` and a block:\n\n```rust\nfn main() {\n".into(),
     });
+    ctx.advance_time(250);
     ctx.assert_snapshot();
 
     let final_text =
@@ -349,6 +350,7 @@ app_story!(btw_dialog_streams_table_in_tiny_deltas, |ctx| {
         assert!(!rows.iter().any(|row| row.trim() == "|"), "frame: {frame}");
     }
 
+    ctx.advance_time(250);
     let frame = ctx.frame_text();
     assert!(frame.contains("A") && frame.contains("B"), "frame: {frame}");
     assert!(frame.contains("1") && frame.contains("2"), "frame: {frame}");
@@ -475,7 +477,7 @@ app_story!(resume_dialog, |ctx| {
             id: id.to_string(),
             title: Some(title.to_string()),
             slug: None,
-            first_user_message: Some(title.to_string()),
+            first_user_message: Some(title.into()),
             created_at_ms: ts,
             updated_at_ms: ts,
             mode: None,
@@ -488,7 +490,7 @@ app_story!(resume_dialog, |ctx| {
             display_context_tokens: None,
             history_len: None,
             checkpoint: None,
-            checkpoint_events: Vec::new(),
+            checkpoint_events: Default::default(),
             text_bytes: Some(bytes),
         };
         ctx.write_session_meta(&meta);

@@ -241,6 +241,11 @@ fn compact_command_streams_preview_into_rendered_transcript() {
         delta: "# Goal\nstreamed via slash command".into(),
     });
 
+    assert!(!app
+        .render_to_frame()
+        .text()
+        .contains("streamed via slash command"));
+    app.clock.advance(std::time::Duration::from_millis(250));
     let frame = app.render_to_frame().text();
     assert!(frame.contains("compacting"), "frame: {frame}");
     assert!(
@@ -268,6 +273,7 @@ fn streaming_compaction_preview_keeps_sparse_projection_viewport_bounded() {
         id: ask_id,
         delta: format!("# Goal\n{}\n{marker}", "streaming summary ".repeat(1_000)),
     });
+    app.clock.advance(std::time::Duration::from_millis(250));
     app.app
         .conversation
         .reset_transcript_projection_counters_for_harness();
@@ -416,7 +422,7 @@ fn auto_compaction_requests_frame_before_coalesced_response_clears_preview() {
         "frame: {streamed_frame}"
     );
     assert!(
-        streamed_frame.contains("streamed before response"),
+        streamed_frame.lines().any(|line| line.trim() == "#"),
         "frame: {streamed_frame}"
     );
 
@@ -488,7 +494,10 @@ fn ordered_prepare_request_paints_transient_streaming_state() {
     }
 
     assert!(
-        streamed_frames.iter().any(|frame| frame.contains(marker)),
+        streamed_frames
+            .iter()
+            .any(|frame| frame.contains("compacting")
+                && frame.lines().any(|line| line.trim() == "#")),
         "ordered prepare request skipped the transient frame: {streamed_frames:#?}"
     );
     assert!(
@@ -497,6 +506,7 @@ fn ordered_prepare_request_paints_transient_streaming_state() {
             .is_none(),
         "final response should clear the transient preview"
     );
+    app.wait_for_project_context();
     assert!(matches!(
         rx.try_recv().expect("prepare request reply"),
         engine::HostRequestDecision::Continue
@@ -610,6 +620,8 @@ fn engine_ask_delta_callbacks_can_update_compaction_preview_from_dispatch() {
         delta: "# Goal\nstream the summary".into(),
     });
 
+    app.clock.advance(std::time::Duration::from_millis(250));
+    app.render_to_frame();
     let preview_id = app
         .conversation_probe()
         .transcript_compaction_preview_id()
@@ -679,7 +691,7 @@ async fn timed_render_loop_shows_compaction_preview_only_while_following_tail() 
                 id: ask_id,
                 delta: marker.into(),
             }),
-            SourceEvent::Tick(20),
+            SourceEvent::Tick(250),
             SourceEvent::engine(protocol::EngineEvent::EngineAskResponse {
                 id: ask_id,
                 message: Some(protocol::Message::assistant(
@@ -940,8 +952,8 @@ async fn real_engine_responses_compaction_streams_preview_before_response() {
 
     let frame = streamed_frame.expect("streaming frame");
     assert!(frame.contains("compacting"), "frame: {frame}");
-    assert!(frame.contains("live compaction marker"), "frame: {frame}");
-
+    assert!(!frame.contains("live compaction marker"), "frame: {frame}");
+    app.clock.advance(std::time::Duration::from_millis(250));
     let next_iteration_frame = app.render_to_frame().text();
     assert!(
         next_iteration_frame.contains("live compaction marker"),
@@ -1187,6 +1199,10 @@ async fn real_engine_one_shot_auto_compaction_preserves_lifecycle() {
                 .recv_output()
                 .await
                 .expect("engine stopped during one-shot compaction");
+            let is_compaction_delta = matches!(
+                &output,
+                engine::EngineOutput::Event(protocol::EngineEvent::EngineAskDelta { .. })
+            );
             let is_prepare_request = matches!(
                 &output,
                 engine::EngineOutput::HostCall(engine::HostCall::PrepareRequest { .. })
@@ -1206,6 +1222,10 @@ async fn real_engine_one_shot_auto_compaction_preserves_lifecycle() {
 
             app.app
                 .dispatch_selected_engine_output_in_render_loop_to(output, &mut terminal_output);
+            app.wait_for_project_context();
+            if is_compaction_delta {
+                app.clock.advance(std::time::Duration::from_millis(250));
+            }
             let frame = app.render_to_frame().text();
             if is_prepare_request && waiting_frame.is_none() && frame.contains("compacting") {
                 waiting_frame = Some(frame.clone());
@@ -1318,6 +1338,7 @@ fn delayed_host_calls_cannot_claim_a_replacement_turn() {
                 app.press(KeyCode::Enter);
                 app.press(KeyCode::Enter);
                 app.press(KeyCode::Enter);
+                app.wait_for_turn_persistence();
                 assert_ne!(app.current_turn_id(), Some(42));
                 let (reply, response) = tokio::sync::oneshot::channel();
                 current_response = Some(response);
@@ -1358,6 +1379,7 @@ fn delayed_host_calls_cannot_claim_a_replacement_turn() {
                     Err(tokio::sync::oneshot::error::TryRecvError::Empty)
                 ));
                 assert_eq!(app.working_probe().phase_label(), Some("compacting"));
+                app.clock.advance(std::time::Duration::from_millis(250));
                 assert!(app.render_to_frame().text().contains("CURRENT_PREVIEW"));
             }
         }
@@ -1483,6 +1505,7 @@ fn late_compaction_callbacks_preserve_new_preview() {
             id: new_ask,
             delta: "NEW_SUMMARY".into(),
         });
+        app.clock.advance(std::time::Duration::from_millis(250));
         assert!(app.render_to_frame().text().contains("NEW_SUMMARY"));
         assert_eq!(app.working_probe().phase_label(), Some("compacting"));
 
@@ -1648,13 +1671,18 @@ async fn real_engine_compaction_preserves_queued_inputs() {
             let mut terminal_output = Vec::new();
             tokio::time::timeout(std::time::Duration::from_secs(15), async {
                 while completed < expected_turns {
-                    let output = app
-                        .app
-                        .core
-                        .engine
-                        .recv_output()
-                        .await
-                        .expect("engine output");
+                    let output = tokio::select! {
+                        output = app.app.core.engine.recv_output() => output.expect("engine output"),
+                        _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                            while let Some(event) = app.try_recv_app_event() {
+                                app.handle_app_event(event);
+                            }
+                            app.app.drain_persist_reports();
+                            app.drain_idle_work();
+                            app.pump_lua();
+                            continue;
+                        }
+                    };
                     let summary_delta = matches!(&output, engine::EngineOutput::Event(
                         protocol::EngineEvent::EngineAskDelta { delta, .. }
                     ) if delta.contains("CHECKPOINT_READY"));

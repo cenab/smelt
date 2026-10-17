@@ -125,6 +125,245 @@ async fn write_sse_response(sock: &mut tokio::net::TcpStream, body: &str) {
     sock.flush().await.unwrap();
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ResponseSteeringCase {
+    HookOnly,
+    ProviderAndHook,
+    Withdrawn,
+    DroppedReply,
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn response_callback_steering_commits_answer_before_follow_ups() {
+    for case in [
+        ResponseSteeringCase::HookOnly,
+        ResponseSteeringCase::ProviderAndHook,
+        ResponseSteeringCase::Withdrawn,
+        ResponseSteeringCase::DroppedReply,
+    ] {
+        tokio::time::timeout(TEST_DEADLINE, check_response_callback_steering(case))
+            .await
+            .unwrap_or_else(|_| panic!("response steering stalled: {case:?}"));
+    }
+}
+
+async fn check_response_callback_steering(case: ResponseSteeringCase) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let _ = read_json_request(&mut first).await;
+        let body = aux_text_sse();
+        let split = body.find("data: {\"type\":\"message_delta\"").unwrap();
+        first.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+        let prefix = &body[..split];
+        first
+            .write_all(format!("{:X}\r\n{prefix}\r\n", prefix.len()).as_bytes())
+            .await
+            .unwrap();
+        let (mut barrier, _) = listener.accept().await.unwrap();
+        let _ = read_json_request(&mut barrier).await;
+        write_sse_response(&mut barrier, &aux_text_sse()).await;
+        release_rx.await.unwrap();
+        let suffix = &body[split..];
+        first
+            .write_all(format!("{:X}\r\n{suffix}\r\n0\r\n\r\n", suffix.len()).as_bytes())
+            .await
+            .unwrap();
+        let (mut barrier, _) = listener.accept().await.unwrap();
+        let _ = read_json_request(&mut barrier).await;
+        write_sse_response(&mut barrier, &aux_text_sse()).await;
+        if case == ResponseSteeringCase::Withdrawn {
+            return None;
+        }
+        let (mut next, _) = listener.accept().await.unwrap();
+        let request = read_json_request(&mut next).await;
+        write_sse_response(
+            &mut next,
+            &aux_text_sse().replace("sub-answer", "final-answer"),
+        )
+        .await;
+        Some(request)
+    });
+    let config = EngineConfig {
+        system_prompt_override: Some("test system".into()),
+        ..EngineConfig::new(PathBuf::from("/tmp"), Arc::new(engine::clock::RealClock))
+    };
+    let target = ModelTarget {
+        model: "test-model".into(),
+        api_base: format!("http://{addr}"),
+        api_key: "test-key".into(),
+        provider_type: "anthropic-compatible".into(),
+        config: ModelConfig::default(),
+    };
+    let runtime = RequestRuntimeConfig {
+        request_audit: protocol::RequestAuditMode::Off,
+        ..Default::default()
+    };
+    let barrier = |id| UiCommand::EngineAsk {
+        id,
+        system: "command barrier".into(),
+        messages: vec![Message::user(Content::text("ack"))],
+        target: Box::new(target.clone()),
+        request_config: runtime,
+        response_format: None,
+        reasoning_effort: ReasoningEffort::Off,
+        fast_mode: false,
+        tools: Vec::new(),
+        session_id: "sess".into(),
+        persistence: protocol::PersistenceScope::default(),
+        stream: false,
+        visible_retries: false,
+    };
+    let mut handle = engine::start(config, Box::new(engine::tools::EmptyDispatcher));
+    while !matches!(handle.recv().await, Some(EngineEvent::Ready)) {}
+    handle.send(UiCommand::StartTurn(Box::new(StartTurnPayload {
+        turn_id: 1,
+        input: protocol::StartTurnInput::user(Content::text("initial request")),
+        mode: AgentMode::normal(),
+        model_target: target.clone(),
+        request_config: runtime,
+        reasoning_effort: ReasoningEffort::Off,
+        fast_mode: false,
+        history: protocol::ModelHistorySource::items(Vec::new()),
+        session_id: "sess".into(),
+        sessions_root: PathBuf::from("/tmp"),
+        persistence: protocol::PersistenceScope::default(),
+        permission_overrides: None,
+        system_prompt: Some("test system".into()),
+        tools: Vec::new(),
+    })));
+    let mut release = Some(release_tx);
+    let mut reply = None;
+    let mut first_delta = true;
+    let mut callbacks = 0;
+    let mut history = vec![protocol::HistoryItem::user(Content::text(
+        "initial request",
+    ))];
+    loop {
+        match handle.recv_output().await {
+            Some(engine::EngineOutput::HostCall(engine::HostCall::PrepareRequest {
+                reply,
+                ..
+            })) => {
+                reply.send(engine::HostRequestDecision::Continue).unwrap();
+            }
+            Some(engine::EngineOutput::HostCall(engine::HostCall::ProviderResponse {
+                reply: response,
+                ..
+            })) => {
+                callbacks += 1;
+                if callbacks == 1 {
+                    handle.send(UiCommand::Steer {
+                        input: protocol::StartTurnInput::user(Content::text("hook follow-up")),
+                    });
+                    if case == ResponseSteeringCase::Withdrawn {
+                        handle.send(UiCommand::Unsteer { count: 1 });
+                    }
+                    handle.send(barrier(2));
+                    reply = Some(response);
+                } else {
+                    response.send(None).unwrap();
+                }
+            }
+            Some(engine::EngineOutput::Event(event)) => match event {
+                EngineEvent::TextDelta { .. } if first_delta => {
+                    first_delta = false;
+                    if case == ResponseSteeringCase::ProviderAndHook {
+                        handle.send(UiCommand::Steer {
+                            input: protocol::StartTurnInput::user(Content::text(
+                                "provider follow-up",
+                            )),
+                        });
+                    }
+                    handle.send(barrier(1));
+                }
+                EngineEvent::EngineAskResponse { id: 1, .. } => {
+                    release.take().unwrap().send(()).unwrap();
+                }
+                EngineEvent::EngineAskResponse { id: 2, .. } => {
+                    let response = reply.take().unwrap();
+                    if case != ResponseSteeringCase::DroppedReply {
+                        response.send(None).unwrap();
+                    }
+                }
+                EngineEvent::HistoryAppended { delta, .. } | EngineEvent::Steered { delta, .. } => {
+                    assert_eq!(delta.first_index.get(), history.len(), "{case:?}");
+                    history.extend(delta.items);
+                }
+                EngineEvent::HistoryUpdated { update, .. } => {
+                    history.truncate(update.first_index.get());
+                    history.extend(update.items);
+                }
+                EngineEvent::ResponseDraftRejected => panic!("valid answer was rejected: {case:?}"),
+                EngineEvent::TurnError { message, .. } => panic!("{message}"),
+                EngineEvent::TurnComplete {
+                    history: update, ..
+                } => {
+                    if let Some(update) = update {
+                        history.truncate(update.first_index.get());
+                        history.extend(update.items);
+                    }
+                    break;
+                }
+                _ => {}
+            },
+            _ => panic!("unexpected engine output"),
+        }
+    }
+    let mut expected = vec![
+        (protocol::Role::User, "initial request"),
+        (protocol::Role::Assistant, "sub-answer"),
+    ];
+    if case == ResponseSteeringCase::ProviderAndHook {
+        expected.push((protocol::Role::User, "provider follow-up"));
+    }
+    if case != ResponseSteeringCase::Withdrawn {
+        expected.extend([
+            (protocol::Role::User, "hook follow-up"),
+            (protocol::Role::Assistant, "final-answer"),
+        ]);
+    }
+    let actual: Vec<_> = protocol::history_to_messages(&history)
+        .iter()
+        .map(|message| {
+            (
+                message.role,
+                message
+                    .content
+                    .as_ref()
+                    .unwrap()
+                    .text_content()
+                    .into_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        expected
+            .iter()
+            .map(|(role, text)| (*role, text.to_string()))
+            .collect::<Vec<_>>(),
+        "{case:?}"
+    );
+    let next = server.await.unwrap();
+    if let Some(next) = next {
+        let messages = next["messages"].to_string();
+        let mut previous = None;
+        for (_, text) in &expected[..expected.len() - 1] {
+            let position = messages
+                .find(text)
+                .unwrap_or_else(|| panic!("missing {text}: {messages}"));
+            assert!(
+                previous.is_none_or(|previous| previous < position),
+                "{messages}"
+            );
+            previous = Some(position);
+        }
+    }
+}
+
 /// Accepts connections in a loop. Request #0 is the main turn (returns
 /// a tool_use); every subsequent request is treated as an EngineAsk and
 /// gets a plain text response.
@@ -524,9 +763,11 @@ async fn queued_message_during_streamed_tool_call_is_acknowledged_after_tool_fin
                 Some(EngineEvent::ToolFinished { call_id, .. }) if call_id == TOOL_CALL_ID => {
                     lifecycle.push("tool_finished");
                 }
-                Some(EngineEvent::Steered { text, count, .. }) => {
-                    assert_eq!(text, "queued follow-up");
-                    assert_eq!(count, 1);
+                Some(EngineEvent::Steered { delta, .. }) => {
+                    assert!(matches!(delta.items.as_slice(),
+                        [protocol::HistoryItem::User { content, .. }]
+                            if content.text_content() == "queued follow-up"
+                    ));
                     lifecycle.push("steered");
                 }
                 Some(EngineEvent::TurnError { message, .. }) => panic!("turn failed: {message}"),
@@ -545,20 +786,17 @@ async fn queued_message_during_streamed_tool_call_is_acknowledged_after_tool_fin
     );
 
     tokio::time::timeout(TEST_DEADLINE, async {
-        let mut acknowledged = false;
         loop {
             match handle.recv().await {
-                Some(EngineEvent::Steered { sent_at_ms, .. }) => {
-                    assert_eq!(sent_at_ms, 1_742_567_823_000);
-                    acknowledged = true;
-                }
-                Some(EngineEvent::HistoryAppended { delta, .. }) if acknowledged => {
+                Some(EngineEvent::Steered { turn_id, delta }) => {
+                    assert_eq!(turn_id, 1);
                     assert!(matches!(
                         delta.items.as_slice(),
                         [protocol::HistoryItem::User {
+                            content,
                             sent_at_ms: Some(1_742_567_823_000),
                             ..
-                        }]
+                        }] if content.text_content() == "queued follow-up"
                     ));
                     break;
                 }
@@ -663,9 +901,11 @@ async fn queued_message_is_acknowledged_after_all_parallel_tools_finish() {
                     assert!(finished.insert(call_id), "tool finished more than once");
                     lifecycle.push("tool_finished");
                 }
-                Some(EngineEvent::Steered { text, count, .. }) => {
-                    assert_eq!(text, "queued follow-up");
-                    assert_eq!(count, 1);
+                Some(EngineEvent::Steered { delta, .. }) => {
+                    assert!(matches!(delta.items.as_slice(),
+                        [protocol::HistoryItem::User { content, .. }]
+                            if content.text_content() == "queued follow-up"
+                    ));
                     lifecycle.push("steered");
                 }
                 Some(EngineEvent::TurnError { message, .. }) => panic!("turn failed: {message}"),
@@ -696,6 +936,181 @@ async fn queued_message_is_acknowledged_after_all_parallel_tools_finish() {
     .await
     .expect("turn should complete");
     server.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn chat_reasoning_replay_tracks_model_switches_during_tool_execution() {
+    for execution_mode in [ToolExecutionMode::Concurrent, ToolExecutionMode::Sequential] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for step in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.push(read_json_request(&mut socket).await);
+                let delta = if step < 2 {
+                    serde_json::json!({
+                        "reasoning_content": if step == 0 { "original thought" } else { "next thought" },
+                        "tool_calls": [{"index": 0, "id": format!("{TOOL_CALL_ID}-{step}"), "type": "function", "function": {
+                            "name": TOOL_NAME, "arguments": serde_json::json!({"step": step}).to_string(),
+                        }}],
+                    })
+                } else {
+                    serde_json::json!({"content": "done"})
+                };
+                let body = format!(
+                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    serde_json::json!({"choices": [{"delta": delta}]}),
+                    serde_json::json!({"choices": [{"delta": {}, "finish_reason": if step < 2 { "tool_calls" } else { "stop" }}]})
+                );
+                write_sse_response(&mut socket, &body).await;
+            }
+            requests
+        });
+        let config = EngineConfig {
+            system_prompt_override: Some("test system".into()),
+            host_callbacks: engine::HostCallbacks::Disabled,
+            ..EngineConfig::new(PathBuf::from("/tmp"), Arc::new(engine::clock::RealClock))
+        };
+        let target = ModelTarget {
+            model: "original-model".into(),
+            api_base: format!("http://{addr}"),
+            api_key: "test-only".into(),
+            provider_type: "openai-compatible".into(),
+            config: ModelConfig::default(),
+        };
+        let next_target = ModelTarget {
+            model: "next-model".into(),
+            ..target.clone()
+        };
+        let mut handle = engine::start(config, Box::new(engine::tools::EmptyDispatcher));
+        loop {
+            match handle.recv().await {
+                Some(EngineEvent::Ready) => break,
+                Some(_) => {}
+                None => panic!("engine stopped before ready"),
+            }
+        }
+        handle.send(UiCommand::StartTurn(Box::new(StartTurnPayload {
+            turn_id: 1,
+            input: protocol::StartTurnInput::user(Content::text("go")),
+            mode: AgentMode::normal(),
+            model_target: target,
+            request_config: RequestRuntimeConfig { request_audit: protocol::RequestAuditMode::Off, ..Default::default() },
+            reasoning_effort: ReasoningEffort::Off,
+            fast_mode: false,
+            history: protocol::ModelHistorySource::items(Vec::new()),
+            session_id: "sess".into(),
+            sessions_root: PathBuf::from("/tmp"),
+            persistence: protocol::PersistenceScope::default(),
+            permission_overrides: None,
+            system_prompt: Some("test system".into()),
+            tools: vec![ToolDef {
+                name: TOOL_NAME.into(),
+                description: "probe reasoning replay across a model switch".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {"step": {"type": "integer"}}}),
+                modes: None,
+                execution_mode,
+                override_core: false,
+                hooks: ToolHookFlags::default(),
+                headless: true,
+            }],
+        })));
+        let mut dispatched = 0;
+        let mut recorded = Vec::new();
+        tokio::time::timeout(TEST_DEADLINE, async {
+            loop {
+                match handle.recv().await {
+                    Some(EngineEvent::ToolEvaluationRequest { request_id, .. }) => {
+                        handle.send(UiCommand::ToolEvaluationResponse {
+                            request_id,
+                            evaluation: protocol::ToolEvaluation {
+                                decision: protocol::Decision::Allow,
+                                metadata: ToolMetadata::default(),
+                            },
+                        });
+                    }
+                    Some(EngineEvent::ToolDispatch {
+                        request_id,
+                        invocation_id,
+                        call_id,
+                        ..
+                    }) => {
+                        if dispatched == 0 {
+                            handle.send(UiCommand::SetTurnModel {
+                                target: Box::new(next_target.clone()),
+                                system_prompt: "next system".into(),
+                            });
+                        }
+                        dispatched += 1;
+                        handle.send(UiCommand::ToolResult {
+                            request_id,
+                            invocation_id,
+                            call_id,
+                            content: format!("step {dispatched} finished"),
+                            is_error: false,
+                            metadata: None,
+                            display_content: Vec::new(),
+                            attachment: None,
+                        });
+                    }
+                    Some(EngineEvent::HistoryAppended { delta, .. }) => {
+                        for item in delta.items.iter() {
+                            if let protocol::HistoryItem::Assistant(step) = item {
+                                if let Some(reasoning) = &step.reasoning {
+                                    recorded.push((
+                                        reasoning.clone(),
+                                        step.reasoning_blocks[0].data["origin"]["model"]
+                                            .as_str()
+                                            .unwrap()
+                                            .to_owned(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Some(EngineEvent::TurnComplete { .. }) => break,
+                    Some(EngineEvent::TurnError { message, .. }) => {
+                        panic!("turn failed: {message}")
+                    }
+                    Some(_) => {}
+                    None => panic!("engine stopped before turn completion"),
+                }
+            }
+        })
+        .await
+        .expect("model-switch tool flow should finish");
+        let requests = server.await.unwrap();
+        assert_eq!(dispatched, 2);
+        assert_eq!(requests[0]["model"], "original-model");
+        assert_eq!(requests[1]["model"], "next-model");
+        assert!(requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message.get("reasoning_content").is_none()));
+        assert_eq!(requests[2]["model"], "next-model");
+        let messages = requests[2]["messages"].as_array().unwrap();
+        let assistants: Vec<_> = messages
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .collect();
+        assert_eq!(assistants.len(), 2);
+        assert!(assistants[0].get("reasoning_content").is_none());
+        assert_eq!(assistants[1]["reasoning_content"], "next thought");
+        for (step, assistant) in assistants.iter().enumerate() {
+            assert!(messages.iter().any(|message| message["role"] == "tool"
+                && message["tool_call_id"] == assistant["tool_calls"][0]["id"]
+                && message["content"] == format!("step {} finished", step + 1)));
+        }
+        assert_eq!(
+            recorded,
+            [
+                ("original thought".into(), "original-model".into()),
+                ("next thought".into(), "next-model".into())
+            ]
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -903,9 +1318,11 @@ async fn updates_during_sequential_tool_wait_apply_after_tool_finishes() {
             Some(EngineEvent::ToolFinished { call_id, .. }) if call_id == TOOL_CALL_ID => {
                 lifecycle.push("tool_finished");
             }
-            Some(EngineEvent::Steered { text, count, .. }) => {
-                assert_eq!(text, "queued during tool");
-                assert_eq!(count, 1);
+            Some(EngineEvent::Steered { delta, .. }) => {
+                assert!(matches!(delta.items.as_slice(),
+                    [protocol::HistoryItem::User { content, .. }]
+                        if content.text_content() == "queued during tool"
+                ));
                 lifecycle.push("steered");
             }
             Some(EngineEvent::TurnComplete { .. }) => break,

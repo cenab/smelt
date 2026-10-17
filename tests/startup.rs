@@ -90,7 +90,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-fn consume_http_request(stream: &mut TcpStream) {
+fn read_http_request(stream: &mut TcpStream) -> serde_json::Value {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set request read timeout");
@@ -109,10 +109,18 @@ fn consume_http_request(stream: &mut TcpStream) {
             }
         }
     }
-    let content_length = content_length.expect("POST request has content length");
-    let consumed = std::io::copy(&mut reader.take(content_length), &mut std::io::sink())
-        .expect("consume request body");
-    assert_eq!(consumed, content_length, "truncated request body");
+    let content_length = content_length.unwrap_or(0);
+    let mut body = Vec::new();
+    let consumed = reader
+        .take(content_length)
+        .read_to_end(&mut body)
+        .expect("read request body");
+    assert_eq!(consumed as u64, content_length, "truncated request body");
+    if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&body).expect("JSON request body")
+    }
 }
 
 fn drain_provider_requests(listener: &TcpListener) -> bool {
@@ -137,6 +145,772 @@ fn drain_provider_requests(listener: &TcpListener) -> bool {
         let _ = stream.write_all(response.as_bytes());
     }
     model_request_seen
+}
+
+#[test]
+fn queued_turn_preserves_previous_assistant_answer() {
+    for ephemeral in [false, true] {
+        check_queued_answer(false, ephemeral);
+    }
+}
+
+#[test]
+fn promoted_queued_turn_preserves_previous_assistant_answer() {
+    for ephemeral in [false, true] {
+        check_queued_answer(true, ephemeral);
+    }
+}
+
+fn check_queued_answer(promote: bool, ephemeral: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let provider = TcpListener::bind("127.0.0.1:0").unwrap();
+    provider.set_nonblocking(true).unwrap();
+    let config = root.path().join("init.lua");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+smelt.settings.autoupgrade = "off"
+smelt.settings.auto_continue = "off"
+smelt.settings.auto_reload = false
+smelt.settings.show_prediction = false
+smelt.settings.vim = false
+smelt.provider.register("local", {{
+  type = "openai-compatible", api_base = "http://{}", models = {{ "test-model" }},
+}})
+smelt.lifecycle.on_ready(function() smelt.model.set("local/test-model") end)
+smelt.keymap.set("", "<F4>", function()
+  smelt.engine.ask({{ system = "test barrier", question = "QUEUE_BARRIER", on_delta = function() end }})
+end)
+"#,
+            provider.local_addr().unwrap()
+        ),
+    )
+    .unwrap();
+    let mut command = isolated_smelt_command(root.path());
+    command
+        .args(["--config", config.to_str().unwrap()])
+        .env("TERM", "xterm-256color")
+        .env("NO_COLOR", "1");
+    if ephemeral {
+        command.arg("--ephemeral");
+    }
+    let (mut master, mut process) = spawn_in_pty(command);
+    let mut captured = Vec::new();
+    let mut terminal = vt100::Parser::new(24, 100, 0);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut submitted = false;
+    let mut queued = false;
+    let mut first_stream = None;
+    let mut main_requests = Vec::new();
+    let mut barriers = 0;
+    let finish = stream_event(serde_json::json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    })) + "data: [DONE]\n\n";
+    loop {
+        while let Ok((mut stream, _)) = provider.accept() {
+            let body = read_http_request(&mut stream);
+            let main = body["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty());
+            let barrier = body["messages"].to_string().contains("QUEUE_BARRIER");
+            let content = if main {
+                main_requests.push(body);
+                match main_requests.len() {
+                    1 => "FIRST_ANSWER",
+                    2 => "SECOND_ANSWER",
+                    _ => panic!("unexpected third turn"),
+                }
+            } else {
+                "test session"
+            };
+            let chunk = stream_event(serde_json::json!({
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": content}}],
+            }));
+            write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{chunk}\r\n", chunk.len()).unwrap();
+            if main && main_requests.len() == 1 {
+                first_stream = Some(stream);
+            } else {
+                write!(stream, "{:x}\r\n{finish}\r\n0\r\n\r\n", finish.len()).unwrap();
+            }
+            if barrier {
+                barriers += 1;
+                // This auxiliary request is dispatched after the queued input on the engine channel.
+                if let Some(mut stream) = first_stream.take() {
+                    write!(stream, "{:x}\r\n{finish}\r\n0\r\n\r\n", finish.len()).unwrap();
+                }
+            }
+        }
+        let previous_len = captured.len();
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[previous_len..]);
+        assert!(process.child.try_wait().unwrap().is_none(), "smelt exited");
+        let screen = terminal.screen().contents();
+        if !submitted && screen.contains("local/test-model") {
+            master.write_all(b"first request\r").unwrap();
+            submitted = true;
+        }
+        if !queued && screen.contains("FIRST_ANSWER") {
+            master.write_all(b"second request\r").unwrap();
+            if promote {
+                master.write_all(b"\r").unwrap();
+            }
+            master.write_all(b"\x1bOS").unwrap();
+            queued = true;
+        }
+        if screen.contains("SECOND_ANSWER") {
+            assert!(queued);
+            assert_eq!(barriers, 1);
+            assert_eq!(main_requests.len(), 2);
+            let expected = vec![
+                ("user", "first request"),
+                ("assistant", "FIRST_ANSWER"),
+                ("user", "second request"),
+            ];
+            let mut previous_position = None;
+            for text in expected
+                .iter()
+                .map(|(_, text)| *text)
+                .chain(["SECOND_ANSWER"])
+            {
+                let position = screen
+                    .find(text)
+                    .unwrap_or_else(|| panic!("missing {text}:\n{screen}"));
+                assert!(
+                    previous_position.is_none_or(|previous| previous < position),
+                    "{screen}"
+                );
+                previous_position = Some(position);
+            }
+            let conversation: Vec<_> = main_requests[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .skip_while(|message| message["content"] != "first request")
+                .map(|message| {
+                    (
+                        message["role"].as_str().unwrap(),
+                        message["content"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(conversation, expected);
+            break;
+        }
+        assert!(Instant::now() < deadline, "queued turn stalled:\n{screen}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn interactive_rewind_keeps_terminal_actions_responsive_with_large_stored_history() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("init.lua");
+    std::fs::write(
+        &config,
+        r#"
+smelt.settings.autoupgrade = "off"
+smelt.settings.auto_continue = "off"
+smelt.settings.auto_reload = false
+smelt.settings.show_prediction = false
+smelt.settings.vim = false
+smelt.provider.register("probe", {
+  type = "openai-compatible", api_base = "http://127.0.0.1:9/v1",
+  models = { "test-model" },
+})
+"#,
+    )
+    .unwrap();
+    let mut session = smelt_core::session::Session::new(1, root.path().to_owned());
+    let mut transcript = smelt_core::content::transcript::Transcript::new();
+    for turn in 0..1_024 {
+        let text = format!("rewind fixture {turn}");
+        let index = session.history.len();
+        session
+            .history
+            .push(protocol::HistoryItem::user(protocol::Content::text(&text)));
+        transcript.push_with_origin(
+            smelt_core::Block::User {
+                text,
+                image_labels: Vec::new(),
+                command: false,
+                sent_at_ms: None,
+            },
+            smelt_core::BlockOrigin::History(index),
+        );
+        let output = "large stored assistant output\n".repeat(8_192);
+        let index = session.history.len();
+        session.history.push(protocol::HistoryItem::assistant(
+            protocol::AssistantStep::terminal(
+                Some(protocol::Content::text(&output)),
+                None,
+                Vec::new(),
+            ),
+        ));
+        transcript.push_with_origin(
+            smelt_core::Block::Text {
+                content: output.into(),
+            },
+            smelt_core::BlockOrigin::History(index),
+        );
+    }
+    let id = session.id.clone();
+    let sessions_root = root.path().join("state/smelt/sessions");
+    let mut writer = smelt_store::OwnedLineageWriter::open(&sessions_root, &id).unwrap();
+    let mut commit = smelt_core::session::initial_store_commit_from_session(&session).unwrap();
+    commit.transcript_records = Some(smelt_store::TranscriptRecordSuffix {
+        start: smelt_store::TranscriptRecordIndex::ZERO,
+        records: transcript
+            .history
+            .block_records()
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                smelt_core::transcript_model::transcript_block_row_with_block_idx(
+                    index,
+                    index as u64,
+                    record,
+                )
+                .unwrap()
+            })
+            .collect(),
+    });
+    writer.commit_session(&commit).unwrap();
+    writer.refresh_catalog().unwrap();
+    writer.release().unwrap();
+    drop(commit);
+    drop(session);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_smelt"));
+    command
+        .args(["--config", config.to_str().unwrap(), "--resume", &id])
+        .current_dir(root.path())
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("XDG_CACHE_HOME", root.path().join("cache"))
+        .env("TERM", "xterm-256color");
+    let (mut master, mut process) = spawn_in_pty(command);
+    let mut captured = Vec::new();
+    let mut terminal = vt100::Parser::new(24, 100, 0);
+    let startup_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let previous_len = captured.len();
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[previous_len..]);
+        assert!(process.child.try_wait().unwrap().is_none(), "smelt exited");
+        if terminal
+            .screen()
+            .contents()
+            .contains("large stored assistant output")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < startup_deadline,
+            "resume stalled: {}",
+            terminal.screen().contents()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    master.write_all(b"\x1b").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    master.write_all(b"\x1b").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    master.write_all(b"\x1b[24~").unwrap();
+    let input_deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        let previous_len = captured.len();
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[previous_len..]);
+        if terminal.screen().contents().contains("performance") {
+            break;
+        }
+        assert!(
+            Instant::now() < input_deadline,
+            "Escape-Escape blocked F12: {}",
+            terminal.screen().contents()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    master.write_all(b"\x1b[24~").unwrap();
+    let dialog_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let previous_len = captured.len();
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[previous_len..]);
+        if terminal.screen().contents().contains("(current)") {
+            break;
+        }
+        assert!(
+            Instant::now() < dialog_deadline,
+            "rewind dialog did not open: {}",
+            terminal.screen().contents()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The newest page contains 128 user turns, an older-page action and current.
+    for _ in 0..129 {
+        master.write_all(b"\x1b[A").unwrap();
+    }
+    master.write_all(b"\r").unwrap();
+    let page_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let previous_len = captured.len();
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[previous_len..]);
+        if terminal.screen().contents().contains("(newer turns)") {
+            break;
+        }
+        assert!(
+            Instant::now() < page_deadline,
+            "older rewind page did not open: {}",
+            terminal.screen().contents()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Skip current and the newer-page action, then select a real stored prefix.
+    master.write_all(b"\x1b[A\x1b[A\r\x1b[24~").unwrap();
+    let input_deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        let previous_len = captured.len();
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[previous_len..]);
+        if terminal.screen().contents().contains("performance") {
+            break;
+        }
+        assert!(
+            Instant::now() < input_deadline,
+            "stored selection blocked F12: {}",
+            terminal.screen().contents()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    master.write_all(b"\x1b[24~").unwrap();
+    let rewind_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let previous_len = captured.len();
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[previous_len..]);
+        if terminal.screen().contents().contains("rewind fixture 895") {
+            break;
+        }
+        assert!(
+            Instant::now() < rewind_deadline,
+            "stored selection did not restore input: {}",
+            terminal.screen().contents()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_worktree_tool_keeps_typing_responsive_during_checkout() {
+    interactive_tool_keeps_typing_responsive(ToolProbe::Worktree).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_cwd_tool_keeps_typing_responsive_during_git_discovery() {
+    interactive_tool_keeps_typing_responsive(ToolProbe::Cwd).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_notebook_preview_keeps_typing_responsive_during_file_read() {
+    interactive_tool_keeps_typing_responsive(ToolProbe::Notebook).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_request_refreshes_external_git_changes_and_worktree_permissions() {
+    interactive_tool_keeps_typing_responsive(ToolProbe::Project).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolProbe {
+    Worktree,
+    Cwd,
+    Notebook,
+    Project,
+}
+
+async fn interactive_tool_keeps_typing_responsive(probe: ToolProbe) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let create_worktree = probe == ToolProbe::Worktree;
+    let notebook = probe == ToolProbe::Notebook;
+    let refresh_project = probe == ToolProbe::Project;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    let home = tempfile::tempdir().unwrap();
+    let repo = home.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .expect("git executable");
+    let run_git = |cwd: &Path, args: &[&str]| {
+        let output = Command::new(&git)
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "smelt test")
+            .env("GIT_AUTHOR_EMAIL", "smelt-test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "smelt test")
+            .env("GIT_COMMITTER_EMAIL", "smelt-test@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run_git(&repo, &["init", "-b", "main"]);
+    std::fs::write(repo.join("hello.txt"), "hello\n").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "fixture"]);
+    let active = if refresh_project {
+        run_git(
+            &repo,
+            &["worktree", "add", ".worktrees/start", "-b", "start"],
+        );
+        repo.join(".worktrees/start")
+    } else {
+        repo.clone()
+    };
+    let target = if create_worktree {
+        repo.join(".worktrees/latency-probe")
+    } else if refresh_project {
+        repo.join(".worktrees/other/hello.txt")
+    } else if notebook {
+        let target = repo.join("probe.ipynb");
+        let path = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        target
+    } else {
+        let target = repo.join("nested");
+        std::fs::create_dir(&target).unwrap();
+        run_git(&target, &["init", "-b", "main"]);
+        target
+    };
+    let started = home.path().join("operation-started");
+    let release = home.path().join("operation-release");
+    let completed = home.path().join("operation-completed");
+    let notebook_content = serde_json::json!({
+        "nbformat": 4, "nbformat_minor": 5, "metadata": {},
+        "cells": [{ "cell_type": "code", "id": "probe-cell", "metadata": {},
+            "source": ["PROBE_OLD\n"], "execution_count": null, "outputs": [] }]
+    })
+    .to_string();
+    if notebook {
+        let target = target.clone();
+        let started = started.clone();
+        let release = release.clone();
+        let content = notebook_content.clone();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut writer = loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&target)
+                {
+                    Ok(writer) => break writer,
+                    Err(_) if Instant::now() < deadline && target.exists() => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(_) => return,
+                }
+            };
+            std::fs::write(started, "ready").unwrap();
+            while !release.exists() && Instant::now() < deadline && target.exists() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let modified = writer.metadata().unwrap().modified().unwrap();
+            writer.write_all(content.as_bytes()).unwrap();
+            writer
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        });
+    }
+    let wait = "touch \"$SMELT_PROBE_STARTED\"\nwhile [ ! -f \"$SMELT_PROBE_RELEASE\" ]; do sleep 0.01; done\n";
+    let wrappers = home.path().join("bin");
+    std::fs::create_dir(&wrappers).unwrap();
+    let script = if create_worktree {
+        let hook = repo.join(".git/hooks/post-checkout");
+        std::fs::write(&hook, format!("#!/bin/sh\n{wait}")).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        None
+    } else if notebook || refresh_project {
+        None
+    } else {
+        Some(format!("#!/bin/sh\nif [ \"$PWD\" = \"$SMELT_PROBE_TARGET\" ] && [ ! -f \"$SMELT_PROBE_STARTED\" ]; then\n{wait}fi\nexec \"$SMELT_PROBE_GIT\" \"$@\"\n"))
+    };
+    if let Some(script) = script {
+        let path = wrappers.join("git");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let tool = if create_worktree {
+        "enter_worktree"
+    } else if notebook {
+        "edit_notebook"
+    } else if refresh_project {
+        "read_file"
+    } else {
+        "switch_cwd"
+    };
+    let args = if create_worktree {
+        serde_json::json!({ "name": "latency-probe" })
+    } else if notebook {
+        serde_json::json!({ "notebook_path": target, "cell_number": 0, "new_source": "PROBE_NEW\n" })
+    } else if refresh_project {
+        serde_json::json!({ "file_path": target })
+    } else {
+        serde_json::json!({ "path": target })
+    };
+    let provider = MockServer::start().await;
+    let provider_git = git.clone();
+    let provider_cwd = active.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |request: &Request| {
+            if request.url.path().ends_with("/count_tokens") {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({ "input_tokens": 10 }));
+            }
+            let request: serde_json::Value = request.body_json().unwrap();
+            let call_tool = request["tools"].as_array().is_some_and(|tools| !tools.is_empty())
+                && !request["messages"].to_string().contains("tool_result");
+            let mut events = vec![serde_json::json!({
+                "type": "message_start", "message": {
+                    "id": "msg_probe", "type": "message", "role": "assistant", "model": "test-model",
+                    "content": [], "stop_reason": null, "stop_sequence": null,
+                    "usage": { "input_tokens": 10, "output_tokens": 0 }
+                }
+            })];
+            let reason = if call_tool {
+                if refresh_project {
+                    let output = Command::new(&provider_git).current_dir(&provider_cwd).args(["checkout", "-b", "probe-after-tool"]).output().unwrap();
+                    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                }
+                events.push(serde_json::json!({ "type": "content_block_start", "index": 0,
+                    "content_block": { "type": "tool_use", "id": "call_probe", "name": tool, "input": {} } }));
+                events.push(serde_json::json!({ "type": "content_block_delta", "index": 0,
+                    "delta": { "type": "input_json_delta", "partial_json": args.to_string() } }));
+                "tool_use"
+            } else {
+                events.push(serde_json::json!({ "type": "content_block_start", "index": 0,
+                    "content_block": { "type": "text", "text": "done" } }));
+                "end_turn"
+            };
+            events.extend([
+                serde_json::json!({ "type": "content_block_stop", "index": 0 }),
+                serde_json::json!({ "type": "message_delta", "delta": { "stop_reason": reason }, "usage": { "output_tokens": 1 } }),
+                serde_json::json!({ "type": "message_stop" }),
+            ]);
+            let body: String = events.into_iter().map(|event| format!("data: {event}\n\n")).collect();
+            let response = ResponseTemplate::new(200).insert_header("content-type", "text/event-stream").set_body_string(body);
+            if refresh_project { response.set_delay(Duration::from_millis(200)) } else { response }
+        })
+        .mount(&provider).await;
+    let notebook_setup = if notebook {
+        format!("smelt.permissions.extend({{ apply = {{ tools = {{ ask = {{ 'edit_notebook' }} }} }} }})\nsmelt.fs.file_state.record_read({}, {}, 0, 10000)\n",
+            serde_json::to_string(&target.to_string_lossy()).unwrap(),
+            serde_json::to_string(&notebook_content).unwrap())
+    } else {
+        String::new()
+    };
+    let project_setup = if refresh_project {
+        let command = format!(
+            "'{}' -C '{}' checkout -b probe-new && '{}' -C '{}' worktree add '{}' -b other",
+            git.display(),
+            active.display(),
+            git.display(),
+            active.display(),
+            target.parent().unwrap().display()
+        );
+        format!("smelt.settings.restrict_to_workspace = true\nsmelt.lifecycle.on('ready', function() assert(os.execute({})); local file = assert(io.open({}, 'w')); file:write('ready'); file:close() end)\n",
+            serde_json::to_string(&command).unwrap(), serde_json::to_string(&started.to_string_lossy()).unwrap())
+    } else {
+        String::new()
+    };
+    let config = home.path().join("init.lua");
+    std::fs::write(&config, format!(r#"
+{notebook_setup}
+{project_setup}
+smelt.settings.autoupgrade = "off"
+smelt.settings.auto_continue = "off"
+smelt.settings.auto_reload = false
+smelt.settings.show_prediction = false
+smelt.settings.vim = false
+smelt.settings.worktree_root = ".worktrees"
+smelt.events.on("turn_end", function()
+  local path = {}
+  local file = assert(io.open(path .. ".tmp", "w"))
+  file:write(smelt.session.cwd(), "\n", smelt.prompt.text())
+  if {refresh_project} then file:write("\n", smelt.signal.get("branch") or "") end
+  file:close()
+  assert(os.rename(path .. ".tmp", path))
+end)
+smelt.provider.register("probe", {{ type = "anthropic", api_base = "{}", api_key_env = "SMELT_PROBE_KEY", models = {{ "test-model" }} }})
+"#, serde_json::to_string(&completed.to_string_lossy()).unwrap(), provider.uri())).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_smelt"));
+    command
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--ephemeral",
+            "--mode",
+            if notebook { "apply" } else { "yolo" },
+            "-m",
+            "probe/test-model",
+        ])
+        .current_dir(&active)
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("XDG_STATE_HOME", home.path().join("state"))
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("TERM", "xterm-256color")
+        .env("SMELT_PROBE_KEY", "test-only")
+        .env("SMELT_PROBE_STARTED", &started)
+        .env("SMELT_PROBE_RELEASE", &release)
+        .env("SMELT_PROBE_TARGET", &target)
+        .env("SMELT_PROBE_GIT", &git)
+        .env(
+            "PATH",
+            std::env::join_paths(
+                std::iter::once(wrappers)
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap(),
+        );
+    if !refresh_project {
+        command.arg("perform probe");
+    }
+    let (mut master, mut process) = spawn_in_pty(command);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut captured = Vec::new();
+    let mut terminal = vt100::Parser::new(24, 100, 0);
+    let mut typed = false;
+    let mut denied = false;
+    loop {
+        let previous_len = captured.len();
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[previous_len..]);
+        assert!(
+            process.child.try_wait().unwrap().is_none(),
+            "smelt exited: {}",
+            String::from_utf8_lossy(&captured)
+        );
+        if !typed && started.exists() {
+            if refresh_project {
+                master.write_all(b"perform probe\r").unwrap();
+            }
+            master.write_all(b"FREEZEPROBE").unwrap();
+            typed = true;
+        }
+        if typed && !release.exists() && terminal.screen().contents().contains("FREEZEPROBE") {
+            // The slow operation cannot finish before typing is visibly rendered.
+            std::fs::write(&release, "ready").unwrap();
+        }
+        if notebook
+            && !denied
+            && terminal.screen().contents().contains("PROBE_NEW")
+            && terminal.screen().contents().contains("allow once")
+        {
+            master.write_all(b"\x1b[B\r").unwrap();
+            denied = true;
+        }
+        if completed.exists() {
+            assert!(
+                release.exists(),
+                "turn completed without rendering input during slow work"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&completed).unwrap(),
+                format!(
+                    "{}\nFREEZEPROBE{}",
+                    if notebook || refresh_project {
+                        &active
+                    } else {
+                        &target
+                    }
+                    .display(),
+                    if refresh_project {
+                        "\nprobe-after-tool"
+                    } else {
+                        ""
+                    }
+                )
+            );
+            let requests = provider.received_requests().await.unwrap();
+            let tool_results: Vec<_> = requests
+                .iter()
+                .filter_map(|request| request.body_json::<serde_json::Value>().ok())
+                .flat_map(|body| body["messages"].as_array().cloned().unwrap_or_default())
+                .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+                .filter(|block| block["type"] == "tool_result")
+                .collect();
+            assert!(
+                !notebook || denied,
+                "notebook preview was not shown: {}\ntool results: {tool_results:?}",
+                terminal.screen().contents()
+            );
+            if refresh_project {
+                let first: serde_json::Value = requests
+                    .iter()
+                    .filter(|request| request.url.path().ends_with("/messages"))
+                    .filter_map(|request| request.body_json::<serde_json::Value>().ok())
+                    .find(|body| {
+                        body["tools"]
+                            .as_array()
+                            .is_some_and(|tools| !tools.is_empty())
+                    })
+                    .expect("provider tool-capable request");
+                assert!(
+                    first["messages"].to_string().contains("branch probe-new"),
+                    "first request used stale Git context: {}",
+                    first["messages"]
+                );
+                assert!(
+                    requests
+                        .iter()
+                        .filter(|request| request.url.path().ends_with("/messages"))
+                        .filter_map(|request| request.body_json::<serde_json::Value>().ok())
+                        .any(|body| body["messages"]
+                            .to_string()
+                            .contains("branch probe-after-tool")),
+                    "follow-up request used stale Git context"
+                );
+            }
+            assert!(
+                notebook
+                    || requests.iter().any(|request| {
+                        let Ok(body) = request.body_json::<serde_json::Value>() else {
+                            return false;
+                        };
+                        body["messages"].as_array().is_some_and(|messages| {
+                            messages.iter().any(|message| {
+                                message["content"].as_array().is_some_and(|blocks| {
+                                    blocks.iter().any(|block| {
+                                        block["type"] == "tool_result"
+                                            && block["tool_use_id"] == "call_probe"
+                                            && (notebook || block["is_error"] != true)
+                                    })
+                                })
+                            })
+                        })
+                    }),
+                "successful tool result was not released after cwd commit"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tool {tool} stalled (typed={typed}, released={}): {}",
+            release.exists(),
+            terminal.screen().contents()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[test]
@@ -545,7 +1319,7 @@ smelt.provider.register("local", {{
         drain_pty(&mut master, &mut captured);
         assert!(process.child.try_wait().unwrap().is_none(), "smelt exited");
         while let Ok((mut stream, _)) = stream_provider.accept() {
-            consume_http_request(&mut stream);
+            read_http_request(&mut stream);
             let chunk =
                 "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Starting\"}}]}\n\n";
             write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{chunk}\r\n", chunk.len()).unwrap();
@@ -637,8 +1411,10 @@ smelt.provider.register("local", {{
         }
         assert!(
             Instant::now() < deadline,
-            "message recovery failed ({recovery:?}, vim={vim}, requests: {}, rewind_sent={rewind_sent}, resubmitted={resubmitted}, output_started={}, turn_ended={}): {}",
+            "message recovery failed ({recovery:?}, vim={vim}, requests: {}, rewind_sent={rewind_sent}, resubmitted={resubmitted}, last_has_edited={}, last_has_queued={}, output_started={}, turn_ended={}): {}",
             bodies.len(),
+            bodies.last().is_some_and(|body| body["messages"].to_string().contains("first request edited")),
+            bodies.last().is_some_and(|body| body["messages"].to_string().contains("queued follow-up")),
             home.path().join("output-started").exists(),
             home.path().join("turn-ended").exists(),
             String::from_utf8_lossy(&captured[captured.len().saturating_sub(5000)..])
@@ -1198,16 +1974,15 @@ fn inspect_startup_explicitly_reconciles_the_session_catalog() {
         .env("XDG_DATA_HOME", root.path().join("data"))
         .env("TERM", "xterm-256color")
         .env("NO_COLOR", "1");
+    let reader = smelt_store::CatalogReader::open_existing(&catalog_path)
+        .expect("open inspector catalog")
+        .expect("inspector catalog exists");
     let (mut master, mut process) = spawn_in_pty(command);
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut captured = Vec::new();
     loop {
         drain_pty(&mut master, &mut captured);
-        let metadata = smelt_store::CatalogReader::open_existing(&catalog_path)
-            .expect("open inspector catalog")
-            .expect("inspector catalog exists")
-            .metadata()
-            .expect("read inspector catalog metadata");
+        let metadata = reader.metadata().expect("read inspector catalog metadata");
         if metadata.completed_scan_id != scan_id {
             assert_eq!(metadata.completed_scan_id, scan_id + 1);
             assert_eq!(metadata.next_scan_id, scan_id + 2);
@@ -1947,5 +2722,2184 @@ smelt.provider.register("local", {
             before,
             "lifecycle benchmark must not mutate its source fixture"
         );
+    }
+}
+
+fn run_headless_config(source: &str) -> std::process::Output {
+    let home = tempfile::tempdir().expect("temporary headless home");
+    let config = home.path().join("init.lua");
+    std::fs::write(
+        &config,
+        format!(
+            r#"smelt.provider.register("test", {{
+  type = "openai-compatible",
+  api_base = "http://127.0.0.1:9/v1",
+  api_key_env = "SMELT_HEADLESS_TEST_KEY",
+  models = {{ "test-model" }},
+}})
+{source}
+"#
+        ),
+    )
+    .expect("write headless config");
+    isolated_smelt_command(home.path())
+        .env("SMELT_HEADLESS_TEST_KEY", "test-only")
+        .args([
+            "--headless",
+            "--color",
+            "never",
+            "--model",
+            "test/test-model",
+            "--config",
+        ])
+        .arg(config)
+        .arg("!printf headless-config-ok")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run headless CLI")
+}
+
+#[derive(Clone, Copy)]
+enum StreamEnding {
+    Eof,
+    NetworkFailure,
+    NetworkFailures { first: usize, count: usize },
+    Cancel,
+    CancelDuringRetry,
+}
+
+struct StreamingTrial {
+    status: std::process::ExitStatus,
+    events: Vec<serde_json::Value>,
+    requests: usize,
+    request_bodies: Vec<serde_json::Value>,
+    tool_effect: Option<String>,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_headless_stream(bodies: &[String], ending: StreamEnding) -> StreamingTrial {
+    run_headless_stream_with_model(bodies, ending, "\"test-model\"")
+}
+
+fn run_headless_stream_with_model(
+    bodies: &[String],
+    ending: StreamEnding,
+    model: &str,
+) -> StreamingTrial {
+    run_headless_stream_with_options(bodies, ending, model, "json", "openai-compatible")
+}
+
+fn run_headless_stream_with_options(
+    bodies: &[String],
+    ending: StreamEnding,
+    model: &str,
+    format: &str,
+    provider_type: &str,
+) -> StreamingTrial {
+    run_headless_stream_with_launch(
+        bodies,
+        ending,
+        model,
+        format,
+        provider_type,
+        |_, command| {
+            command.arg("exercise the stream");
+        },
+    )
+}
+
+fn run_headless_stream_with_launch(
+    bodies: &[String],
+    ending: StreamEnding,
+    model: &str,
+    format: &str,
+    provider_type: &str,
+    launch: impl FnOnce(&Path, &mut Command),
+) -> StreamingTrial {
+    let home = tempfile::tempdir().unwrap();
+    let provider = TcpListener::bind("127.0.0.1:0").unwrap();
+    provider.set_nonblocking(true).unwrap();
+    let config = home.path().join("init.lua");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+smelt.settings.autoupgrade = "off"
+smelt.settings.auto_continue = "off"
+smelt.provider.register("test", {{
+  type = "{provider_type}",
+  api_base = "http://{}/v1",
+  api_key_env = "SMELT_STREAM_TEST_KEY",
+  models = {{ {model} }},
+}})
+smelt.tools.register({{
+  name = "stream_probe",
+  description = "Record a test side effect",
+  permission_defaults = {{ normal = "allow" }},
+  parameters = {{ type = "object", properties = {{ value = {{ type = "string" }} }} }},
+  execute = function(args)
+    local file = assert(io.open("tool-executed", "a"))
+    file:write(args.value or "missing")
+    file:close()
+    return {{ content = "recorded" }}
+  end,
+}})
+"#,
+            provider.local_addr().unwrap()
+        ),
+    )
+    .unwrap();
+    let stdout = home.path().join("events.jsonl");
+    let stderr = home.path().join("stderr");
+    let mut command = isolated_smelt_command(home.path());
+    command
+        .env("SMELT_STREAM_TEST_KEY", "test-only")
+        .args([
+            "--headless",
+            "--format",
+            format,
+            "--color",
+            "never",
+            "--model",
+            "test/test-model",
+            "--config",
+        ])
+        .arg(config)
+        .stdin(Stdio::null())
+        .stdout(File::create(&stdout).unwrap())
+        .stderr(File::create(&stderr).unwrap())
+        .process_group(0);
+    launch(home.path(), &mut command);
+    let child = command.spawn().unwrap();
+    let mut process = ChildProcessGroup {
+        id: child.id() as i32,
+        child,
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut requests = 0;
+    let mut request_bodies = Vec::new();
+    let mut held_streams = Vec::new();
+    let mut cancelled = false;
+    let status = loop {
+        if let Some(status) = process.child.try_wait().unwrap() {
+            break status;
+        }
+        while let Ok((mut stream, _)) = provider.accept() {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let post = line.starts_with("POST ");
+            let mut length = 0;
+            loop {
+                line.clear();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse::<u64>().unwrap();
+                    }
+                }
+            }
+            let mut request_body = Vec::new();
+            reader.take(length).read_to_end(&mut request_body).unwrap();
+            if !post {
+                let body = r#"{"data":[{"id":"test-model","context_window":100000}]}"#;
+                write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+                continue;
+            }
+            request_bodies.push(serde_json::from_slice(&request_body).unwrap());
+            let body = &bodies[requests.min(bodies.len() - 1)];
+            requests += 1;
+            assert!(requests <= bodies.len() + 5, "unexpected retries");
+            let network_failure = match ending {
+                StreamEnding::NetworkFailures { first, count } => {
+                    (first..first + count).contains(&requests)
+                }
+                StreamEnding::NetworkFailure
+                | StreamEnding::Cancel
+                | StreamEnding::CancelDuringRetry => requests >= bodies.len(),
+                StreamEnding::Eof => false,
+            };
+            if !network_failure {
+                write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).unwrap();
+                // Small writes exercise arbitrary transport boundaries; decoder tests
+                // separately check every split, including mid-codepoint UTF-8.
+                for byte in body.as_bytes() {
+                    if stream.write_all(&[*byte]).is_err() {
+                        break;
+                    }
+                }
+            } else {
+                write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{body}\r\n", body.len()).unwrap();
+                if matches!(ending, StreamEnding::Cancel) {
+                    held_streams.push(stream);
+                }
+                // Dropping a chunked response without its zero chunk is a transport error.
+            }
+        }
+        if !cancelled && {
+            let events = std::fs::read_to_string(&stdout).unwrap();
+            match ending {
+                StreamEnding::Cancel => {
+                    events.contains("TextDelta") || events.contains("EngineAskDelta")
+                }
+                StreamEnding::CancelDuringRetry => events.contains("Retrying"),
+                _ => false,
+            }
+        } {
+            assert_eq!(unsafe { libc::kill(process.id, libc::SIGINT) }, 0);
+            cancelled = true;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "headless stream timed out after {requests} requests; events: {}; stderr: {}",
+            std::fs::read_to_string(&stdout).unwrap(),
+            std::fs::read_to_string(&stderr).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = std::fs::read_to_string(stdout).unwrap();
+    let events = if format == "json" {
+        stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("structured CLI event"))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    StreamingTrial {
+        status,
+        events,
+        requests,
+        request_bodies,
+        tool_effect: std::fs::read_to_string(home.path().join("tool-executed")).ok(),
+        stdout,
+        stderr: std::fs::read_to_string(stderr).unwrap(),
+    }
+}
+
+fn stream_event(value: serde_json::Value) -> String {
+    format!("data: {value}\n\n")
+}
+
+fn isolated_smelt_command(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_smelt"));
+    command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .current_dir(home);
+    command
+}
+
+fn run_prompt_file_cli(home: &Path, args: &[&str]) -> std::process::Output {
+    isolated_smelt_command(home)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run prompt-file CLI")
+}
+
+#[test]
+fn prompt_file_cli_rejects_conflicting_or_missing_inputs() {
+    let home = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["--headless", "--prompt-file", "prompt.txt", "message"],
+        vec!["--headless", "message", "--prompt-file", "prompt.txt"],
+        vec!["--headless", "--prompt-file"],
+        vec!["--prompt-file", "prompt.txt", "auth"],
+    ] {
+        let output = run_prompt_file_cli(home.path(), &args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+    }
+    let output = run_prompt_file_cli(home.path(), &["--headless"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("--headless requires a message argument or --prompt-file"));
+}
+
+#[test]
+fn prompt_file_cli_read_failures_do_not_fall_back_to_prompt_text() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir(home.path().join("directory")).unwrap();
+    std::fs::write(home.path().join("invalid.txt"), b"private prompt text\xff").unwrap();
+    for path in ["missing.txt", "directory", "invalid.txt", "-"] {
+        let output = run_prompt_file_cli(home.path(), &["--headless", "--prompt-file", path]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("failed to read prompt file"), "{stderr}");
+        assert!(stderr.contains(path), "{stderr}");
+        assert!(!stderr.contains("private prompt text"), "{stderr}");
+    }
+}
+
+#[test]
+fn prompt_file_preserves_large_multiline_utf8_input() {
+    let prompt = format!(
+        "  --not-a-flag 'quotes' $HOME 界\r\nembedded\0NUL\n{}\n\n",
+        "x".repeat(150_000)
+    );
+    let body = format!(
+        "{}{}",
+        stream_event(serde_json::json!({"choices": [{"delta": {"content": "done"}}]})),
+        stream_finish()
+    );
+    let trial = run_headless_stream_with_launch(
+        &[body],
+        StreamEnding::Eof,
+        "\"test-model\"",
+        "json",
+        "openai-compatible",
+        |home, command| {
+            std::fs::write(home.join("prompt.txt"), &prompt).unwrap();
+            command.args(["--prompt-file", "prompt.txt"]);
+        },
+    );
+    assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+    assert_eq!(trial.requests, 1);
+    assert!(
+        trial.request_bodies[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "user" && message["content"] == prompt),
+        "{}",
+        trial.request_bodies[0]["messages"]
+    );
+}
+
+#[test]
+fn prompt_file_absolute_path_keeps_shell_escape_behavior() {
+    let trial = run_headless_stream_with_launch(
+        &[],
+        StreamEnding::Eof,
+        "\"test-model\"",
+        "text",
+        "openai-compatible",
+        |home, command| {
+            let path = home.join("prompt 界.txt");
+            std::fs::write(&path, "!printf file-shell-ok\n").unwrap();
+            command.arg("--prompt-file").arg(path);
+        },
+    );
+    assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+    assert_eq!(trial.requests, 0);
+    assert_eq!(trial.stdout, "file-shell-ok");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_file_interactive_auto_submits_without_consuming_terminal_input() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let home = tempfile::tempdir().unwrap();
+    let provider = MockServer::start().await;
+    let response = stream_event(
+        serde_json::json!({"choices": [{"delta": {"content": "File prompt completed."}}]}),
+    ) + &stream_finish();
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(response),
+        )
+        .mount(&provider)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"data": [{"id": "test-model", "context_window": 100000}]}),
+        ))
+        .mount(&provider)
+        .await;
+    let config = home.path().join("init.lua");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+smelt.settings.autoupgrade = "off"
+smelt.settings.auto_continue = "off"
+smelt.settings.show_prediction = false
+smelt.provider.register("test", {{
+  type = "openai-compatible", api_base = "{}",
+  models = {{ {{ name = "test-model", context_window = 100000 }} }},
+}})
+"#,
+            provider.uri()
+        ),
+    )
+    .unwrap();
+    let prompt = "Read this initial message.\nThen answer in 界.";
+    std::fs::write(home.path().join("prompt.txt"), prompt).unwrap();
+    let mut command = isolated_smelt_command(home.path());
+    command
+        .arg("--config")
+        .arg(config)
+        .args(["--model", "test/test-model", "--prompt-file", "prompt.txt"])
+        .env("TERM", "xterm-256color")
+        .env("NO_COLOR", "1");
+    let (mut master, mut process) = spawn_in_pty(command);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut captured = Vec::new();
+    let mut consumed = 0;
+    let mut terminal = vt100::Parser::new(24, 100, 0);
+    loop {
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[consumed..]);
+        consumed = captured.len();
+        assert!(process.child.try_wait().unwrap().is_none(), "smelt exited");
+        if terminal
+            .screen()
+            .contents()
+            .contains("File prompt completed.")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "file prompt did not auto-submit:\n{}",
+            terminal.screen().contents()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let requests = provider.received_requests().await.unwrap();
+    assert!(requests
+        .iter()
+        .filter(|request| request.method == "POST")
+        .filter_map(|request| request.body_json::<serde_json::Value>().ok())
+        .any(|body| body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "user" && message["content"] == prompt)));
+    master.write_all(b"terminal input still works").unwrap();
+    loop {
+        drain_pty(&mut master, &mut captured);
+        terminal.process(&captured[consumed..]);
+        consumed = captured.len();
+        if terminal
+            .screen()
+            .contents()
+            .contains("terminal input still works")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "terminal input was not available:\n{}",
+            terminal.screen().contents()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn init_prompt_file_repo(home: &Path) -> std::path::PathBuf {
+    let repo = home.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join("hello.txt"), "hello\n").unwrap();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["add", "hello.txt"],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+    ] {
+        let output = Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    repo
+}
+
+#[test]
+fn prompt_file_read_failure_does_not_create_worktree_or_branch() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = init_prompt_file_repo(home.path());
+    std::fs::write(repo.join("invalid.txt"), b"private prompt text\xff").unwrap();
+    for path in ["missing.txt", "invalid.txt"] {
+        for inline in [false, true] {
+            let mut command = isolated_smelt_command(home.path());
+            command
+                .current_dir(&repo)
+                .args(["--headless", "--worktree", "probe"]);
+            if inline {
+                command.arg(format!("--prompt-file={path}"));
+            } else {
+                command.args(["--prompt-file", path]);
+            }
+            let output = command.stdin(Stdio::null()).output().unwrap();
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains("failed to read prompt file"), "{stderr}");
+            assert!(
+                !repo.join(".worktrees").exists(),
+                "failed startup created a worktree"
+            );
+            let branch = Command::new("git")
+                .current_dir(&repo)
+                .args(["show-ref", "--verify", "--quiet", "refs/heads/probe"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                branch.status.code(),
+                Some(1),
+                "failed startup created a branch: {branch:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn prompt_file_read_error_preserves_cli_error_and_help_precedence() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = init_prompt_file_repo(home.path());
+    for (args, code) in [
+        (
+            vec![
+                "--worktree",
+                "probe",
+                "--prompt-file",
+                "missing.txt",
+                "message",
+            ],
+            2,
+        ),
+        (vec!["--worktree", "probe", "--prompt-file"], 2),
+        (vec!["--worktree", "probe", "--prompt-file", "--help"], 2),
+        (
+            vec!["--worktree", "probe", "--prompt-file=missing.txt", "--help"],
+            0,
+        ),
+    ] {
+        let output = isolated_smelt_command(home.path())
+            .current_dir(&repo)
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(code), "{args:?}: {output:?}");
+        assert!(
+            !repo.join(".worktrees").exists(),
+            "failed startup created a worktree"
+        );
+    }
+}
+
+#[test]
+fn prompt_file_non_unicode_paths_work_with_both_option_forms() {
+    use std::os::unix::ffi::OsStrExt;
+
+    for inline in [false, true] {
+        let trial = run_headless_stream_with_launch(
+            &[],
+            StreamEnding::Eof,
+            "\"test-model\"",
+            "text",
+            "openai-compatible",
+            |home, command| {
+                let path = home.join(std::ffi::OsStr::from_bytes(b"prompt-\xff.txt"));
+                std::fs::write(&path, "!printf file-path-ok").unwrap();
+                if inline {
+                    let mut arg = std::ffi::OsString::from("--prompt-file=");
+                    arg.push(path);
+                    command.arg(arg);
+                } else {
+                    command.arg("--prompt-file").arg(path);
+                }
+            },
+        );
+        assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+        assert_eq!(trial.stdout, "file-path-ok");
+    }
+}
+
+#[test]
+fn prompt_file_relative_path_survives_startup_worktree_change() {
+    let body = format!(
+        "{}{}",
+        stream_event(serde_json::json!({"choices": [{"delta": {"content": "done"}}]})),
+        stream_finish()
+    );
+    let prompt = "Read the prompt from the launch directory.";
+    let trial = run_headless_stream_with_launch(
+        &[body],
+        StreamEnding::Eof,
+        "\"test-model\"",
+        "json",
+        "openai-compatible",
+        |home, command| {
+            let repo = init_prompt_file_repo(home);
+            std::fs::write(repo.join("prompt.txt"), prompt).unwrap();
+            command
+                .current_dir(repo)
+                .args(["--worktree", "probe", "--prompt-file", "prompt.txt"]);
+        },
+    );
+    assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+    let messages = &trial.request_bodies[0]["messages"];
+    assert!(
+        messages.to_string().contains(".worktrees/probe"),
+        "{messages}"
+    );
+    assert!(
+        messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "user" && message["content"] == prompt),
+        "{messages}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn prompt_file_cleanup_does_not_kill_smelt() {
+    use std::os::unix::process::ExitStatusExt;
+
+    // A per-test random marker keeps pkill from matching unrelated processes.
+    let unique = tempfile::tempdir().unwrap();
+    let marker = format!(
+        "smelt_cleanup_{}",
+        unique.path().file_name().unwrap().to_string_lossy()
+    );
+    let prompt = format!("Clean up the process for {marker}.");
+    let bash = stream_event(serde_json::json!({
+        "choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "cleanup", "type": "function",
+            "function": {"name": "bash", "arguments": serde_json::json!({
+                "command": format!("pkill -9 -f {marker}"),
+                "description": "Isolated cleanup regression"
+            }).to_string()}
+        }]}}]
+    })) + &stream_finish_reason("tool_calls");
+    let done = stream_event(
+        serde_json::json!({"choices": [{"delta": {"content": "Cleanup completed."}}]}),
+    ) + &stream_finish();
+    let bodies = [bash, done];
+    for file_backed in [false, true] {
+        let trial = run_headless_stream_with_launch(
+            &bodies,
+            StreamEnding::Eof,
+            "\"test-model\"",
+            "json",
+            "openai-compatible",
+            |home, command| {
+                command.args(["--mode", "yolo"]);
+                if file_backed {
+                    std::fs::write(home.join("prompt.txt"), &prompt).unwrap();
+                    command.args(["--prompt-file", "prompt.txt"]);
+                } else {
+                    command.arg(&prompt);
+                }
+            },
+        );
+        if !file_backed {
+            assert_eq!(
+                trial.status.signal(),
+                Some(libc::SIGKILL),
+                "{}",
+                trial.stderr
+            );
+            assert_eq!(trial.requests, 1);
+            continue;
+        }
+        assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+        assert_eq!(trial.requests, 2);
+        assert!(trial.stdout.contains("Cleanup completed."));
+        assert!(trial
+            .events
+            .iter()
+            .any(|event| event.get("ToolFinished").is_some()));
+        let messages = trial.request_bodies[1]["messages"].as_array().unwrap();
+        assert!(messages
+            .iter()
+            .any(|message| message["role"] == "user" && message["content"] == prompt));
+        assert!(messages
+            .iter()
+            .any(|message| message["role"] == "tool" && message["tool_call_id"] == "cleanup"));
+    }
+}
+
+fn stream_content() -> String {
+    stream_event(
+        serde_json::json!({"choices": [{"delta": {"content": "partial 界", "reasoning_content": "thinking"}}]}),
+    )
+}
+
+fn stream_finish() -> String {
+    stream_finish_reason("stop")
+}
+
+fn stream_finish_reason(reason: &str) -> String {
+    stream_event(serde_json::json!({"choices": [{"delta": {}, "finish_reason": reason}]}))
+}
+
+fn stream_tool(arguments: &str, start: bool) -> String {
+    let mut tool = serde_json::json!({"index": 0, "function": {"arguments": arguments}});
+    if start {
+        tool["id"] = serde_json::json!("probe-1");
+        tool["function"]["name"] = serde_json::json!("stream_probe");
+    }
+    stream_event(serde_json::json!({"choices": [{"delta": {"tool_calls": [tool]}}]}))
+}
+
+fn stream_event_count(trial: &StreamingTrial, name: &str) -> usize {
+    trial
+        .events
+        .iter()
+        .filter(|event| event.as_str() == Some(name) || event.get(name).is_some())
+        .count()
+}
+
+fn assert_stream_failure(trial: &StreamingTrial, cause: &str) {
+    assert_stream_failure_attempts(trial, cause, 1);
+}
+
+fn assert_stream_failure_attempts(trial: &StreamingTrial, cause: &str, attempts: usize) {
+    assert_eq!(trial.status.code(), Some(3), "{}", trial.stderr);
+    assert_eq!(trial.requests, attempts, "unexpected retry count");
+    assert!(trial.tool_effect.is_none());
+    let error = trial
+        .events
+        .iter()
+        .find_map(|ev| ev.get("TurnError"))
+        .expect("TurnError");
+    assert!(
+        error["message"].as_str().unwrap().contains(cause),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("sensitive-fixture"));
+    assert!(!error.to_string().contains("partial 界"));
+    assert!(!trial.stderr.contains("sensitive-fixture"));
+    assert!(!trial
+        .events
+        .iter()
+        .any(|ev| ev.get("TurnComplete").is_some() || ev.get("ToolStarted").is_some()));
+    assert!(!trial
+        .events
+        .iter()
+        .filter_map(|ev| ev.get("HistoryAppended"))
+        .any(|ev| ev.to_string().contains("\"kind\":\"assistant\"")));
+}
+
+fn assert_output_limit(trial: &StreamingTrial, requests: usize) {
+    assert_eq!(trial.status.code(), Some(3), "{:?}", trial.events);
+    assert_eq!(
+        trial.requests, requests,
+        "output-limited response was continued"
+    );
+    let error = trial
+        .events
+        .iter()
+        .find_map(|ev| ev.get("TurnError"))
+        .expect("TurnError");
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("output token limit"), "{error}");
+    assert!(message.contains("incomplete"), "{error}");
+}
+
+fn last_stream_assistant(trial: &StreamingTrial) -> &serde_json::Value {
+    trial
+        .events
+        .iter()
+        .rev()
+        .filter_map(|ev| ev.get("HistoryAppended"))
+        .filter_map(|ev| ev["delta"]["items"].as_array())
+        .flat_map(|items| items.iter().rev())
+        .find(|item| item["kind"] == "assistant")
+        .expect("committed assistant history")
+}
+
+#[test]
+fn headless_stream_malformed_then_valid_retries_unchanged_request() {
+    let invalid = format!(
+        "{}{}{}{}",
+        stream_content(),
+        stream_tool("{\"sensitive-fixture\":", true),
+        stream_finish_reason("tool_calls"),
+        stream_event(
+            serde_json::json!({"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 4}})
+        )
+    );
+    let valid = format!(
+        "{}{}{}",
+        stream_event(serde_json::json!({"choices": [{"delta": {"content": "recovered"}}]})),
+        stream_finish(),
+        stream_event(
+            serde_json::json!({"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 2}})
+        )
+    );
+    let trial = run_headless_stream(&[invalid, valid], StreamEnding::Eof);
+    assert_eq!(trial.status.code(), Some(0), "{:?}", trial.events);
+    assert_eq!(trial.requests, 2);
+    assert_eq!(trial.request_bodies[0], trial.request_bodies[1]);
+    assert!(trial.tool_effect.is_none());
+    assert_eq!(last_stream_assistant(&trial)["content"], "recovered");
+    let usage: Vec<_> = trial
+        .events
+        .iter()
+        .filter_map(|event| event.get("TokenUsage"))
+        .collect();
+    assert_eq!(usage.len(), 2);
+    assert_eq!(
+        usage
+            .iter()
+            .map(|event| event["usage"]["prompt_tokens"].as_u64().unwrap())
+            .sum::<u64>(),
+        10
+    );
+    assert_eq!(
+        usage
+            .iter()
+            .map(|event| event["usage"]["completion_tokens"].as_u64().unwrap())
+            .sum::<u64>(),
+        6
+    );
+    assert!(trial
+        .events
+        .iter()
+        .any(|event| event.as_str() == Some("ResponseDraftRejected")));
+}
+
+#[test]
+fn headless_stream_malformed_retry_exhaustion_counts_usage_once() {
+    let body = format!(
+        "{}{}{}{}{}",
+        stream_content(),
+        stream_tool("{\"sensitive-fixture\":", true),
+        stream_finish_reason("length"),
+        stream_event(
+            serde_json::json!({"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 4}})
+        ),
+        stream_event(
+            serde_json::json!({"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 4}})
+        )
+    );
+    let trial = run_headless_stream(&[body], StreamEnding::Eof);
+    assert_eq!(trial.status.code(), Some(3));
+    assert_eq!(trial.requests, 3);
+    assert!(trial
+        .request_bodies
+        .windows(2)
+        .all(|pair| pair[0] == pair[1]));
+    assert!(trial.tool_effect.is_none());
+    let usage: Vec<_> = trial
+        .events
+        .iter()
+        .filter_map(|event| event.get("TokenUsage"))
+        .collect();
+    assert_eq!(usage.len(), 3);
+    assert_eq!(
+        usage
+            .iter()
+            .map(|event| event["usage"]["prompt_tokens"].as_u64().unwrap())
+            .sum::<u64>(),
+        21
+    );
+    assert_eq!(
+        usage
+            .iter()
+            .map(|event| event["usage"]["completion_tokens"].as_u64().unwrap())
+            .sum::<u64>(),
+        12
+    );
+    assert_eq!(
+        trial
+            .events
+            .iter()
+            .filter(|event| event.as_str() == Some("ResponseDraftRejected"))
+            .count(),
+        3
+    );
+    assert!(!trial
+        .events
+        .iter()
+        .any(|event| event.get("ToolStarted").is_some()));
+    let error = trial
+        .events
+        .iter()
+        .find_map(|event| event.get("TurnError"))
+        .unwrap();
+    assert!(error["message"]
+        .as_str()
+        .unwrap()
+        .contains("malformed response"));
+    assert!(!error.to_string().contains("sensitive-fixture"));
+    assert!(!trial.stderr.contains("sensitive-fixture"));
+}
+
+#[test]
+fn headless_stream_mixed_batch_executes_only_after_valid_recovery() {
+    let invalid_batch = stream_event(serde_json::json!({"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "valid-call", "function": {"name": "stream_probe", "arguments": "{\"value\":\"must-not-run\"}"}},
+        {"index": 1, "id": "invalid-call", "function": {"name": "stream_probe", "arguments": "[1,2]"}}
+    ]}}]}));
+    let valid = format!(
+        "{}{}",
+        stream_tool("{\"value\":\"recovered\"}", true),
+        stream_finish_reason("tool_calls")
+    );
+    let final_answer = format!(
+        "{}{}",
+        stream_event(serde_json::json!({"choices": [{"delta": {"content": "done"}}]})),
+        stream_finish()
+    );
+    let trial = run_headless_stream(
+        &[
+            format!(
+                "{}{}{}",
+                stream_content(),
+                invalid_batch,
+                stream_finish_reason("tool_calls")
+            ),
+            valid,
+            final_answer,
+        ],
+        StreamEnding::Eof,
+    );
+    assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+    assert_eq!(trial.requests, 3);
+    assert_eq!(trial.request_bodies[0], trial.request_bodies[1]);
+    assert_eq!(trial.tool_effect.as_deref(), Some("recovered"));
+    assert!(!trial.request_bodies[2]["messages"]
+        .to_string()
+        .contains("must-not-run"));
+    let assistants: Vec<_> = trial
+        .events
+        .iter()
+        .filter_map(|event| event.get("HistoryAppended"))
+        .flat_map(|event| event["delta"]["items"].as_array().unwrap())
+        .filter(|item| item["kind"] == "assistant")
+        .collect();
+    assert!(assistants
+        .iter()
+        .all(|item| item.get("reasoning").is_none()));
+    assert!(!assistants
+        .iter()
+        .any(|item| item["content"] == "partial 界"));
+}
+
+#[test]
+fn headless_compacts_before_next_request_using_reported_context() {
+    let tool = format!(
+        "{}{}{}",
+        stream_tool("{\"value\":\"recorded\"}", true),
+        stream_finish_reason("tool_calls"),
+        stream_event(
+            serde_json::json!({"choices": [], "usage": {"prompt_tokens": 90000, "completion_tokens": 2}})
+        )
+    );
+    let answer = |content: &str| {
+        format!(
+            "{}{}",
+            stream_event(serde_json::json!({"choices": [{"delta": {"content": content}}]})),
+            stream_finish()
+        )
+    };
+    let bodies = [tool, answer("# Goal\nContinue the test"), answer("done")];
+    for model in [
+        r#"{ name = "test-model", context_window = 100000 }"#,
+        r#""test-model""#,
+    ] {
+        let trial = run_headless_stream_with_model(&bodies, StreamEnding::Eof, model);
+        assert_eq!(trial.status.code(), Some(0), "{:?}", trial.events);
+        assert_eq!(
+            trial.requests,
+            3,
+            "compaction was not invoked: usage={:?}, stderr={}",
+            trial
+                .events
+                .iter()
+                .filter_map(|event| event.get("TokenUsage"))
+                .collect::<Vec<_>>(),
+            trial.stderr
+        );
+        let summarizer = &trial.request_bodies[1];
+        assert!(
+            summarizer["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("CONTEXT CHECKPOINT COMPACTION")
+        );
+        assert_eq!(summarizer["tools"], trial.request_bodies[0]["tools"]);
+        let resumed = &trial.request_bodies[2]["messages"];
+        assert!(resumed.to_string().contains("# Goal\\nContinue the test"));
+        assert!(resumed.to_string().contains("probe-1"));
+        assert_eq!(trial.tool_effect.as_deref(), Some("recorded"));
+        assert_eq!(last_stream_assistant(&trial)["content"], "done");
+    }
+}
+
+#[test]
+fn headless_compaction_retry_rejects_only_the_auxiliary_draft() {
+    let tool = format!(
+        "{}{}{}",
+        stream_tool("{\"value\":\"recorded\"}", true),
+        stream_finish_reason("tool_calls"),
+        stream_event(
+            serde_json::json!({"choices": [], "usage": {"prompt_tokens": 90000, "completion_tokens": 2}})
+        ),
+    );
+    let malformed = format!(
+        "{}{}{}",
+        stream_event(serde_json::json!({"choices": [{"delta": {"content": "rejected summary"}}]})),
+        stream_tool("[1,2]", true),
+        stream_finish_reason("tool_calls"),
+    );
+    let answer = |content: &str| {
+        format!(
+            "{}{}",
+            stream_event(serde_json::json!({"choices": [{"delta": {"content": content}}]})),
+            stream_finish(),
+        )
+    };
+    let trial = run_headless_stream_with_model(
+        &[
+            tool,
+            malformed,
+            answer("# Goal\nContinue safely"),
+            answer("done"),
+        ],
+        StreamEnding::Eof,
+        r#"{ name = "test-model", context_window = 100000 }"#,
+    );
+    assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+    assert_eq!(trial.requests, 4);
+    assert_eq!(trial.request_bodies[1], trial.request_bodies[2]);
+    assert_eq!(trial.tool_effect.as_deref(), Some("recorded"));
+    let rejection = trial
+        .events
+        .iter()
+        .find_map(|event| event.get("EngineAskDraftRejected"))
+        .expect("auxiliary retry must identify its rejected draft");
+    let id = &rejection["id"];
+    assert!(trial
+        .events
+        .iter()
+        .filter_map(|event| event.get("EngineAskDelta"))
+        .any(|event| &event["id"] == id && event["delta"] == "rejected summary"));
+    assert!(!trial
+        .events
+        .iter()
+        .any(|event| event.as_str() == Some("ResponseDraftRejected")));
+    assert!(!trial.request_bodies[3]
+        .to_string()
+        .contains("rejected summary"));
+    assert_eq!(last_stream_assistant(&trial)["content"], "done");
+}
+
+#[test]
+fn headless_cancellation_during_compaction_stops_requests() {
+    let tool = format!(
+        "{}{}{}",
+        stream_tool("{\"value\":\"recorded\"}", true),
+        stream_finish_reason("tool_calls"),
+        stream_event(
+            serde_json::json!({"choices": [], "usage": {"prompt_tokens": 90000, "completion_tokens": 2}})
+        )
+    );
+    let summary =
+        stream_event(serde_json::json!({"choices": [{"delta": {"content": "draft summary"}}]}));
+    let trial = run_headless_stream_with_model(
+        &[tool, summary],
+        StreamEnding::Cancel,
+        r#"{ name = "test-model", context_window = 100000 }"#,
+    );
+    assert_eq!(trial.status.code(), Some(130), "{}", trial.stderr);
+    assert_eq!(trial.requests, 2);
+    assert_eq!(trial.tool_effect.as_deref(), Some("recorded"));
+    assert!(trial
+        .events
+        .iter()
+        .any(|event| event.get("EngineAskDelta").is_some()));
+}
+
+#[test]
+fn headless_text_output_resets_only_rejected_attempt() {
+    let tool = format!(
+        "{}{}{}",
+        stream_event(serde_json::json!({"choices": [{"delta": {"content": "kept 界\n"}}]})),
+        stream_tool("{\"value\":\"recorded\"}", true),
+        stream_finish_reason("tool_calls"),
+    );
+    let malformed = format!(
+        "{}{}{}",
+        stream_content(),
+        stream_tool("{\"sensitive-fixture\":", true),
+        stream_finish_reason("length")
+    );
+    let recovered = format!(
+        "{}{}",
+        stream_event(serde_json::json!({"choices": [{"delta": {"content": "recovered"}}]})),
+        stream_finish(),
+    );
+    let trial = run_headless_stream_with_options(
+        &[tool, malformed, recovered],
+        StreamEnding::Eof,
+        "\"test-model\"",
+        "text",
+        "openai-compatible",
+    );
+    assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+    assert_eq!(trial.requests, 3);
+    assert_eq!(trial.stdout, "kept 界\nrecovered\n");
+    assert_eq!(trial.request_bodies[1], trial.request_bodies[2]);
+    assert_eq!(trial.tool_effect.as_deref(), Some("recorded"));
+    assert!(!trial.stderr.contains("sensitive-fixture"));
+}
+
+#[test]
+fn headless_stream_responses_terminal_arguments_reject_entire_draft_batch() {
+    let completed = |input_tokens, output_tokens| {
+        stream_event(
+            serde_json::json!({"type": "response.completed", "response": {
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+            }}),
+        )
+    };
+    let call = |id, draft, terminal| {
+        [
+            serde_json::json!({"type": "response.output_item.added", "item": {
+                "type": "function_call", "id": id, "call_id": id, "name": "stream_probe"
+            }}),
+            serde_json::json!({"type": "response.function_call_arguments.done", "item_id": id, "arguments": draft}),
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "id": id, "call_id": id, "name": "stream_probe", "arguments": terminal
+            }}),
+        ].into_iter().map(stream_event).collect::<String>()
+    };
+    let malformed = format!(
+        "{}{}{}{}",
+        stream_event(
+            serde_json::json!({"type": "response.output_text.delta", "delta": "rejected draft"})
+        ),
+        call(
+            "valid-call",
+            r#"{"value":"must-not-run"}"#,
+            r#"{"value":"must-not-run"}"#
+        ),
+        call("invalid-call", r#"{"value":"must-not-run"}"#, "[1,2]"),
+        completed(7, 4),
+    );
+    let recovered = format!(
+        "{}{}",
+        call("recovered-call", r#"{"value":"#, r#"{"value":"recovered"}"#),
+        completed(3, 2),
+    );
+    let answer = format!(
+        "{}{}",
+        stream_event(serde_json::json!({"type": "response.output_text.delta", "delta": "done"})),
+        completed(2, 1),
+    );
+    let trial = run_headless_stream_with_options(
+        &[malformed, recovered, answer],
+        StreamEnding::Eof,
+        "\"test-model\"",
+        "json",
+        "openai",
+    );
+    assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+    assert_eq!(trial.tool_effect.as_deref(), Some("recovered"));
+    assert_eq!(trial.requests, 3);
+    assert_eq!(trial.request_bodies[0], trial.request_bodies[1]);
+    assert_eq!(last_stream_assistant(&trial)["content"], "done");
+    assert_eq!(
+        trial
+            .events
+            .iter()
+            .filter(|event| event.as_str() == Some("ResponseDraftRejected"))
+            .count(),
+        1
+    );
+    let usage: Vec<_> = trial
+        .events
+        .iter()
+        .filter_map(|event| event.get("TokenUsage"))
+        .collect();
+    assert_eq!(usage.len(), 3);
+    assert_eq!(
+        usage
+            .iter()
+            .map(|event| event["usage"]["prompt_tokens"].as_u64().unwrap())
+            .sum::<u64>(),
+        12
+    );
+    assert_eq!(
+        usage
+            .iter()
+            .map(|event| event["usage"]["completion_tokens"].as_u64().unwrap())
+            .sum::<u64>(),
+        7
+    );
+}
+
+#[test]
+fn headless_stream_anthropic_empty_tool_input_is_accepted() {
+    let tool = [
+        serde_json::json!({"type": "message_start", "message": {"usage": {"input_tokens": 7}}}),
+        serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "probe-1", "name": "stream_probe", "input": {}}}),
+        serde_json::json!({"type": "content_block_stop", "index": 0}),
+        serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 2}}),
+        serde_json::json!({"type": "message_stop"}),
+    ].into_iter().map(stream_event).collect::<String>();
+    let answer = [
+        serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "done"}}),
+        serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}}),
+        serde_json::json!({"type": "message_stop"}),
+    ].into_iter().map(stream_event).collect::<String>();
+    let trial = run_headless_stream_with_options(
+        &[tool, answer],
+        StreamEnding::Eof,
+        "\"test-model\"",
+        "json",
+        "anthropic-compatible",
+    );
+    assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+    assert_eq!(trial.requests, 2);
+    assert_eq!(trial.tool_effect.as_deref(), Some("missing"));
+    assert_eq!(last_stream_assistant(&trial)["content"], "done");
+    assert!(!trial
+        .events
+        .iter()
+        .any(|event| event == "ResponseDraftRejected"));
+}
+
+#[test]
+fn headless_recovers_from_context_limit_with_compaction() {
+    let tool = format!(
+        "{}{}",
+        stream_tool("{\"value\":\"recorded\"}", true),
+        stream_finish_reason("tool_calls")
+    );
+    let context_error = stream_event(
+        serde_json::json!({"error": {"code": "context_length_exceeded", "message": "private-provider-detail"}}),
+    );
+    let answer = |content: &str| {
+        format!(
+            "{}{}",
+            stream_event(serde_json::json!({"choices": [{"delta": {"content": content}}]})),
+            stream_finish()
+        )
+    };
+    let trial = run_headless_stream_with_model(
+        &[
+            tool,
+            context_error,
+            answer("# Goal\nResume safely"),
+            answer("done"),
+        ],
+        StreamEnding::Eof,
+        r#"{ name = "test-model", context_window = 100000 }"#,
+    );
+    assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+    assert_eq!(trial.requests, 4);
+    assert!(trial.request_bodies[2]["messages"]
+        .to_string()
+        .contains("CONTEXT CHECKPOINT COMPACTION"));
+    assert!(trial.request_bodies[3]["messages"]
+        .to_string()
+        .contains("# Goal\\nResume safely"));
+    assert_eq!(trial.tool_effect.as_deref(), Some("recorded"));
+    assert_eq!(last_stream_assistant(&trial)["content"], "done");
+    assert!(!trial
+        .events
+        .iter()
+        .any(|event| event.get("TurnError").is_some()));
+}
+
+#[test]
+fn headless_compaction_quota_failure_aborts_without_looping() {
+    let tool = format!(
+        "{}{}{}",
+        stream_tool("{\"value\":\"recorded\"}", true),
+        stream_finish_reason("tool_calls"),
+        stream_event(
+            serde_json::json!({"choices": [], "usage": {"prompt_tokens": 90000, "completion_tokens": 2}})
+        )
+    );
+    let quota = stream_event(serde_json::json!({"error": {"code": "insufficient_quota"}}));
+    let trial = run_headless_stream_with_model(
+        &[tool, quota],
+        StreamEnding::Eof,
+        r#"{ name = "test-model", context_window = 100000 }"#,
+    );
+    assert_eq!(trial.status.code(), Some(3), "{}", trial.stderr);
+    assert_eq!(trial.requests, 2);
+    let error = trial
+        .events
+        .iter()
+        .find_map(|event| event.get("TurnError"))
+        .expect("terminal error");
+    assert!(error["message"].as_str().unwrap().contains("quota"));
+}
+
+#[test]
+fn headless_stream_valid_content_and_usage() {
+    let usage = stream_event(
+        serde_json::json!({"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 2}}),
+    );
+    let body = format!(
+        ": keepalive\n\n{}{}{}data: [DONE]\n\n",
+        stream_content(),
+        stream_finish(),
+        usage
+    )
+    .replace("data: ", "data:")
+    .replace('\n', "\r\n");
+    let trial = run_headless_stream(&[body], StreamEnding::Eof);
+    assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+    assert_eq!(trial.requests, 1);
+    assert!(trial.events.iter().any(|ev| ev
+        .get("TextDelta")
+        .is_some_and(|v| v.to_string().contains("界"))));
+    assert!(trial
+        .events
+        .iter()
+        .any(|ev| ev.get("TurnComplete").is_some()));
+    assert!(trial.events.iter().any(|ev| ev.get("TokenUsage").is_some()));
+}
+
+#[test]
+fn headless_stream_unusable_response_exhaustion_is_an_error() {
+    for delta in [
+        serde_json::json!({"reasoning_content": "sensitive-fixture"}),
+        serde_json::json!({}),
+        serde_json::json!({"content": " \n\t", "reasoning_content": "thinking"}),
+    ] {
+        let body = format!(
+            "{}{}data: [DONE]\n\n",
+            stream_event(serde_json::json!({"choices": [{"delta": delta}]})),
+            stream_finish(),
+        );
+        let trial = run_headless_stream(&[body], StreamEnding::Eof);
+        assert_stream_failure_attempts(&trial, "no answer or tool calls after 3 attempts", 3);
+        assert!(trial
+            .request_bodies
+            .windows(2)
+            .all(|pair| pair[0] == pair[1]));
+        assert_eq!(
+            trial
+                .events
+                .iter()
+                .filter(|ev| ev.as_str() == Some("ResponseDraftRejected"))
+                .count(),
+            3
+        );
+        assert!(!trial
+            .events
+            .iter()
+            .any(|ev| ev.as_str() == Some("ResponseDraftAccepted")));
+    }
+}
+
+#[test]
+fn headless_stream_unusable_initial_response_recovers() {
+    let unusable = format!(
+        "{}{}",
+        stream_event(
+            serde_json::json!({"choices": [{"delta": {"reasoning_content": "rejected-plan"}}]})
+        ),
+        stream_finish()
+    );
+    let answer = format!(
+        "{}{}",
+        stream_event(serde_json::json!({"choices": [{"delta": {"content": "done"}}]})),
+        stream_finish()
+    );
+    let trial = run_headless_stream(&[unusable, answer], StreamEnding::Eof);
+    assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+    assert_eq!(trial.requests, 2);
+    assert_eq!(trial.request_bodies[0], trial.request_bodies[1]);
+    assert_eq!(last_stream_assistant(&trial)["content"], "done");
+    assert!(trial.tool_effect.is_none());
+}
+
+#[test]
+fn headless_stream_valid_tool_arguments_preserve_special_token_literals() {
+    let value = "literal <|endoftext|> and <|im_end|>";
+    let arguments = serde_json::json!({"value": value}).to_string();
+    let tool = format!(
+        "{}{}",
+        stream_tool(&arguments, true),
+        stream_finish_reason("tool_calls")
+    );
+    let answer = format!(
+        "{}{}",
+        stream_event(serde_json::json!({"choices": [{"delta": {"content": "done"}}]})),
+        stream_finish()
+    );
+    let trial = run_headless_stream(&[tool, answer], StreamEnding::Eof);
+    assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+    assert_eq!(trial.requests, 2);
+    assert_eq!(trial.tool_effect.as_deref(), Some(value));
+    assert_eq!(last_stream_assistant(&trial)["content"], "done");
+    assert!(!trial
+        .events
+        .iter()
+        .any(|event| event == "ResponseDraftRejected"));
+}
+
+#[test]
+fn headless_stream_unusable_response_recovers_without_replaying_tools() {
+    let tool = format!(
+        "{}{}",
+        stream_tool("{\"value\":\"recorded\"}", true),
+        stream_finish_reason("tool_calls")
+    );
+    let unusable = format!(
+        "{}{}{}",
+        stream_event(
+            serde_json::json!({"choices": [{"delta": {"reasoning_content": "rejected-plan"}}]})
+        ),
+        stream_finish(),
+        stream_event(
+            serde_json::json!({"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 4}})
+        ),
+    );
+    let valid = format!(
+        "{}{}",
+        stream_event(serde_json::json!({"choices": [{"delta": {"content": "done"}}]})),
+        stream_finish()
+    );
+    let trial = run_headless_stream(
+        &[tool, unusable.clone(), unusable, valid],
+        StreamEnding::Eof,
+    );
+    assert_eq!(trial.status.code(), Some(0), "{:?}", trial.events);
+    assert_eq!(trial.requests, 4);
+    assert_eq!(trial.tool_effect.as_deref(), Some("recorded"));
+    assert_eq!(trial.request_bodies[1], trial.request_bodies[2]);
+    assert_eq!(trial.request_bodies[2], trial.request_bodies[3]);
+    assert!(!trial.request_bodies[3]["messages"]
+        .to_string()
+        .contains("rejected-plan"));
+    assert_eq!(last_stream_assistant(&trial)["content"], "done");
+    assert_eq!(
+        trial
+            .events
+            .iter()
+            .filter(|ev| ev.as_str() == Some("ResponseDraftRejected"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        trial
+            .events
+            .iter()
+            .filter_map(|ev| ev.get("TokenUsage"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn headless_stream_unusable_response_after_tool_exhaustion_is_an_error() {
+    let tool = format!(
+        "{}{}",
+        stream_tool("{\"value\":\"recorded\"}", true),
+        stream_finish_reason("tool_calls")
+    );
+    let trial = run_headless_stream(&[tool, stream_finish()], StreamEnding::Eof);
+    assert_eq!(trial.status.code(), Some(3));
+    assert_eq!(trial.requests, 4);
+    assert_eq!(trial.tool_effect.as_deref(), Some("recorded"));
+    assert_eq!(
+        last_stream_assistant(&trial)["invocations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(trial
+        .events
+        .iter()
+        .filter_map(|ev| ev.get("TurnError"))
+        .any(|ev| ev["message"]
+            .as_str()
+            .unwrap()
+            .contains("no answer or tool calls")));
+}
+
+#[test]
+fn headless_stream_output_limit_is_incomplete() {
+    for delta in [
+        serde_json::json!({"reasoning_content": "thinking"}),
+        serde_json::json!({"content": "partial answer"}),
+        serde_json::json!({}),
+    ] {
+        let body = format!(
+            "{}{}data: [DONE]\n\n",
+            stream_event(serde_json::json!({"choices": [{"delta": delta}]})),
+            stream_finish_reason("length"),
+        );
+        let trial = run_headless_stream(&[body], StreamEnding::Eof);
+        assert_output_limit(&trial, 1);
+        assert!(trial.tool_effect.is_none());
+        let assistant = last_stream_assistant(&trial);
+        assert_eq!(assistant["content"], delta["content"]);
+        assert_eq!(assistant["reasoning"], delta["reasoning_content"]);
+        assert!(assistant.get("invocations").is_none());
+    }
+}
+
+#[test]
+fn headless_stream_output_limited_tools_execute_then_stop() {
+    let body = format!(
+        "{}{}{}data: [DONE]\n\n",
+        stream_content(),
+        stream_tool("{\"value\":\"recorded\"}", true),
+        stream_finish_reason("length"),
+    );
+    let trial = run_headless_stream(&[body], StreamEnding::Eof);
+    assert_eq!(
+        trial.tool_effect.as_deref(),
+        Some("recorded"),
+        "{:?}",
+        trial.events
+    );
+    assert_output_limit(&trial, 1);
+    let assistant = last_stream_assistant(&trial);
+    assert_eq!(assistant["content"], "partial 界");
+    assert_eq!(assistant["reasoning"], "thinking");
+    let invocations = assistant["invocations"]
+        .as_array()
+        .expect("committed tool results");
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0]["call_id"], "probe-1");
+    assert_eq!(invocations[0]["name"], "stream_probe");
+    assert_eq!(invocations[0]["result"]["content"], "recorded");
+    assert_eq!(invocations[0]["result"]["is_error"], false);
+    let tool_finished = trial
+        .events
+        .iter()
+        .position(|ev| ev.get("ToolFinished").is_some())
+        .expect("ToolFinished");
+    let error_index = trial
+        .events
+        .iter()
+        .position(|ev| ev.get("TurnError").is_some())
+        .unwrap();
+    assert!(tool_finished < error_index);
+}
+
+#[test]
+fn headless_stream_empty_output_limit_after_tool_is_not_retried() {
+    let tool = format!(
+        "{}{}",
+        stream_tool("{\"value\":\"recorded\"}", true),
+        stream_finish()
+    );
+    let trial = run_headless_stream(&[tool, stream_finish_reason("length")], StreamEnding::Eof);
+    assert_eq!(trial.tool_effect.as_deref(), Some("recorded"));
+    assert_output_limit(&trial, 2);
+    let assistant = last_stream_assistant(&trial);
+    assert!(assistant.get("content").is_none());
+    assert!(assistant.get("reasoning").is_none());
+    assert!(assistant.get("invocations").is_none());
+}
+
+#[test]
+fn headless_stream_thinking_disabled_replays_only_received_reasoning_fields() {
+    for empty_reasoning in [false, true] {
+        let reasoning = if empty_reasoning {
+            stream_event(serde_json::json!({"choices": [{"delta": {"reasoning_content": ""}}]}))
+        } else {
+            String::new()
+        };
+        let tool = format!(
+            "{reasoning}{}{}data: [DONE]\n\n",
+            stream_tool("{\"value\":\"recorded\"}", true),
+            stream_finish_reason("tool_calls")
+        );
+        let final_response = format!(
+            "{}{}data: [DONE]\n\n",
+            stream_event(serde_json::json!({"choices": [{"delta": {"content": "done"}}]})),
+            stream_finish()
+        );
+        let trial = run_headless_stream_with_model(
+            &[tool, final_response],
+            StreamEnding::Eof,
+            r#"{ name = "test-model", supports_reasoning = true, thinking_token_budget = 8192, max_tokens = 32768, chat_template_kwargs = { enable_thinking = false } }"#,
+        );
+        assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+        assert_eq!(trial.requests, 2);
+        assert_eq!(trial.tool_effect.as_deref(), Some("recorded"));
+        for body in &trial.request_bodies {
+            assert_eq!(body["reasoning_effort"], "none");
+            assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+            assert_eq!(body["thinking_token_budget"], 8192);
+            assert_eq!(body["max_tokens"], 32768);
+        }
+        let assistant = trial.request_bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
+        if empty_reasoning {
+            assert_eq!(assistant["reasoning_content"], "");
+        } else {
+            assert!(assistant.get("reasoning_content").is_none());
+        }
+    }
+}
+
+#[test]
+fn headless_stream_replays_reasoning_across_multiple_tool_continuations() {
+    for field in [
+        "reasoning_content",
+        "reasoning",
+        "reasoning_text",
+        "unsupported_reasoning",
+    ] {
+        let reasoning = |text: &str| {
+            let mut delta = serde_json::json!({});
+            delta[field] = serde_json::json!(text);
+            stream_event(serde_json::json!({"choices": [{"delta": delta}]}))
+        };
+        let first = format!(
+            "{}{}{}data: [DONE]\n\n",
+            reasoning("first thought"),
+            stream_tool("{\"value\":\"first\"}", true),
+            stream_finish_reason("tool_calls")
+        );
+        let second = format!(
+            "{}{}{}data: [DONE]\n\n",
+            reasoning("second thought"),
+            stream_tool("{\"value\":\"second\"}", true).replace("probe-1", "probe-2"),
+            stream_finish_reason("tool_calls")
+        );
+        let final_response = format!(
+            "{}{}data: [DONE]\n\n",
+            stream_event(serde_json::json!({"choices": [{"delta": {"content": "done"}}]})),
+            stream_finish()
+        );
+        let trial = run_headless_stream(&[first, second, final_response], StreamEnding::Eof);
+        assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+        assert_eq!(trial.requests, 3);
+        assert_eq!(trial.tool_effect.as_deref(), Some("firstsecond"));
+        for (index, body) in trial.request_bodies.iter().enumerate() {
+            let messages = body["messages"].as_array().unwrap();
+            let assistants: Vec<_> = messages
+                .iter()
+                .filter(|message| message["role"] == "assistant")
+                .collect();
+            assert_eq!(assistants.len(), index);
+            for (step, assistant) in assistants.iter().enumerate() {
+                let expected = if step == 0 {
+                    "first thought"
+                } else {
+                    "second thought"
+                };
+                if field == "unsupported_reasoning" {
+                    assert!(assistant.get(field).is_none());
+                    assert_eq!(assistant.as_object().unwrap().len(), 2);
+                } else {
+                    assert_eq!(assistant[field], expected);
+                    assert_eq!(assistant.as_object().unwrap().len(), 3);
+                }
+                assert_eq!(
+                    assistant["tool_calls"][0]["id"],
+                    format!("probe-{}", step + 1)
+                );
+                assert!(messages.iter().any(|message| message["role"] == "tool"
+                    && message["tool_call_id"] == assistant["tool_calls"][0]["id"]));
+            }
+            assert!(!body.to_string().contains("reasoning_details"));
+            assert!(!body.to_string().contains("tool_metadata"));
+            assert!(!body.to_string().contains("endpoint_sha256"));
+        }
+    }
+}
+
+#[test]
+fn headless_stream_valid_fragmented_tool_call() {
+    let body = format!(
+        "{}{}{}data: [DONE]\n\n",
+        stream_tool("{\"value\":", true),
+        stream_tool("\"recorded\"}", false),
+        stream_finish()
+    );
+    let trial = run_headless_stream(
+        &[body, format!("{}{}", stream_content(), stream_finish())],
+        StreamEnding::Eof,
+    );
+    assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+    assert_eq!(trial.requests, 2);
+    assert_eq!(
+        trial.tool_effect.as_deref(),
+        Some("recorded"),
+        "{:?}",
+        trial.events
+    );
+    assert!(trial
+        .events
+        .iter()
+        .any(|ev| ev.get("ToolStarted").is_some()));
+    assert!(trial
+        .events
+        .iter()
+        .any(|ev| ev.get("ToolFinished").is_some()));
+}
+
+#[test]
+fn headless_responses_upstream_errors_share_retry_policy() {
+    use serde_json::json;
+
+    for (code, retry) in [
+        ("server_error", true),
+        ("rate_limit_exceeded", true),
+        ("invalid_prompt", false),
+        ("unknown_error", false),
+    ] {
+        let payload = json!({"code": code, "resets_at": 0, "message": "sensitive-fixture"});
+        for error in [
+            json!({"type": "error", "error": payload}),
+            json!({"type": "response.failed", "response": {"error": payload}}),
+        ] {
+            let failed = stream_event(
+                json!({"type": "response.output_text.delta", "delta": "rejected-answer"}),
+            ) + &stream_event(error);
+            let answer =
+                stream_event(json!({"type": "response.output_text.delta", "delta": "recovered"}))
+                    + &stream_event(
+                        json!({"type": "response.completed", "response": {"usage": {}}}),
+                    );
+            let trial = run_headless_stream_with_options(
+                &[failed, answer],
+                StreamEnding::Eof,
+                "\"test-model\"",
+                "json",
+                "openai",
+            );
+            if !retry {
+                assert_stream_failure(&trial, "upstream error event");
+                continue;
+            }
+            assert_eq!(trial.status.code(), Some(0), "{:?}", trial.events);
+            assert_eq!(trial.requests, 2);
+            assert_eq!(trial.request_bodies[0], trial.request_bodies[1]);
+            assert_eq!(last_stream_assistant(&trial)["content"], "recovered");
+            assert!(trial
+                .events
+                .iter()
+                .any(|event| *event == "ResponseDraftRejected"));
+            assert!(!trial.stdout.contains("sensitive-fixture"));
+            assert!(!trial.stderr.contains("sensitive-fixture"));
+            assert!(!trial
+                .events
+                .iter()
+                .any(|event| event.get("TurnError").is_some()));
+        }
+    }
+}
+
+#[test]
+fn headless_responses_output_limit_and_filter_are_not_retried() {
+    for reason in ["max_output_tokens", "content_filter"] {
+        let body = stream_event(
+            serde_json::json!({"type": "response.output_text.delta", "delta": "partial answer"}),
+        ) + &stream_event(
+            serde_json::json!({"type": "response.incomplete", "response": {
+                "incomplete_details": {"reason": reason}, "usage": {"input_tokens": 7, "output_tokens": 2}
+            }}),
+        );
+        let trial = run_headless_stream_with_options(
+            &[body],
+            StreamEnding::Eof,
+            "\"test-model\"",
+            "json",
+            "openai",
+        );
+        if reason == "max_output_tokens" {
+            assert_output_limit(&trial, 1);
+            assert_eq!(last_stream_assistant(&trial)["content"], "partial answer");
+            let usage = trial
+                .events
+                .iter()
+                .find_map(|event| event.get("TokenUsage"))
+                .unwrap();
+            assert_eq!(usage["usage"]["prompt_tokens"], 7);
+            assert_eq!(usage["usage"]["completion_tokens"], 2);
+        } else {
+            assert_stream_failure(&trial, reason);
+        }
+    }
+}
+
+#[test]
+fn headless_responses_output_limit_validates_tools_before_execution() {
+    for (arguments, valid) in [(r#"{"value":"recorded"}"#, true), ("{", false)] {
+        let body = [
+            serde_json::json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "id": "probe", "call_id": "probe", "name": "stream_probe", "arguments": arguments
+            }}),
+            serde_json::json!({"type": "response.incomplete", "response": {
+                "incomplete_details": {"reason": "max_output_tokens"}, "usage": {"input_tokens": 7, "output_tokens": 2}
+            }}),
+        ].into_iter().map(stream_event).collect::<String>();
+        let trial = run_headless_stream_with_options(
+            &[body],
+            StreamEnding::Eof,
+            "\"test-model\"",
+            "json",
+            "openai",
+        );
+        if valid {
+            assert_output_limit(&trial, 1);
+            assert_eq!(trial.tool_effect.as_deref(), Some("recorded"));
+        } else {
+            assert_stream_failure_attempts(&trial, "tool-call arguments", 3);
+        }
+    }
+}
+
+#[test]
+fn headless_stream_upstream_error() {
+    for (error, cause) in [
+        (
+            stream_event(
+                serde_json::json!({"error": {"message": "sensitive-fixture", "code": "invalid_request_error"}}),
+            ),
+            "upstream error event",
+        ),
+        (
+            "event: error\ndata: sensitive-fixture\n\n".into(),
+            "upstream error event",
+        ),
+        ("event: error\ndata:\n\n".into(), "upstream error event"),
+        (
+            stream_event(
+                serde_json::json!({"error": {"message": "sensitive-fixture", "code": "insufficient_quota"}}),
+            ),
+            "API quota exceeded",
+        ),
+        (
+            stream_event(
+                serde_json::json!({"error": {"message": "sensitive-fixture", "code": "rate_limit_exceeded"}}),
+            ),
+            "rate limited",
+        ),
+    ] {
+        assert_stream_failure(
+            &run_headless_stream(
+                &[format!("{}{}{error}", stream_content(), stream_finish())],
+                StreamEnding::Eof,
+            ),
+            cause,
+        );
+    }
+}
+
+#[test]
+fn headless_stream_malformed_json() {
+    assert_stream_failure(
+        &run_headless_stream(
+            &[format!(
+                "{}{}data: {{sensitive-fixture}}\n\n",
+                stream_content(),
+                stream_finish()
+            )],
+            StreamEnding::Eof,
+        ),
+        "malformed JSON",
+    );
+}
+
+#[test]
+fn headless_stream_eof_during_event_recovers() {
+    for tail in ["data: {\"sensitive-fixture\":", "data: {\"ok\":true}\n"] {
+        let valid = stream_content() + &stream_finish();
+        let trial = run_headless_stream(&[valid.clone() + tail, valid], StreamEnding::Eof);
+        assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+        assert_eq!(trial.requests, 2);
+        assert_eq!(trial.request_bodies[0], trial.request_bodies[1]);
+        assert_eq!(last_stream_assistant(&trial)["content"], "partial 界");
+    }
+}
+
+#[test]
+fn headless_stream_eof_without_finish_reason() {
+    assert_stream_failure(
+        &run_headless_stream(&[stream_content()], StreamEnding::Eof),
+        "without finish_reason",
+    );
+}
+
+#[test]
+fn headless_stream_done_without_finish_reason() {
+    let trial = run_headless_stream(
+        &[format!("{}data: [DONE]\n\n", stream_content())],
+        StreamEnding::Eof,
+    );
+    assert_stream_failure(&trial, "without finish_reason");
+    let error = trial
+        .events
+        .iter()
+        .find_map(|ev| ev.get("TurnError"))
+        .unwrap();
+    assert!(error["message"].as_str().unwrap().contains("done=true"));
+}
+
+#[test]
+fn headless_responses_stream_interruption_recovers_without_executing_drafts() {
+    use serde_json::json;
+
+    let draft = [
+        json!({"type": "response.reasoning_summary_text.delta", "item_id": "reasoning-1", "summary_index": 0, "delta": "rejected-plan"}),
+        json!({"type": "response.output_text.delta", "delta": "rejected-answer"}),
+        json!({"type": "response.output_item.added", "item": {
+            "type": "function_call", "id": "draft-1", "call_id": "draft-1", "name": "stream_probe", "arguments": ""
+        }}),
+        json!({"type": "response.function_call_arguments.delta", "item_id": "draft-1", "delta": "{\"value\":\"rejected-effect\"}"}),
+        json!({"type": "response.output_item.done", "item": {
+            "type": "function_call", "id": "draft-1", "call_id": "draft-1", "name": "stream_probe", "arguments": "{\"value\":\"rejected-effect\"}"
+        }}),
+    ].into_iter().map(stream_event).collect::<String>();
+    let answer = [
+        json!({"type": "response.output_text.delta", "delta": "recovered 界"}),
+        json!({"type": "response.completed", "response": {"usage": {"input_tokens": 7, "output_tokens": 2}}}),
+    ].into_iter().map(stream_event).collect::<String>();
+
+    // Both an abruptly closed HTTP body and a clean EOF before response.completed
+    // must restart the request, not accept or execute the streamed draft.
+    for (ending, tail) in [
+        (StreamEnding::NetworkFailures { first: 1, count: 2 }, ""),
+        (StreamEnding::Eof, ""),
+        (StreamEnding::Eof, "data: {\"sensitive-fixture\":"),
+    ] {
+        let failed = draft.clone() + tail;
+        let trial = run_headless_stream_with_options(
+            &[failed.clone(), failed, answer.clone()],
+            ending,
+            "\"test-model\"",
+            "json",
+            "openai",
+        );
+        assert_eq!(trial.status.code(), Some(0), "{:?}", trial.events);
+        assert_eq!(trial.requests, 3);
+        assert!(trial
+            .request_bodies
+            .windows(2)
+            .all(|pair| pair[0] == pair[1]));
+        assert!(trial.tool_effect.is_none());
+        let assistant = last_stream_assistant(&trial);
+        assert_eq!(assistant["content"], "recovered 界");
+        assert!(!assistant.to_string().contains("rejected-"));
+        assert_eq!(stream_event_count(&trial, "ResponseDraftRejected"), 2);
+        assert_eq!(stream_event_count(&trial, "Retrying"), 2);
+        assert_eq!(stream_event_count(&trial, "TokenUsage"), 1);
+        assert!(!trial
+            .events
+            .iter()
+            .any(|event| event.get("TurnError").is_some() || event.get("ToolStarted").is_some()));
+    }
+}
+
+#[test]
+fn headless_stream_network_interruption_exhausts_retry_budget() {
+    let trial = run_headless_stream(&[stream_content()], StreamEnding::NetworkFailure);
+    assert_stream_failure_attempts(&trial, "SSE network read failed", 6);
+    assert!(trial
+        .request_bodies
+        .windows(2)
+        .all(|pair| pair[0] == pair[1]));
+    assert_eq!(stream_event_count(&trial, "ResponseDraftRejected"), 6);
+    assert_eq!(stream_event_count(&trial, "Retrying"), 5);
+}
+
+#[test]
+fn headless_stream_cancellation_during_network_retry() {
+    let trial = run_headless_stream(&[stream_content()], StreamEnding::CancelDuringRetry);
+    assert_eq!(trial.status.code(), Some(130), "{}", trial.stderr);
+    assert_eq!(trial.requests, 1);
+    assert!(trial.tool_effect.is_none());
+    assert!(trial
+        .events
+        .iter()
+        .any(|event| event.get("Retrying").is_some()));
+    assert!(!trial
+        .events
+        .iter()
+        .any(|event| event.get("TurnError").is_some()));
+}
+
+#[test]
+fn headless_stream_cancellation() {
+    let trial = run_headless_stream(
+        &[format!("{}data: {{", stream_content())],
+        StreamEnding::Cancel,
+    );
+    assert_eq!(trial.status.code(), Some(130), "{}", trial.stderr);
+    assert_eq!(trial.requests, 1);
+    assert!(trial.tool_effect.is_none());
+    assert!(!trial.events.iter().any(|ev| ev.get("TurnError").is_some()));
+}
+
+#[test]
+fn headless_stream_incomplete_tool_is_not_executed() {
+    for finish in [false, true] {
+        let body = format!(
+            "{}{}data: [DONE]\n\n",
+            stream_tool("{\"value\":", true),
+            if finish {
+                stream_finish()
+            } else {
+                String::new()
+            }
+        );
+        assert_stream_failure_attempts(
+            &run_headless_stream(&[body], StreamEnding::Eof),
+            if finish {
+                "tool-call arguments"
+            } else {
+                "without finish_reason"
+            },
+            if finish { 3 } else { 1 },
+        );
+    }
+}
+
+#[test]
+fn headless_stream_tool_finish_does_not_execute_before_stream_validation() {
+    let tool = format!(
+        "{}{}",
+        stream_tool("{\"value\":\"recorded\"}", true),
+        stream_finish()
+    );
+    for tail in [
+        "data: {\"error\":{\"message\":\"sensitive-fixture\"}}\n\n",
+        "data: {sensitive-fixture}\n\n",
+        "data: {",
+    ] {
+        let trial = run_headless_stream(
+            &[format!("{tool}{tail}"), stream_content() + &stream_finish()],
+            StreamEnding::Eof,
+        );
+        if tail.ends_with("\n\n") {
+            assert_stream_failure(
+                &trial,
+                if tail.contains("error") {
+                    "upstream error event"
+                } else {
+                    "malformed JSON"
+                },
+            );
+        } else {
+            assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+            assert_eq!(trial.requests, 2);
+            assert!(trial.tool_effect.is_none());
+        }
+        assert!(trial
+            .events
+            .iter()
+            .any(|ev| ev.get("ToolCallDraftFinished").is_some()));
+        assert!(!trial
+            .events
+            .iter()
+            .any(|ev| ev.get("ToolDispatch").is_some()));
+    }
+}
+
+#[test]
+fn headless_stream_failure_after_tool_effect_does_not_replay() {
+    let tool = format!(
+        "{}{}",
+        stream_tool("{\"value\":\"recorded\"}", true),
+        stream_finish()
+    );
+    let answer =
+        stream_event(serde_json::json!({"choices": [{"delta": {"content": "recovered"}}]}))
+            + &stream_finish();
+    let trial = run_headless_stream(
+        &[tool, stream_content(), answer],
+        StreamEnding::NetworkFailures { first: 2, count: 1 },
+    );
+    assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+    assert_eq!(trial.requests, 3);
+    assert_eq!(trial.request_bodies[1], trial.request_bodies[2]);
+    assert_eq!(trial.tool_effect.as_deref(), Some("recorded"));
+    assert_eq!(last_stream_assistant(&trial)["content"], "recovered");
+    assert_eq!(
+        trial
+            .events
+            .iter()
+            .filter(|ev| ev.get("ToolStarted").is_some())
+            .count(),
+        1
+    );
+    assert!(!trial.events.iter().any(|ev| ev.get("TurnError").is_some()));
+}
+
+#[test]
+fn headless_stream_multiline_data() {
+    let body = format!("data: {{\"choices\": [\n: keepalive\ndata: {{\"delta\": {{\"content\": \"multiline\"}}}}]}}\n\n{}", stream_finish());
+    let trial = run_headless_stream(&[body], StreamEnding::Eof);
+    assert_eq!(trial.status.code(), Some(0), "{}", trial.stderr);
+    assert!(trial.events.iter().any(|ev| ev
+        .get("TextDelta")
+        .is_some_and(|v| v.to_string().contains("multiline"))));
+}
+
+#[test]
+fn headless_settings_load_before_shell_dispatch() {
+    let output = run_headless_config(
+        r#"
+assert(smelt.settings.restrict_to_workspace == true)
+smelt.settings.autoupgrade = "off"
+smelt.settings.fast_mode = true
+smelt.settings.restrict_to_workspace = false
+assert(smelt.settings.autoupgrade == "off")
+assert(smelt.settings.fast_mode == true)
+assert(smelt.settings.restrict_to_workspace == false)
+"#,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"headless-config-ok");
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn headless_config_errors_prevent_shell_dispatch() {
+    for source in [
+        "error('invalid headless config')",
+        "smelt.settings.unknown_setting = true",
+        "smelt.settings.fast_mode = 'true'",
+    ] {
+        let output = run_headless_config(source);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("error: lua init:"));
     }
 }

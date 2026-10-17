@@ -112,6 +112,12 @@ impl StreamParser {
         self.stream_exec_id = None;
     }
 
+    pub fn clear_response_output(&mut self) {
+        self.active_thinking.clear();
+        self.active_text.clear();
+        self.tool_drafts.clear();
+    }
+
     pub fn begin_turn(&mut self) {
         self.active_tools.clear();
         self.tool_drafts.clear();
@@ -175,14 +181,14 @@ impl StreamParser {
         call_id: Option<String>,
         name: Option<String>,
     ) -> ToolDraftChange {
-        self.flush_streaming_thinking(history);
-        self.flush_streaming_text(history);
         if let Some(block_id) = self.tool_drafts.get(&stream_id).copied() {
             return ToolDraftChange {
                 block_id,
                 presentation_changed: false,
             };
         }
+        self.flush_streaming_thinking(history);
+        self.flush_streaming_text(history);
         let name = name
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "tool".into());

@@ -105,9 +105,22 @@ impl TuiApp {
     }
 
     pub(crate) fn flush_lua_callbacks(&mut self) {
+        let work = self.lua.shared().begin_work();
         self.drain_lua_invocations();
         self.drain_lua_commands();
         self.lua.pump_task_events();
+        self.finish_lua_work(&work);
+    }
+
+    pub(super) fn finish_lua_work(&self, work: &crate::lua::LuaWorkGuard) {
+        if work.root
+            && (self.core.signals.has_pending()
+                || self.lua.shared().has_pending_callbacks()
+                || self.lua.shared().has_pending_commands()
+                || self.lua.core_shared().has_pending_task_events())
+        {
+            let _ = self.lua.wakeup_sender().send(());
+        }
     }
 
     fn drain_lua_commands(&mut self) {
@@ -118,84 +131,75 @@ impl TuiApp {
             return;
         }
 
-        let mut remaining = crate::lua::MAX_PENDING_LUA_COMMANDS;
-        loop {
-            let commands = self.lua.shared().drain_commands();
-            if commands.is_empty() {
+        let shared = std::sync::Arc::clone(self.lua.shared());
+        for _ in 0..crate::lua::LUA_WORK_BATCH {
+            if !std::sync::Arc::ptr_eq(&shared, self.lua.shared())
+                || !shared.has_pending_commands()
+                || !shared.claim_work()
+            {
                 break;
             }
-            let overflowed = commands.len() > remaining;
-            for line in commands.into_iter().take(remaining) {
-                self.apply_lua_command(&line);
-                remaining -= 1;
-            }
-            if overflowed || remaining == 0 {
-                let queued_more = !self.lua.shared().drain_commands().is_empty();
-                if overflowed || queued_more {
-                    self.notify_workspace_error_sticky(format!(
-                        "deferred Lua commands exceeded {} in one flush",
-                        crate::lua::MAX_PENDING_LUA_COMMANDS
-                    ));
-                }
+            let Some(line) = shared.pop_command() else {
                 break;
-            }
+            };
+            self.apply_lua_command(&line);
         }
-
-        self.lua.shared().end_command_drain();
+        shared.end_command_drain();
     }
 
-    /// Drive cell subscribers + invocation queue + task inbox to a fixpoint.
-    /// Either pass can re-feed the other, so loop until both are quiet.
+    /// Drive reactive work within one shared callback/time budget. Remaining work
+    /// keeps its queue position and wakes the event loop for another pass.
     pub(crate) fn pump_lua(&mut self) {
         if smelt_core::host::host_access_active() {
             return;
         }
-        loop {
-            let cells_had_work = self.core.signals.has_pending();
-            if cells_had_work {
-                self.drain_signals_pending();
-            }
+        let work = self.lua.shared().begin_work();
+        while self.lua.shared().has_work_budget() {
+            self.drain_signals_pending();
             self.flush_lua_callbacks();
-            if !self.core.signals.has_pending() {
+            if !self.core.signals.has_pending()
+                && !self.lua.shared().has_pending_callbacks()
+                && !self.lua.shared().has_pending_commands()
+                && !self.lua.core_shared().has_pending_task_events()
+            {
                 break;
             }
         }
+        self.finish_lua_work(&work);
     }
 
     /// Drain invocations queued by `ui.dispatch_event` / `ui.fire_win_event`.
     ///
-    /// Two-phase to keep host borrowing explicit: phase 1 collects `(func, payload)` while
-    /// `&mut self` is live; phase 2 lends the frontend root only for the callbacks' dynamic
-    /// extent, so Lua cannot retain host authority after the calls return.
+    /// Prepare each callback before lending the frontend root for its dynamic
+    /// extent, so Lua cannot retain host authority after the call returns.
     pub(crate) fn drain_lua_invocations(&mut self) {
-        loop {
-            let pending = self.lua.drain_invocations();
-            if pending.is_empty() {
-                return;
+        let work = self.lua.shared().begin_work();
+        for _ in 0..crate::lua::LUA_WORK_BATCH {
+            if !self.lua.shared().has_pending_callbacks() || !self.lua.shared().claim_work() {
+                break;
             }
-            let prepared: Vec<(mlua::Function, mlua::Table, u64)> = pending
-                .into_iter()
-                .filter_map(|inv| {
-                    let (func, payload) =
-                        self.lua
-                            .prepare_invocation(inv.handle, inv.win, &inv.payload)?;
-                    Some((func, payload, inv.handle.0))
-                })
-                .collect();
+            let Some(inv) = self.lua.pop_invocation() else {
+                break;
+            };
+            let Some((func, payload)) =
+                self.lua
+                    .prepare_invocation(inv.handle, inv.win, &inv.payload)
+            else {
+                continue;
+            };
             let lua = self.lua.execution();
             crate::lua::scope_app(self, move || {
-                for (func, payload, handle_id) in prepared {
-                    let _perf = smelt_perf::perf::begin("lua:event_cb");
-                    if let Err(e) = func.call::<()>(payload) {
-                        lua.record_error(format!("callback `{handle_id}`: {e}"));
-                    }
+                let _perf = smelt_perf::perf::begin("lua:event_cb");
+                if let Err(error) = func.call::<()>(payload) {
+                    lua.record_error(format!("callback `{}`: {error}", inv.handle.0));
                 }
             });
-            // A callback may itself queue further invocations; drain in the same tick.
         }
+        self.finish_lua_work(&work);
     }
 
     pub(crate) fn drive_lua_tasks(&mut self) {
+        let work = self.lua.shared().begin_work();
         self.flush_lua_callbacks();
         let now = self.core.clock.instant_now();
         let lua = self.lua.execution();
@@ -225,11 +229,19 @@ impl TuiApp {
                         },
                     );
                 }
+                crate::lua::TaskDriveOutput::ToolEvaluated { request, result } => {
+                    let lua = self.lua.execution();
+                    let metadata = crate::lua::scope_app(self, || {
+                        lua.finish_tool_evaluation(&request, result)
+                    });
+                    self.finish_tool_evaluation(*request, metadata);
+                }
                 crate::lua::TaskDriveOutput::NotifyError(msg) => {
                     self.notify_error(msg);
                 }
             }
         }
         self.flush_lua_callbacks();
+        self.finish_lua_work(&work);
     }
 }

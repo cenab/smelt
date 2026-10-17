@@ -94,8 +94,12 @@ impl TestApp {
         };
         self.ensure_writer_ready();
         let sent_at_ms = engine::clock::unix_time_ms(self.app.core.clock.as_ref());
-        let turn = self.app.begin_custom_command_turn(cmd, sent_at_ms)?;
-        self.app.conversation.set_active(Some(turn));
+        let turn = self.app.begin_custom_command_turn(cmd, sent_at_ms);
+        self.app.conversation.set_active(turn);
+        self.wait_for_turn_persistence();
+        if !self.agent_running() {
+            return None;
+        }
         self.drain_cmd();
         self.actions.iter().rev().find_map(|a| match a {
             Action::EngineSend(cmd) => match cmd.as_ref() {
@@ -485,13 +489,12 @@ impl TestApp {
         let full_history = protocol::history_to_messages(&self.app.model_history());
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         {
-            self.app
-                .dispatch_host_call(engine::HostCall::PrepareRequest {
-                    turn_id: self.current_turn_id().expect("active request turn"),
-                    messages: engine::PreparedRequestMessages::model_only(full_history),
-                    estimated_tokens: 200,
-                    reply: tx,
-                });
+            self.dispatch_host_call(engine::HostCall::PrepareRequest {
+                turn_id: self.current_turn_id().expect("active request turn"),
+                messages: engine::PreparedRequestMessages::model_only(full_history),
+                estimated_tokens: 200,
+                reply: tx,
+            });
         }
 
         let sends = self.drain_engine_sends();

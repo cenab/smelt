@@ -34,8 +34,14 @@ impl PendingToolOutputAppend {
 }
 
 pub(super) enum TranscriptWork {
-    ProviderContinuation(EngineEvent),
-    AuxiliaryContinuation(EngineEvent),
+    ProviderContinuation {
+        event: EngineEvent,
+        arrived_at: std::time::Instant,
+    },
+    AuxiliaryContinuation {
+        event: EngineEvent,
+        arrived_at: std::time::Instant,
+    },
     ToolOutputAppend(PendingToolOutputAppend),
     DeferredReasoningSummary {
         event: EngineEvent,
@@ -49,9 +55,10 @@ pub(super) enum TranscriptWork {
 impl TranscriptWork {
     fn pending_tool_output_invocation(&self) -> Option<InvocationId> {
         match self {
-            Self::ProviderContinuation(EngineEvent::ToolOutput { invocation_id, .. }) => {
-                Some(*invocation_id)
-            }
+            Self::ProviderContinuation {
+                event: EngineEvent::ToolOutput { invocation_id, .. },
+                ..
+            } => Some(*invocation_id),
             Self::ToolOutputAppend(pending) => Some(pending.invocation_id),
             _ => None,
         }
@@ -60,7 +67,7 @@ impl TranscriptWork {
     fn is_main_turn_work(&self) -> bool {
         matches!(
             self,
-            Self::ProviderContinuation(_)
+            Self::ProviderContinuation { .. }
                 | Self::ToolOutputAppend(_)
                 | Self::DeferredReasoningSummary { .. }
                 | Self::OrderedEngineEvent(_)
@@ -77,12 +84,20 @@ pub(super) struct TranscriptWorkQueue {
 }
 
 impl TranscriptWorkQueue {
-    pub(super) fn push_provider_continuation(&mut self, event: EngineEvent) {
-        self.push_back(TranscriptWork::ProviderContinuation(event));
+    pub(super) fn push_provider_continuation(
+        &mut self,
+        event: EngineEvent,
+        arrived_at: std::time::Instant,
+    ) {
+        self.push_back(TranscriptWork::ProviderContinuation { event, arrived_at });
     }
 
-    pub(super) fn push_auxiliary_continuation(&mut self, event: EngineEvent) {
-        self.push_back(TranscriptWork::AuxiliaryContinuation(event));
+    pub(super) fn push_auxiliary_continuation(
+        &mut self,
+        event: EngineEvent,
+        arrived_at: std::time::Instant,
+    ) {
+        self.push_back(TranscriptWork::AuxiliaryContinuation { event, arrived_at });
     }
 
     pub(super) fn push_deferred_reasoning_summary(
@@ -154,6 +169,19 @@ impl TranscriptWorkQueue {
         &mut self,
     ) -> Vec<smelt_core::transcript_model::BlockId> {
         std::mem::take(&mut self.pending_tool_draft_summaries)
+    }
+
+    pub(super) fn has_auxiliary_work(&self, id: u64) -> bool {
+        self.items.iter().any(|work| {
+            matches!(work,
+                TranscriptWork::AuxiliaryContinuation {
+                    event: EngineEvent::EngineAskDelta { id: queued, .. }
+                    | EngineEvent::EngineAskDraftRejected { id: queued }
+                    | EngineEvent::EngineAskResponse { id: queued, .. },
+                    ..
+                } if *queued == id
+            )
+        })
     }
 
     pub(super) fn has_main_turn_work(&self) -> bool {

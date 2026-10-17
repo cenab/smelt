@@ -80,18 +80,21 @@ impl ProviderClient {
     ) -> Result<ChatResponse, ProviderError> {
         let provider_kind = request.provider.kind();
         let mut wire_api = provider_kind.wire_api();
+        let mut reasoning_origin = None;
         let (url, mut body) = {
             let _perf = smelt_perf::perf::begin("provider:request:build_body");
             match provider_kind {
                 ProviderKind::OpenAiCompatible => {
                     let url = endpoint_url(request.api_base, "chat/completions");
+                    let target = chat_completions::Target::new(provider_kind, &url, request.model);
                     let body = chat_completions::build_body(
                         request.messages,
                         request.tools,
-                        request.model,
+                        &target,
                         request.effort,
                         request.config,
                     );
+                    reasoning_origin = Some(target.origin);
                     (url, body)
                 }
                 ProviderKind::OpenAi => {
@@ -138,15 +141,19 @@ impl ProviderClient {
                     };
                     wire_api = wire;
                     let url = wire.copilot_url(&tokens.api_base);
+                    let target = chat_completions::Target::new(provider_kind, &url, request.model);
                     let body = copilot_body(
                         wire,
                         request.messages,
                         request.tools,
-                        request.model,
+                        &target,
                         request.effort,
                         request.config,
                         &request.cache,
                     );
+                    if wire == WireApi::ChatCompletions {
+                        reasoning_origin = Some(target.origin);
+                    }
                     (url, body)
                 }
             }
@@ -205,7 +212,15 @@ impl ProviderClient {
             ChatProviderKind::None { .. } => {}
         }
 
-        self.chat_http(transport, opts).await
+        let mut response = self.chat_http(transport, opts).await?;
+        if let Some(origin) = reasoning_origin {
+            for block in response.reasoning_details.iter_mut().flatten() {
+                if block.provider == protocol::ReasoningBlock::CHAT_COMPLETIONS {
+                    block.data["origin"] = origin.clone();
+                }
+            }
+        }
+        Ok(response)
     }
 }
 
@@ -254,6 +269,7 @@ struct RetryState {
     request_attempt: usize,
     standard_retries: usize,
     cyber_policy_retries: usize,
+    malformed_retries: usize,
 }
 
 impl RetryState {
@@ -264,6 +280,10 @@ impl RetryState {
         retry_after: Option<Duration>,
         now_secs: u64,
     ) -> Option<Duration> {
+        let is_malformed = matches!(error, ProviderError::MalformedResponse { .. });
+        if is_malformed && self.malformed_retries >= 2 {
+            return None;
+        }
         let is_cyber_policy = matches!(error, ProviderError::CyberPolicy { .. });
         let (retry_attempt, retry_limit) = if is_cyber_policy {
             (self.cyber_policy_retries, MAX_CYBER_POLICY_RETRIES)
@@ -279,6 +299,9 @@ impl RetryState {
             self.cyber_policy_retries += 1;
         } else {
             self.standard_retries += 1;
+        }
+        if is_malformed {
+            self.malformed_retries += 1;
         }
         self.request_attempt += 1;
         Some(delay)
@@ -377,7 +400,7 @@ impl ProviderClient {
                             unix_now(),
                         ) {
                             emit_retry(opts, delay, attempt);
-                            tokio::time::sleep(delay).await;
+                            wait_retry(opts, delay).await?;
                             continue;
                         }
                         return Err(err);
@@ -403,7 +426,7 @@ impl ProviderClient {
                     retry_state.schedule_provider_retry(&err, max_retries, retry_after, unix_now())
                 {
                     emit_retry(opts, delay, attempt);
-                    tokio::time::sleep(delay).await;
+                    wait_retry(opts, delay).await?;
                     continue;
                 }
                 return Err(err);
@@ -417,12 +440,17 @@ impl ProviderClient {
                 .map(str::to_string);
             let noop_delta: &(dyn Fn(ProviderStreamEvent<'_>) + Send + Sync) = &|_| {};
             let on_delta = opts.on_delta.unwrap_or(noop_delta);
+            let streamed = std::sync::atomic::AtomicBool::new(false);
+            let tracked_delta = |delta: ProviderStreamEvent<'_>| {
+                streamed.store(true, std::sync::atomic::Ordering::Relaxed);
+                on_delta(delta);
+            };
 
             let parsed_result = if request.use_stream {
                 (
                     request
                         .wire_api
-                        .read_stream(resp, opts.cancel, on_delta, unix_now())
+                        .read_stream(resp, opts.cancel, &tracked_delta, unix_now())
                         .await,
                     None,
                     http_status,
@@ -453,6 +481,12 @@ impl ProviderClient {
                 }
             };
 
+            let parsed_result = match parsed_result {
+                (Ok(parsed), raw, status, error_body) => {
+                    (parsed.validate().map(|()| parsed), raw, status, error_body)
+                }
+                result => result,
+            };
             let (parsed, raw, status) = match parsed_result {
                 (Ok(parsed), raw, status, _) => (parsed, raw, status),
                 (Err(err), _, status, error_body) => {
@@ -464,6 +498,15 @@ impl ProviderClient {
                         http_status: status,
                         error_body: error_body.as_deref(),
                     });
+                    let malformed = matches!(err, ProviderError::MalformedResponse { .. });
+                    if malformed
+                        || (streamed.load(std::sync::atomic::Ordering::Relaxed)
+                            && !matches!(err, ProviderError::Cancelled))
+                    {
+                        on_delta(ProviderStreamEvent::DraftRejected);
+                    }
+                    // Streamed output is only a draft. Replaying the unchanged request
+                    // after a retryable failure is safe once the whole draft is rejected.
                     if let Some(delay) = retry_state.schedule_provider_retry(
                         &err,
                         max_stream_retries,
@@ -471,7 +514,7 @@ impl ProviderClient {
                         unix_now(),
                     ) {
                         emit_retry(opts, delay, attempt);
-                        tokio::time::sleep(delay).await;
+                        wait_retry(opts, delay).await?;
                         continue;
                     }
                     return Err(err);
@@ -489,7 +532,10 @@ impl ProviderClient {
             let response = ChatResponse::from_parsed_with_metadata(
                 parsed,
                 tokens_per_sec,
-                ChatResponseMetadata { codex_turn_state },
+                ChatResponseMetadata {
+                    codex_turn_state,
+                    ..Default::default()
+                },
             );
             emit_attempt(AttemptEvent {
                 attempt: attempt as u32,
@@ -568,11 +614,11 @@ fn copilot_request_headers(
 fn copilot_chat_completions_body(
     messages: &[Message],
     tools: &[ToolDefinition],
-    model: &str,
+    target: &chat_completions::Target<'_>,
     effort: ReasoningEffort,
     config: &ModelConfig,
 ) -> serde_json::Value {
-    let mut body = chat_completions::build_body(messages, tools, model, effort, config);
+    let mut body = chat_completions::build_body(messages, tools, target, effort, config);
     if let Some(obj) = body.as_object_mut() {
         obj.remove("chat_template_kwargs");
         obj.remove("reasoning_effort");
@@ -584,22 +630,22 @@ fn copilot_body(
     wire: WireApi,
     messages: &[Message],
     tools: &[ToolDefinition],
-    model: &str,
+    target: &chat_completions::Target<'_>,
     effort: ReasoningEffort,
     config: &ModelConfig,
     cache: &CacheConfig,
 ) -> serde_json::Value {
     match wire {
         WireApi::ChatCompletions => {
-            copilot_chat_completions_body(messages, tools, model, effort, config)
+            copilot_chat_completions_body(messages, tools, target, effort, config)
         }
         WireApi::OpenAiResponses => {
-            let mut body = openai::build_body(messages, tools, model, effort, config);
+            let mut body = openai::build_body(messages, tools, target.model, effort, config);
             body["store"] = serde_json::json!(false);
             body
         }
         WireApi::AnthropicMessages => {
-            anthropic::build_body(messages, tools, model, effort, config, cache)
+            anthropic::build_body(messages, tools, target.model, effort, config, cache)
         }
     }
 }
@@ -789,6 +835,14 @@ impl<'a> ChatOptions<'a> {
     }
 }
 
+async fn wait_retry(opts: &ChatOptions<'_>, delay: Duration) -> Result<(), ProviderError> {
+    tokio::select! {
+        biased;
+        _ = opts.cancel.cancelled() => Err(ProviderError::Cancelled),
+        _ = tokio::time::sleep(delay) => Ok(()),
+    }
+}
+
 pub fn emit_retry(opts: &ChatOptions<'_>, delay: Duration, attempt: usize) {
     if let Some(f) = opts.on_retry {
         f(delay, (attempt + 1) as u32);
@@ -888,6 +942,207 @@ mod tests {
             headers,
             request[header_end..header_end + content_length].to_vec(),
         )
+    }
+
+    #[test]
+    fn malformed_retries_share_the_standard_budget_and_stop_after_two() {
+        let error = ProviderError::MalformedResponse {
+            issue: "invalid arguments".into(),
+            finish_reason: Some("length".into()),
+            stop_reason: None,
+            system_fingerprint: None,
+            usage: Default::default(),
+        };
+        let mut retries = RetryState::default();
+        assert!(retries
+            .schedule_provider_retry(&error, 5, None, 0)
+            .is_some());
+        assert!(retries
+            .schedule_provider_retry(&error, 5, None, 0)
+            .is_some());
+        assert!(retries
+            .schedule_provider_retry(&error, 5, None, 0)
+            .is_none());
+        assert_eq!(retries.standard_retries, 2);
+        let mut retries = RetryState {
+            standard_retries: 4,
+            ..Default::default()
+        };
+        assert!(retries
+            .schedule_provider_retry(&error, 5, None, 0)
+            .is_some());
+        assert!(retries
+            .schedule_provider_retry(&error, 5, None, 0)
+            .is_none());
+        assert_eq!(retries.malformed_retries, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_backoff_honors_cancellation_and_outer_deadline() {
+        let cancel = CancellationToken::new();
+        let opts = ChatOptions::new(&cancel);
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            wait_retry(&opts, Duration::from_secs(30))
+        )
+        .await
+        .is_err());
+        cancel.cancel();
+        assert!(matches!(
+            wait_retry(&opts, Duration::from_secs(30)).await,
+            Err(ProviderError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_nonstream_response_retries_without_changing_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (_, request) = read_http_request(&mut stream).await;
+                bodies.push(request);
+                let message = if index == 0 {
+                    json!({"tool_calls": [
+                        {"id": "valid", "type": "function", "function": {"name": "probe", "arguments": "{}"}},
+                        {"id": "invalid", "type": "function", "function": {"name": "probe", "arguments": "{\"private-argument\":"}}
+                    ]})
+                } else {
+                    json!({"content": "recovered"})
+                };
+                let body = json!({"choices": [{"message": message, "finish_reason": "stop"}], "usage": {"prompt_tokens": 3, "completion_tokens": 2}}).to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        let cancel = CancellationToken::new();
+        let attempts = std::sync::Mutex::new(Vec::new());
+        let on_attempt = |info: RequestAttemptInfo<'_>| {
+            if let Err(error) = info.result {
+                attempts.lock().unwrap().push(error.clone());
+            }
+        };
+        let mut opts = ChatOptions::new(&cancel);
+        opts.on_attempt = Some(&on_attempt);
+        let response = ProviderClient::new(reqwest::Client::new())
+            .chat(
+                ChatRequest {
+                    provider: ChatProvider::api_key(ProviderKind::OpenAiCompatible, "test-only"),
+                    api_base: &api_base,
+                    model: "custom-model",
+                    messages: &[user_msg("test")],
+                    tools: &[],
+                    effort: ReasoningEffort::Off,
+                    config: &ModelConfig::default(),
+                    cache: CacheConfig::default(),
+                    response_format: None,
+                    fast_mode: false,
+                },
+                &opts,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.content.as_deref(), Some("recovered"));
+        let bodies = server.await.unwrap();
+        assert_eq!(bodies[0], bodies[1]);
+        let errors = attempts.into_inner().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(!format!("{:?}", errors[0]).contains("private-argument"));
+        assert!(
+            matches!(&errors[0], ProviderError::MalformedResponse { usage, finish_reason, .. }
+            if usage.prompt_tokens == Some(3) && finish_reason.as_deref() == Some("stop"))
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_replays_nonstream_reasoning_on_new_turn_but_not_model_switch() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for index in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (_, body) = read_http_request(&mut stream).await;
+                bodies.push(serde_json::from_slice::<Value>(&body).unwrap());
+                let message = if index == 0 {
+                    json!({
+                        "reasoning": "choose a tool",
+                        "tool_calls": [{"id": "probe", "type": "function", "function": {"name": "probe", "arguments": "{}"}}],
+                    })
+                } else {
+                    json!({"content": "finished"})
+                };
+                let body =
+                    json!({"choices": [{"message": message, "finish_reason": "stop"}]}).to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        let client = ProviderClient::new(reqwest::Client::new());
+        let cancel = CancellationToken::new();
+        let opts = ChatOptions::new(&cancel);
+        let config = ModelConfig::default();
+        let mut messages = vec![user_msg("first question")];
+        for index in 0..4 {
+            let response = client
+                .chat(
+                    ChatRequest {
+                        provider: ChatProvider::api_key(
+                            ProviderKind::OpenAiCompatible,
+                            "test-only",
+                        ),
+                        api_base: &api_base,
+                        model: if index == 3 {
+                            "other-model"
+                        } else {
+                            "custom-model"
+                        },
+                        messages: &messages,
+                        tools: &[],
+                        effort: ReasoningEffort::Off,
+                        config: &config,
+                        cache: CacheConfig::default(),
+                        response_format: None,
+                        fast_mode: false,
+                    },
+                    &opts,
+                )
+                .await
+                .unwrap();
+            if index == 0 {
+                assert_eq!(
+                    response.reasoning_details.as_ref().unwrap()[0].data["field"],
+                    "reasoning"
+                );
+            }
+            let tool_calls = (!response.tool_calls.is_empty()).then_some(response.tool_calls);
+            messages.push(Message::assistant_with_reasoning(
+                response.content.map(Content::text),
+                response.reasoning_content,
+                response.reasoning_details,
+                tool_calls,
+            ));
+            if index == 0 {
+                messages.push(Message::tool("probe".into(), "tool result", false));
+            } else if index == 1 {
+                messages.push(user_msg("new question"));
+            }
+        }
+        let bodies = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bodies[1]["messages"][1]["reasoning"], "choose a tool");
+        assert_eq!(bodies[1]["messages"][1]["tool_calls"][0]["id"], "probe");
+        assert_eq!(bodies[1]["messages"][2]["content"], "tool result");
+        assert_eq!(bodies[2]["messages"][1]["reasoning"], "choose a tool");
+        assert_eq!(bodies[2]["messages"][4]["content"], "new question");
+        assert!(bodies[3]["messages"][1].get("reasoning").is_none());
+        assert!(bodies
+            .iter()
+            .all(|body| !body.to_string().contains("reasoning_details")));
     }
 
     async fn spawn_sse_responses(
@@ -996,7 +1251,10 @@ mod tests {
 
         assert_eq!(server.await.unwrap(), 4);
         assert!(matches!(error, ProviderError::CyberPolicy { .. }));
-        assert_eq!(attempt_errors.into_inner().unwrap(), vec![MESSAGE; 4]);
+        assert_eq!(
+            attempt_errors.into_inner().unwrap(),
+            vec![error.to_string(); 4]
+        );
         assert_eq!(
             retries.into_inner().unwrap(),
             vec![
@@ -1033,13 +1291,11 @@ mod tests {
         assert!(matches!(error, ProviderError::CyberPolicy { .. }));
         assert_eq!(
             attempt_errors.into_inner().unwrap(),
-            vec![
-                "server error 500: temporary",
-                MESSAGE,
-                MESSAGE,
-                MESSAGE,
-                MESSAGE,
+            [
+                vec!["server error 500: temporary".to_string()],
+                vec![error.to_string(); 4]
             ]
+            .concat()
         );
         assert_eq!(
             retries.into_inner().unwrap(),
@@ -1078,7 +1334,7 @@ mod tests {
         assert_eq!(server.await.unwrap(), 3);
         assert_eq!(
             attempt_errors.into_inner().unwrap(),
-            vec![format!("server error 0: {MESSAGE}"); 2]
+            vec!["server error 0: upstream error event: server_error"; 2]
         );
         assert_eq!(
             retries.into_inner().unwrap(),
@@ -1162,6 +1418,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_disconnect_retries_with_same_auth_and_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}/codex", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (headers, body) = read_http_request(&mut stream).await;
+                assert_eq!(
+                    headers.lines().next(),
+                    Some("POST /codex/responses HTTP/1.1")
+                );
+                assert!(headers
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("authorization: Bearer access")));
+                assert!(headers
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("chatgpt-account-id: acct")));
+                assert!(headers
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("x-codex-turn-state: turn")));
+                bodies.push(body);
+                let text = ["rejected", "recovered"][attempt];
+                let mut body = format!(
+                    "data: {}\n\n",
+                    json!({"type": "response.output_text.delta", "delta": text})
+                );
+                if attempt == 1 {
+                    body.push_str(
+                        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
+                    );
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{body}\r\n{}",
+                    body.len(), if attempt == 1 { "0\r\n\r\n" } else { "" }
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            assert_eq!(bodies[0], bodies[1]);
+        });
+        let tokens = test_codex_tokens();
+        let cancel = CancellationToken::new();
+        let opts = ChatOptions::new(&cancel);
+        let response = ProviderClient::new(reqwest::Client::new())
+            .chat(
+                ChatRequest {
+                    provider: ChatProvider::codex(&tokens, Some("turn")),
+                    api_base: &api_base,
+                    model: "gpt-test",
+                    messages: &[user_msg("hi")],
+                    tools: &[],
+                    effort: ReasoningEffort::Max,
+                    config: &ModelConfig::default(),
+                    cache: CacheConfig::default(),
+                    response_format: None,
+                    fast_mode: false,
+                },
+                &opts,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.content.as_deref(), Some("recovered"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn codex_http_request_normalizes_endpoint_and_emits_one_based_attempts() {
         let (body, _headers, attempts) = capture_codex_request(false, true).await;
         assert_eq!(body["reasoning"]["effort"], "max");
@@ -1232,7 +1554,11 @@ mod tests {
             WireApi::ChatCompletions,
             &[user_msg("hi")],
             &[],
-            "gpt-4.1",
+            &chat_completions::Target::new(
+                ProviderKind::Copilot,
+                "http://local/chat/completions",
+                "gpt-4.1",
+            ),
             ReasoningEffort::High,
             &ModelConfig::default(),
             &CacheConfig::default(),

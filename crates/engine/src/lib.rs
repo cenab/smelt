@@ -17,6 +17,7 @@ pub(crate) mod skills;
 pub mod tools;
 pub(crate) mod trim;
 
+pub use agent::{normalize_reasoning_summary, ReasoningSummaryPhase};
 pub use host::{HostCall, HostRequestDecision, PreparedRequestMessages};
 use protocol::{EngineEvent, UiCommand};
 use std::path::PathBuf;
@@ -187,8 +188,8 @@ mod system_prompt_tests {
     fn interactive_prompt_renders_collaborator_behavior_and_tools() {
         let rendered = prompt(SystemPromptBehavior::Interactive, true);
         assert!(rendered.contains("# Tools"));
-        assert!(rendered.contains("You and the user are collaborators"));
-        assert!(!rendered.contains("You are running autonomously"));
+        assert!(rendered.contains("Collaborate with the user."));
+        assert!(!rendered.contains("Work autonomously."));
         assert!(rendered.contains("# Skills\nLoaded skill."));
         assert!(rendered.ends_with("Extra instructions."));
         assert!(!rendered.contains("{%"));
@@ -198,8 +199,8 @@ mod system_prompt_tests {
     fn autonomous_prompt_can_omit_tools() {
         let rendered = prompt(SystemPromptBehavior::Autonomous, false);
         assert!(!rendered.contains("# Tools"));
-        assert!(rendered.contains("You are running autonomously"));
-        assert!(!rendered.contains("You and the user are collaborators"));
+        assert!(rendered.contains("Work autonomously."));
+        assert!(!rendered.contains("Collaborate with the user."));
         assert!(!rendered.contains("{%"));
     }
 }
@@ -457,6 +458,9 @@ mod tests {
         };
         let out = render_system_prompt(&ctx);
         assert!(out.contains("# Managed worktrees"));
+        assert!(out.contains("Never expose, log, or commit secrets."));
+        assert!(out.contains("Run focused checks against the requested behavior"));
+        assert!(out.contains("review the requirements and final artifacts"));
         assert!(out.contains("MARK-EXTRA-7384"));
     }
 
@@ -488,10 +492,10 @@ mod tests {
             None,
         );
 
-        assert!(interactive.contains("You and the user are collaborators"));
-        assert!(!interactive.contains("You are running autonomously"));
-        assert!(autonomous.contains("You are running autonomously"));
-        assert!(!autonomous.contains("You and the user are collaborators"));
+        assert!(interactive.contains("Collaborate with the user."));
+        assert!(!interactive.contains("Work autonomously."));
+        assert!(autonomous.contains("Work autonomously."));
+        assert!(!autonomous.contains("Collaborate with the user."));
     }
 
     #[test]

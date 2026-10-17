@@ -249,8 +249,8 @@ pub enum FuzzOp {
     /// Emit `TurnError`. Active-turn dispatch ends the turn; idle dispatch
     /// surfaces a notification.
     EngineTurnError(String),
-    /// Emit `Steered { text, count }`. Active-turn dispatch flushes both
-    /// streams and drains up to `count` request-queued messages.
+    /// Emit a canonical steering delta with `count` user items. Active-turn
+    /// dispatch commits their transcript rows before acknowledging queued inputs.
     EngineSteered {
         text: String,
         count: u8,
@@ -409,7 +409,7 @@ pub enum FuzzOp {
     /// going through accept / dismiss.
     ClearPlaceholder,
     /// Side channel: emit `EngineAskResponse` with the smallest pending ask
-    /// id, if any. Exercises `lua.fire_ask_callback` and plugin paths that
+    /// id, if any. Exercises auxiliary callback dispatch and plugin paths that
     /// depend on it (e.g., `/btw`, compaction plugins).
     EngineAskResponsePending {
         content: String,
@@ -1941,10 +1941,14 @@ fn plan(app: &TestApp, op: FuzzOp) -> (Option<SourceEvent>, PostCheck) {
         }
         FuzzOp::EngineSteered { text, count } => {
             let n = usize::from(count);
+            let item = protocol::HistoryItem::user(protocol::Content::text(text))
+                .with_sent_at_ms(1_742_567_823_000);
             let ev = SourceEvent::engine(EngineEvent::Steered {
-                text,
-                count: n,
-                sent_at_ms: 1_742_567_823_000,
+                turn_id: app.current_turn_id().unwrap_or(0),
+                delta: protocol::CanonicalHistoryDelta::new(
+                    app.session_message_count(),
+                    vec![item; n],
+                ),
             });
             (Some(ev), PostCheck::Steered { count: n })
         }
@@ -2270,6 +2274,10 @@ fn try_dispatch_side_channel(app: &mut TestApp, op: FuzzOp) -> Result<(), FuzzOp
         } => {
             let pre = Snapshot::capture(app);
             app.handle_job_completed(id, exit_code, termination.into());
+            // Idle completion submits a canonical turn asynchronously. Observe
+            // its durable dispatch before checking the completed lifecycle.
+            app.wait_for_turn_persistence();
+            app.feed_one_within_budget(SourceEvent::Tick(0), AllocBudget::DEFAULT);
             let post = Snapshot::capture(app);
             let new_actions = app.actions_since(pre.action_count);
             run_check(PostCheck::JobCompleted, &pre, &post, new_actions);
@@ -2485,8 +2493,20 @@ pub fn apply(app: &mut TestApp, op: FuzzOp) {
         }
         op => plan(app, op),
     };
+    let settles_turn_lifecycle = matches!(check, PostCheck::TurnCompleted { .. })
+        || matches!(
+            &ev,
+            Some(SourceEvent::Term(TermEvent::Key(key))) if key.code == KeyCode::Enter
+        );
     if let Some(ev) = ev {
         app.feed_one_within_budget(ev, AllocBudget::DEFAULT);
+    }
+    if settles_turn_lifecycle {
+        // Submitted turns and queued follow-ups dispatch only after persistence
+        // is durable. Keep that work outside the event budget and settle it
+        // before a later macro can install a synthetic turn.
+        app.wait_for_turn_persistence();
+        app.feed_one_within_budget(SourceEvent::Tick(0), AllocBudget::DEFAULT);
     }
     let post = Snapshot::capture(app);
     let new_actions = app.actions_since(pre.action_count);

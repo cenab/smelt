@@ -11,8 +11,15 @@ keyboard shortcuts, just stdout.
 smelt --headless "explain this codebase"
 ```
 
-A message argument is required. Without one, smelt exits with code 1 and prints
-`error: --headless requires a message argument` to stderr.
+Provide a message argument or use `--prompt-file`:
+
+```bash
+smelt --headless --prompt-file /runtime/prompt.txt
+```
+
+For automation, prefer file input to keep task text out of the process command
+line. See [Initial message](../reference/cli.md#initial-message) for the input
+rules. Without either input, smelt exits 1.
 
 The message follows the same rules as the TUI input box, including `@file`
 attachments:
@@ -56,6 +63,59 @@ See the [CLI reference](../reference/cli.md) for the full flag list. Sampling,
 reasoning effort, system prompt overrides, and `--set` all work in headless
 mode.
 
+## Configuration
+
+Lua settings work without a terminal UI. Reads during startup return the built-in
+defaults or values already assigned by the config:
+
+```lua
+smelt.settings.autoupgrade = "off"
+smelt.settings.restrict_to_workspace = false
+```
+
+Only disable workspace restrictions when the process runs inside an isolated
+sandbox. UI-only APIs still require a terminal UI.
+
+For per-run settings, use `--set`; CLI overrides take precedence over Lua config:
+
+```bash
+smelt --headless --mode yolo \
+  --set autoupgrade=off \
+  "fix the failing tests"
+```
+
+Headless startup exits 1 if Lua configuration fails, including syntax errors,
+unknown settings, invalid setting types, and UI-only calls. It does not run tools
+or dispatch the requested model turn with a partially loaded configuration.
+
+## Context Management and Response Validation
+
+Headless mode uses the same automatic compaction algorithm and thresholds as
+interactive mode. It summarizes older context before requests near the model's
+context limit and can recover from context-limit errors. The compactor preserves
+recent message groups and uses configured or discovered model limits. Headless
+mode enables automatic compaction; `compact_threshold` and
+`compact_keep_recent_groups` apply without loading UI-only plugins.
+
+smelt validates the entire tool-call batch before executing any call. For a
+malformed response, it resends the unchanged request at most twice, within the
+existing retry budget. Failed attempts do not enter assistant history, but their
+reported token usage still counts toward the token and cost totals. Cancellation
+and request deadlines remain active during retries and compaction.
+
+A main response with no non-whitespace answer and no tool calls is also retried
+at most twice, even if it contains reasoning. Rejected drafts do not enter
+assistant history, and completed tools are not replayed. If all three attempts
+are unusable, the turn ends with an explicit error (exit 3), not success.
+Output-limit errors remain terminal without this recovery.
+
+When supplied by the provider, the request audit retains finish reason, stop
+reason, and a bounded runtime fingerprint for successful and malformed attempts.
+Summary audits retain only these diagnostic fields, not response bodies or tool
+arguments. The stop-reason field retains token IDs or a sequence-match marker,
+not the matched sequence text. Existing full-payload audit retention is unchanged.
+These fields do not add token traces or user-facing diagnostic output.
+
 ## Output Format
 
 ### Text (default)
@@ -81,9 +141,22 @@ answer suitable for files or downstream commands.
 smelt --headless --format json "summarize this repo"
 ```
 
-Every engine event is emitted as one JSON object per line (JSONL) to stdout.
+Every engine event is emitted as one JSON value per line (JSONL) to stdout.
 Nothing else is written to stdout in this mode: no token summary, no final
 message reprint. The stream ends after `TurnComplete` or `TurnError`.
+
+Streaming output is provisional until `"ResponseDraftAccepted"` closes the
+current main-response draft after provider validation. A `"ResponseDraftRejected"`
+event tells consumers to discard text, reasoning, and tool-call drafts from the
+current response attempt. It does not discard earlier accepted responses or
+completed tool output. A retry starts a fresh draft.
+
+Auxiliary requests, such as compaction summaries, have separate drafts keyed by
+request ID. `{"EngineAskDraftRejected":{"id":42}}` discards only that request's
+current `EngineAskDelta` output. `EngineAskResponse` supplies its validated final
+message or terminal error. Main-response draft events do not affect auxiliary
+requests. Lua streaming consumers can reset their draft in `on_draft_rejected`;
+like the other ask callbacks, it respects the request's lifecycle guard.
 
 ## Permissions
 
@@ -148,7 +221,7 @@ Stream structured events for programmatic consumption:
 
 ```bash
 smelt --headless --format json "fix the bug" \
-  | jq -c 'select(.type == "TurnComplete")'
+  | jq -c 'select(type == "object" and has("TurnComplete"))'
 ```
 
 Use in a CI pipeline, logging stderr for inspection:

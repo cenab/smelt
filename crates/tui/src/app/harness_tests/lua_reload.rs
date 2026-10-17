@@ -454,6 +454,7 @@ fn failed_lua_reload_preserves_the_committed_command_generation() {
     std::fs::write(
         &init,
         r#"
+        smelt.settings.autoupgrade = "off"
         local buffer = smelt.buf.new({ name = "phase3.transaction.buffer" })
         buffer:source("committed")
         smelt.cmd.register("committed_command", function()
@@ -474,6 +475,7 @@ fn failed_lua_reload_preserves_the_committed_command_generation() {
     std::fs::write(
         &init,
         r#"
+        smelt.settings.autoupgrade = "off"
         local buffer = smelt.buf.new({ name = "phase3.transaction.buffer" })
         buffer:source("discarded")
         smelt.settings.show_slug = false
@@ -542,6 +544,7 @@ fn failed_lua_reload_preserves_the_committed_command_generation() {
     std::fs::write(
         &init,
         r#"
+        smelt.settings.autoupgrade = "off"
         smelt.cmd.register("replacement_command", function() end)
         "#,
     )
@@ -625,6 +628,7 @@ fn failed_candidate_rejects_external_effects_and_recovers() {
     std::fs::write(
         &init,
         r#"
+        smelt.settings.autoupgrade = "off"
         smelt.cmd.register("committed_external_guard", function()
             _G.__committed_external_guard = true
         end)
@@ -640,6 +644,7 @@ fn failed_candidate_rejects_external_effects_and_recovers() {
         &init,
         format!(
             r#"
+            smelt.settings.autoupgrade = "off"
             smelt.notify.info("discarded candidate notice", "phase3-candidate")
             smelt.log.info("discarded_candidate_log")
             smelt.lifecycle.on("ready", function()
@@ -673,6 +678,7 @@ fn failed_candidate_rejects_external_effects_and_recovers() {
         &init,
         format!(
             r#"
+            smelt.settings.autoupgrade = "off"
             smelt.cmd.register("recovered_external_guard", function() end)
             smelt.notify.info("committed candidate notice", "phase3-committed")
             smelt.log.info("committed_candidate_log")
@@ -1946,6 +1952,7 @@ fn relative_lua_cwd_change_resolves_from_runtime_cwd() {
         "#,
     ));
     assert!(app.drain_idle_work());
+    app.wait_for_workspace();
 
     assert_eq!(app.core_probe().env.cwd(), expected);
     assert_eq!(std::env::current_dir().unwrap(), expected);
@@ -1970,6 +1977,7 @@ fn tilde_lua_cwd_change_resolves_from_runtime_home() {
         "#,
     ));
     assert!(app.drain_idle_work());
+    app.wait_for_workspace();
 
     assert_eq!(app.core_probe().env.cwd(), expected);
     assert_eq!(std::env::current_dir().unwrap(), expected);
@@ -1996,6 +2004,7 @@ fn lua_switch_cwd_updates_runtime_state_and_engine_cwd() {
         "#,
     ));
     assert!(app.drain_idle_work());
+    app.wait_for_workspace();
 
     assert_eq!(app.workspace_probe().cwd(), expected);
     assert_eq!(
@@ -2042,8 +2051,8 @@ fn lua_switch_cwd_updates_runtime_state_and_engine_cwd() {
     );
 }
 
-#[test]
-fn enter_worktree_tool_changes_the_process_cwd() {
+#[tokio::test]
+async fn enter_worktree_tool_changes_the_process_cwd() {
     let repo = worktree_repo();
     let environment_guard = test_environment_guard();
 
@@ -2068,6 +2077,7 @@ fn enter_worktree_tool_changes_the_process_cwd() {
         )]),
     }));
 
+    app.wait_for_tool_result("enter-worktree");
     let target = std::fs::canonicalize(repo.path().join(".worktrees/tool-cwd")).unwrap();
     let expected = target.to_string_lossy();
     assert_eq!(app.workspace_probe().cwd(), expected);
@@ -2134,6 +2144,7 @@ fn switch_cwd_tool_commits_project_context_before_releasing_its_result() {
             serde_json::Value::String(expected.clone()),
         )]),
     }));
+    app.wait_for_tool_result("switch-cwd");
 
     assert_eq!(app.workspace_probe().cwd(), expected);
     assert_eq!(app.core_probe().env.cwd(), target);
@@ -2399,6 +2410,7 @@ fn direct_cwd_request_is_not_committed_by_unrelated_tool_completion() {
 
     app.discard_turn(crate::app::TurnEnd::Complete);
     assert!(app.drain_idle_work());
+    app.wait_for_workspace();
 
     assert_eq!(app.workspace_probe().cwd(), expected);
     assert_eq!(app.core_probe().env.cwd(), target);
@@ -2449,6 +2461,7 @@ fn failed_switch_cwd_tool_reports_error_without_publishing_partial_context() {
             serde_json::Value::String(target.to_string_lossy().into_owned()),
         )]),
     }));
+    app.wait_for_tool_result("failed-switch-cwd");
 
     assert_eq!(app.workspace_probe().cwd(), original_cwd);
     assert_eq!(app.core_probe().env.cwd(), original_runtime_cwd);
@@ -2489,8 +2502,8 @@ fn failed_switch_cwd_tool_reports_error_without_publishing_partial_context() {
     )));
 }
 
-#[test]
-fn failed_worktree_cwd_commit_preserves_creation_result_metadata() {
+#[tokio::test]
+async fn failed_worktree_cwd_commit_preserves_creation_result_metadata() {
     let repo = worktree_repo();
     let environment_guard = test_environment_guard();
 
@@ -2528,6 +2541,7 @@ fn failed_worktree_cwd_commit_preserves_creation_result_metadata() {
             serde_json::Value::String("broken-context".into()),
         )]),
     }));
+    app.wait_for_tool_result("enter-broken-worktree");
 
     assert_eq!(app.workspace_probe().cwd(), original_cwd);
     assert_eq!(std::env::current_dir().unwrap(), original_process_cwd);
@@ -2601,6 +2615,7 @@ fn cwd_change_replaces_workspace_but_preserves_application_notification() {
     .unwrap();
     assert!(app.run_lua("assert(smelt.session.switch_cwd(_G.__first_cwd_target).pending == true)"));
     assert!(app.drain_idle_work());
+    app.wait_for_workspace();
     assert!(app.overlays_probe().notification().is_none());
 
     app.notify_application_error_sticky("application failure".into());
@@ -2611,6 +2626,7 @@ fn cwd_change_replaces_workspace_but_preserves_application_notification() {
     .unwrap();
     assert!(app.run_lua("assert(smelt.session.switch_cwd(_G.__second_cwd_target).pending == true)"));
     assert!(app.drain_idle_work());
+    app.wait_for_workspace();
     assert!(app
         .overlays_probe()
         .notification()
@@ -2643,6 +2659,7 @@ fn failed_cwd_candidate_preserves_the_complete_project_context() {
 
     assert!(app.run_lua("assert(smelt.session.switch_cwd(_G.__failed_cwd_target).pending == true)"));
     assert!(app.drain_idle_work());
+    app.wait_for_workspace();
     assert_eq!(app.workspace_probe().cwd(), original_cwd);
     assert_eq!(app.core_probe().env.cwd(), original_runtime_cwd);
     assert_eq!(app.lua_probe().id, original_generation);
@@ -2667,6 +2684,7 @@ fn failed_cwd_candidate_preserves_the_complete_project_context() {
     app.mark_project_trusted(target_dir.path()).unwrap();
     assert!(app.run_lua("assert(smelt.session.switch_cwd(_G.__failed_cwd_target).pending == true)"));
     assert!(app.drain_idle_work());
+    app.wait_for_workspace();
     assert_eq!(app.workspace_probe().cwd(), expected);
     assert_eq!(app.core_probe().env.cwd(), target);
     assert_eq!(std::env::current_dir().unwrap(), target);
@@ -2705,6 +2723,7 @@ fn loading_session_restores_persisted_cwd() {
 
     app.load_session(session);
     assert!(app.drain_idle_work());
+    app.wait_for_workspace();
 
     assert_eq!(app.workspace_probe().cwd(), expected);
     assert_eq!(
@@ -2743,6 +2762,7 @@ fn loading_session_restores_persisted_cwd() {
         ),
     );
     assert!(app.drain_idle_work());
+    app.wait_for_workspace();
 
     assert_eq!(app.workspace_probe().cwd(), display_expected);
     assert_eq!(
@@ -2809,6 +2829,7 @@ fn loading_session_restores_persisted_cwd() {
         .unwrap();
     assert!(app.run_lua("assert(smelt.session.switch_cwd(_G.__fallback_cwd).pending == true)"));
     assert!(app.drain_idle_work());
+    app.wait_for_workspace();
     assert!(app.overlays_probe().notification().is_none());
 }
 
@@ -3175,6 +3196,7 @@ fn lua_picker_permissions_notify_engine_and_ui_contracts_are_available() {
                 default = {
                     tools = { ask = { "*" } },
                     effects = { read = "ask" },
+                    paths = { allow = { "/tmp", "~/.cargo" } },
                 },
             })
             assert(not pcall(function()
@@ -3792,6 +3814,7 @@ fn direct_reload_clears_pending_scheduled_reload() {
     assert!(app.schedule_lua_reload());
     app.reload_lua();
 
+    app.wait_for_workspace();
     assert!(!app.pending_lua_reload());
     assert_eq!(
         app.lua_int_global("reload_count"),
@@ -4411,13 +4434,39 @@ async fn reload_lua_via_engine_dismisses_open_modal() {
         "modal should be open after /open_modal"
     );
 
-    // Drive the reload through the Lua binding (the gate lives there,
-    // not in `TuiApp::reload_lua`). The binding should dismiss the
-    // modal and call through to `reload_lua` instead of bailing out.
+    app.start_turn(1);
+    app.exec_lua_entry("smelt.engine.reload()").unwrap();
+    assert!(app.pending_lua_reload());
+    app.drain_idle_work();
+    assert!(app.ui_probe().active_modal().is_some());
+
+    app.feed_one(SourceEvent::engine(EngineEvent::TurnComplete {
+        turn_id: 1,
+        history: None,
+        meta: None,
+    }));
+    assert!(app.pending_lua_reload(), "open modal keeps reload deferred");
+    assert!(app.ui_probe().active_modal().is_some());
+
+    app.press(KeyCode::Esc);
+    app.drain_idle_work();
+    app.wait_for_workspace();
+    assert!(app.ui_probe().active_modal().is_none());
+    assert!(
+        !app.pending_lua_reload(),
+        "closing the modal releases reload"
+    );
+
+    app.apply_lua_command("open_modal");
+    app.drive_lua_tasks();
+    assert!(app.ui_probe().active_modal().is_some());
+
+    // An explicit reload while idle dismisses the modal before scheduling.
     app.exec_lua_entry("smelt.engine.reload()")
         .expect("reload succeeds even with modal open");
     assert!(app.pending_lua_reload());
     assert!(app.drain_idle_work());
+    app.wait_for_workspace();
     assert!(
         app.ui_probe().active_modal().is_none(),
         "modal must be dismissed after reload"
@@ -4478,6 +4527,82 @@ fn reload_lua_preserves_user_size_override() {
 }
 
 #[test]
+fn manual_reload_upgrades_in_flight_config_preparation_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let init = tmp.path().join("init.lua");
+    std::fs::write(&init, "-- config\n").unwrap();
+    let mut app = TestApp::builder()
+        .with_cwd(tmp.path())
+        .with_init_lua(&init)
+        .build();
+    let generation = app.lua_probe().id;
+    std::fs::write(
+        tmp.path().join("AGENTS.md"),
+        "instructions for manual reload",
+    )
+    .unwrap();
+
+    app.app.reload_lua_config();
+    assert!(app.pending_lua_reload());
+    assert!(!app.schedule_lua_reload());
+    assert!(!app.schedule_lua_reload());
+    app.wait_for_workspace();
+
+    assert_eq!(app.lua_probe().id, generation.wrapping_add(1));
+    assert!(app
+        .app
+        .prompt_inputs
+        .instructions
+        .as_deref()
+        .unwrap()
+        .contains("instructions for manual reload"));
+    assert!(!app.pending_lua_reload());
+}
+
+#[test]
+fn manual_reload_waits_for_active_turn() {
+    for entry in ["command", "keymap", "api"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let init = tmp.path().join("init.lua");
+        std::fs::write(&init, "_G.reload_version = 1\n").unwrap();
+        let mut app = TestApp::builder().with_init_lua(&init).build();
+        app.start_turn(1);
+        std::fs::write(&init, "_G.reload_version = 2\n").unwrap();
+
+        assert!(app.app.schedule_lua_config_reload());
+        for _ in 0..2 {
+            match entry {
+                "command" => {
+                    app.type_text("/reload");
+                    app.press(KeyCode::Enter);
+                }
+                "keymap" => app.press(KeyCode::F(5)),
+                "api" => app.exec_lua_entry("smelt.engine.reload()").unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(app.pending_lua_reload(), "{entry} must queue reload");
+            app.drain_idle_work();
+            assert!(app.agent_running());
+            assert_eq!(app.lua_int_global("reload_version"), Some(1));
+            assert!(app.state().queued_inputs.is_empty());
+            assert_eq!(
+                app.overlays_probe().notification().unwrap().summary,
+                "reload queued until agent is idle"
+            );
+        }
+
+        app.feed_one(SourceEvent::engine(EngineEvent::TurnComplete {
+            turn_id: 1,
+            history: None,
+            meta: None,
+        }));
+        app.wait_for_workspace();
+        assert!(!app.pending_lua_reload());
+        assert_eq!(app.lua_int_global("reload_version"), Some(2));
+    }
+}
+
+#[test]
 fn scheduled_reload_runs_after_turn_is_idle() {
     let tmp = tempfile::tempdir().unwrap();
     let init = tmp.path().join("init.lua");
@@ -4497,6 +4622,7 @@ fn scheduled_reload_runs_after_turn_is_idle() {
         meta: None,
     }));
 
+    app.wait_for_workspace();
     assert!(!app.pending_lua_reload());
     assert_eq!(
         app.lua_int_global("reload_count"),

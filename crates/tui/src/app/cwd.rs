@@ -12,10 +12,105 @@ pub(crate) enum SessionCwdRestore {
     },
 }
 
+pub(super) struct PreparedLuaInputs {
+    pub(super) cwd: std::path::PathBuf,
+    pub(super) project: smelt_core::worktree::ProjectContext,
+    pub(super) prompt_inputs: crate::prompt_inputs::PromptInputs,
+    pub(super) skills: std::sync::Arc<engine::SkillLoader>,
+    pub(super) system_prompt_read_error: Option<String>,
+    pub(super) permissions: smelt_core::permissions::PermissionContext,
+}
+
+pub(super) type LuaPreparation = std::sync::mpsc::Receiver<Result<PreparedLuaInputs, String>>;
+pub(super) type ProjectPreparation = std::sync::mpsc::Receiver<Result<PreparedWorkspace, String>>;
+
+pub(super) enum PreparedWorkspace {
+    Context(Box<PreparedProjectContext>),
+    Cwd(Box<PreparedLuaInputs>),
+}
+
+impl PreparedWorkspace {
+    pub(super) fn permissions(&self) -> &smelt_core::permissions::PermissionContext {
+        match self {
+            Self::Context(prepared) => &prepared.permissions,
+            Self::Cwd(prepared) => &prepared.permissions,
+        }
+    }
+}
+
+pub(super) struct PreparedProjectContext {
+    pub(super) cwd: std::path::PathBuf,
+    pub(super) project: smelt_core::worktree::ProjectContext,
+    pub(super) permissions: smelt_core::permissions::PermissionContext,
+}
+
+impl PreparedProjectContext {
+    fn load(
+        target: std::path::PathBuf,
+        root: std::path::PathBuf,
+        store: smelt_core::permissions::store::PermissionStore,
+    ) -> Result<Self, String> {
+        let cwd = std::fs::canonicalize(&target)
+            .map_err(|error| format!("resolve cwd {}: {error}", target.display()))?;
+        if !cwd.is_dir() {
+            return Err(format!("cwd is not a directory: {}", cwd.display()));
+        }
+        let project = smelt_core::worktree::project_context(&cwd, Some(&root));
+        let permissions =
+            smelt_core::permissions::PermissionContext::load(&cwd, project.clone(), &store)
+                .map_err(|error| format!("load persisted permissions: {error}"))?;
+        Ok(Self {
+            cwd,
+            project,
+            permissions,
+        })
+    }
+
+    fn with_lua_inputs(
+        self,
+        mut prompt_inputs: crate::prompt_inputs::PromptInputs,
+        refresh_agent_inputs: bool,
+    ) -> PreparedLuaInputs {
+        let (skills, system_prompt_read_error) = if refresh_agent_inputs {
+            let outcome = prompt_inputs.refresh(&self.cwd);
+            (outcome.loader, outcome.system_prompt_read_error)
+        } else {
+            (prompt_inputs.skill_loader_for_cwd(&self.cwd), None)
+        };
+        PreparedLuaInputs {
+            cwd: self.cwd,
+            project: self.project,
+            prompt_inputs,
+            skills,
+            system_prompt_read_error,
+            permissions: self.permissions,
+        }
+    }
+}
+
+fn spawn_workspace_preparation<T: Send + 'static>(
+    wakeup: tokio::sync::mpsc::UnboundedSender<()>,
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<std::sync::mpsc::Receiver<Result<T, String>>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("smelt-workspace-prepare".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                .unwrap_or_else(|_| Err("workspace preparation worker panicked".into()));
+            let _ = tx.send(result);
+            let _ = wakeup.send(());
+        })
+        .map_err(|error| format!("prepare workspace: {error}"))?;
+    Ok(rx)
+}
+
 struct PendingCwdChange {
     path: std::path::PathBuf,
     mark_session_dirty: bool,
     tool_invocation: Option<smelt_core::lua::ToolInvocationContext>,
+    preparation: Option<LuaPreparation>,
+    tool_completion: Option<(String, super::agent::LuaToolCompletion)>,
 }
 
 pub(crate) struct StagedCwdTransition {
@@ -31,7 +126,6 @@ impl StagedCwdTransition {
         path: std::path::PathBuf,
         mark_session_dirty: bool,
     ) -> Result<Self, String> {
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
         let previous_cwd = std::env::current_dir().map_err(|error| error.to_string())?;
         let previous_pwd = std::env::var_os("PWD");
         std::env::set_current_dir(&path)
@@ -69,6 +163,8 @@ impl Drop for StagedCwdTransition {
 
 pub(crate) struct WorkspaceState {
     cwd: String,
+    #[cfg(unix)]
+    cwd_directory: Option<std::fs::File>,
     home: std::path::PathBuf,
     context: smelt_core::worktree::ProjectContext,
     worktree_path: String,
@@ -85,6 +181,8 @@ impl WorkspaceState {
             smelt_core::worktree::project_context(std::path::Path::new(&cwd), Some(worktree_root));
         let worktree_path = worktree_display_path(&context, &home);
         Self {
+            #[cfg(unix)]
+            cwd_directory: std::fs::File::open(&cwd).ok(),
             cwd,
             home,
             context,
@@ -103,6 +201,10 @@ impl WorkspaceState {
 
     pub(crate) fn project(&self) -> &str {
         &self.context.project_name
+    }
+
+    pub(super) fn project_context(&self) -> smelt_core::worktree::ProjectContext {
+        self.context.clone()
     }
 
     pub(crate) fn branch(&self) -> &str {
@@ -134,9 +236,33 @@ impl WorkspaceState {
         })
     }
 
-    pub(crate) fn install_cwd(&mut self, cwd: std::path::PathBuf, worktree_root: &std::path::Path) {
+    pub(crate) fn install_cwd(&mut self, cwd: std::path::PathBuf) {
+        #[cfg(unix)]
+        {
+            self.cwd_directory = std::fs::File::open(&cwd).ok();
+        }
         self.cwd = cwd.to_string_lossy().into_owned();
-        self.refresh(worktree_root);
+    }
+
+    fn renamed_process_cwd(&self) -> Option<std::path::PathBuf> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let cwd = std::env::current_dir().ok()?;
+            if cwd == self.cwd_path() {
+                return None;
+            }
+            // A rename changes the path, not the directory the process occupies.
+            // Keep a handle so a replacement at the old path cannot be mistaken
+            // for the workspace, and never adopt an unrelated process cwd.
+            let previous = self.cwd_directory.as_ref()?.metadata().ok()?;
+            let current = std::fs::metadata(&cwd).ok()?;
+            if previous.dev() == current.dev() && previous.ino() == current.ino() {
+                return Some(cwd);
+            }
+        }
+        None
     }
 
     pub(crate) fn refresh(&mut self, worktree_root: &std::path::Path) {
@@ -144,11 +270,11 @@ impl WorkspaceState {
         self.install_context(context);
     }
 
-    pub(crate) fn context_note(&self, worktree_root: &std::path::Path) -> String {
-        smelt_core::context_notes::cwd_note(self.cwd_path(), worktree_root)
+    pub(crate) fn context_note(&self) -> String {
+        smelt_core::context_notes::cwd_note_for_project(self.cwd_path(), &self.context)
     }
 
-    fn install_context(&mut self, context: smelt_core::worktree::ProjectContext) {
+    pub(super) fn install_context(&mut self, context: smelt_core::worktree::ProjectContext) {
         self.worktree_path = worktree_display_path(&context, &self.home);
         self.context = context;
     }
@@ -163,6 +289,8 @@ impl WorkspaceState {
             path,
             mark_session_dirty,
             tool_invocation,
+            preparation: None,
+            tool_completion: None,
         });
     }
 
@@ -170,7 +298,6 @@ impl WorkspaceState {
         self.pending_change.as_ref()
     }
 
-    #[cfg(test)]
     pub(crate) fn has_pending_change(&self) -> bool {
         self.pending_change.is_some()
     }
@@ -209,15 +336,21 @@ impl TuiApp {
         &mut self,
         path: std::path::PathBuf,
     ) -> Result<(String, bool), String> {
+        let invocation = smelt_core::lua::current_tool_invocation();
+        if self.workspace.pending().is_some_and(|pending| {
+            pending.tool_invocation.is_some() && pending.tool_invocation != invocation
+        }) {
+            return Err("a model tool owns the pending cwd transition".into());
+        }
         let path = self.resolve_cwd_target(path)?;
         let target = path.to_string_lossy().into_owned();
-        self.workspace
-            .schedule(path, true, smelt_core::lua::current_tool_invocation());
+        self.workspace.schedule(path, true, invocation);
         Ok((target, true))
     }
 
     fn resolve_cwd_target(&self, path: std::path::PathBuf) -> Result<std::path::PathBuf, String> {
-        let path = smelt_core::path::resolve_from(path, self.core.env.cwd(), self.core.env.home());
+        let path =
+            smelt_core::path::resolve_from(path, self.current_project_cwd(), self.core.env.home());
         let path = std::fs::canonicalize(&path)
             .map_err(|error| format!("resolve cwd {}: {error}", path.display()))?;
         if !path.is_dir() {
@@ -226,24 +359,168 @@ impl TuiApp {
         Ok(path)
     }
 
+    pub(super) fn prepare_lua_inputs(
+        &self,
+        target: std::path::PathBuf,
+        refresh_agent_inputs: bool,
+    ) -> Result<LuaPreparation, String> {
+        let prompt_inputs = self.prompt_inputs.clone();
+        let root = std::path::PathBuf::from(&self.core.config.settings.worktree_root);
+        let permission_store = self.core.permission_store.clone();
+        spawn_workspace_preparation(self.lua.wakeup_sender(), move || {
+            let prepared = PreparedProjectContext::load(target, root, permission_store)?;
+            Ok(prepared.with_lua_inputs(prompt_inputs, refresh_agent_inputs))
+        })
+    }
+
+    pub(super) fn current_project_cwd(&self) -> std::path::PathBuf {
+        self.workspace
+            .renamed_process_cwd()
+            .unwrap_or_else(|| self.core.env.cwd())
+    }
+
+    pub(super) fn prepare_project_context(
+        &self,
+        cwd: std::path::PathBuf,
+    ) -> Result<ProjectPreparation, String> {
+        let prompt_inputs = (cwd != self.core.env.cwd()).then(|| self.prompt_inputs.clone());
+        let root = std::path::PathBuf::from(&self.core.config.settings.worktree_root);
+        let store = self.core.permission_store.clone();
+        spawn_workspace_preparation(self.lua.wakeup_sender(), move || {
+            let prepared = PreparedProjectContext::load(cwd, root, store)?;
+            Ok(match prompt_inputs {
+                Some(inputs) => {
+                    PreparedWorkspace::Cwd(Box::new(prepared.with_lua_inputs(inputs, true)))
+                }
+                None => PreparedWorkspace::Context(Box::new(prepared)),
+            })
+        })
+    }
+
+    pub(super) fn install_prepared_project_context(
+        &mut self,
+        prepared: PreparedWorkspace,
+    ) -> Result<bool, String> {
+        let previous_context = self.current_context_note_text();
+        match prepared {
+            PreparedWorkspace::Cwd(prepared) => {
+                if let Some(error) = self.bring_up_lua_for_cwd(*prepared, true) {
+                    return Err(error.to_string());
+                }
+            }
+            PreparedWorkspace::Context(prepared) => {
+                let desired = self.lua.desired();
+                let permissions = prepared.permissions.resolve(
+                    &desired.permissions.rules,
+                    &desired.permissions.tool_defaults,
+                    desired.modes.behaviors.clone(),
+                    &self.core.config.settings,
+                    self.core.env.home(),
+                    self.core.permissions.paths_fn(),
+                );
+                self.core.permissions.apply_resolution(permissions);
+                self.workspace.install_context(prepared.project);
+                self.publish_workspace_signals();
+            }
+        }
+        self.refresh_active_turn_permissions();
+        let context_changed = previous_context != self.current_context_note_text();
+        if context_changed {
+            self.ensure_current_context_note();
+            self.apply_pending_history_appends_for_request();
+        }
+        Ok(context_changed)
+    }
+
     pub(crate) fn try_perform_scheduled_cwd_change(&mut self) -> bool {
-        if self.workspace.pending().is_none()
-            || self
-                .workspace
-                .pending()
-                .is_some_and(|pending| pending.tool_invocation.is_some())
-            || self.prompt_input_is_busy()
-            || self.ui.active_modal().is_some()
-        {
+        let Some(pending) = self.workspace.pending() else {
+            return false;
+        };
+        if pending.tool_invocation.is_some() {
+            if pending.tool_completion.is_none() {
+                return false;
+            }
+        } else if self.prompt_input_is_busy() || self.ui.active_modal().is_some() {
             return false;
         }
-        let _ = self.commit_pending_cwd_change();
+        if pending.preparation.is_none() {
+            let preparation = self.prepare_lua_inputs(pending.path.clone(), true);
+            match preparation {
+                Ok(preparation) => {
+                    self.workspace.pending_change.as_mut().unwrap().preparation = Some(preparation);
+                    return true;
+                }
+                Err(error) => return self.finish_pending_cwd_change(Err(error)),
+            }
+        }
+        let result = match pending.preparation.as_ref().unwrap().try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("workspace preparation worker stopped".into())
+            }
+        };
+        if result
+            .as_ref()
+            .is_ok_and(|prepared| !prepared.permissions.is_current())
+        {
+            self.workspace.pending_change.as_mut().unwrap().preparation = None;
+            return true;
+        }
+        self.finish_pending_cwd_change(result)
+    }
+
+    fn finish_pending_cwd_change(&mut self, prepared: Result<PreparedLuaInputs, String>) -> bool {
+        let pending = self.workspace.take_pending().unwrap();
+        let requested = pending.path.to_string_lossy().into_owned();
+        let result = prepared
+            .and_then(|prepared| {
+                match self.bring_up_lua_for_cwd(prepared, pending.mark_session_dirty) {
+                    Some(error) => Err(error.to_string()),
+                    None => Ok(true),
+                }
+            })
+            .map_err(|error| {
+                let message = if pending.mark_session_dirty {
+                    format!("cwd change: {error}")
+                } else {
+                    format!(
+                        "session cwd unavailable: {requested}: {error}; using {}",
+                        self.workspace.cwd()
+                    )
+                };
+                self.notify_operation_error_sticky(
+                    NotificationOperation::CwdChange,
+                    message.clone(),
+                );
+                message
+            });
+        if result.is_ok() {
+            self.dismiss_operation_notification(&NotificationOperation::CwdChange);
+        }
+        if let (Some(invocation), Some((call_id, completion))) =
+            (pending.tool_invocation, pending.tool_completion)
+        {
+            self.finish_lua_tool(invocation, call_id, completion, result);
+        }
         true
     }
 
-    /// Commit a transaction requested by this model tool. A direct Lua request
-    /// cannot be pulled forward accidentally by an unrelated tool completion.
-    pub(crate) fn commit_tool_cwd_change(
+    pub(super) fn park_cwd_tool_completion(
+        &mut self,
+        call_id: String,
+        completion: super::agent::LuaToolCompletion,
+    ) {
+        self.workspace
+            .pending_change
+            .as_mut()
+            .unwrap()
+            .tool_completion = Some((call_id, completion));
+    }
+
+    /// Check whether this result must wait for its cwd transaction. A direct Lua
+    /// request cannot be pulled forward by an unrelated tool completion.
+    pub(super) fn defer_tool_cwd_result(
         &mut self,
         invocation: smelt_core::lua::ToolInvocationContext,
         tool_succeeded: bool,
@@ -264,7 +541,7 @@ impl TuiApp {
             self.workspace.discard_pending();
             return Err("cwd-changing model tools must use sequential execution".into());
         }
-        self.commit_pending_cwd_change()
+        Ok(true)
     }
 
     pub(crate) fn discard_model_tool_cwd_change(&mut self) {
@@ -277,34 +554,12 @@ impl TuiApp {
         }
     }
 
-    /// Commit the pending transaction without applying the idle gate. Callers
-    /// must own a safe boundary, such as a completed model tool callback.
-    fn commit_pending_cwd_change(&mut self) -> Result<bool, String> {
-        let Some(pending) = self.workspace.take_pending() else {
-            return Ok(false);
-        };
-        let requested = pending.path.to_string_lossy().into_owned();
-        if let Some(error) = self.bring_up_lua_for_cwd(pending.path, pending.mark_session_dirty) {
-            let message = if pending.mark_session_dirty {
-                format!("cwd change: {error}")
-            } else {
-                format!(
-                    "session cwd unavailable: {requested}: {error}; using {}",
-                    self.workspace.cwd()
-                )
-            };
-            self.notify_operation_error_sticky(NotificationOperation::CwdChange, message.clone());
-            return Err(message);
-        }
-        self.dismiss_operation_notification(&NotificationOperation::CwdChange);
-        Ok(true)
-    }
-
     /// Restore the working directory stored on a loaded session. Unlike
     /// `change_cwd`, this is not a user-visible directory switch inside the
     /// conversation, so it updates runtime state without appending a new context
     /// note or marking the restored session dirty.
     pub(crate) fn restore_session_cwd(&mut self, cwd: Option<&str>) -> SessionCwdRestore {
+        self.workspace.discard_pending();
         let Some(cwd) = cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) else {
             return SessionCwdRestore::Missing;
         };
@@ -332,13 +587,14 @@ impl TuiApp {
         self.core.env.set_cwd(cwd.clone());
         self.platform.install_cwd(cwd.clone());
         self.prompt.set_cwd(cwd.clone());
-        self.workspace.install_cwd(
-            cwd.clone(),
-            std::path::Path::new(&self.core.config.settings.worktree_root),
-        );
+        self.workspace.install_cwd(cwd.clone());
         if mark_session_dirty && !self.session_is_read_only() {
             self.conversation.set_cwd(self.workspace.cwd().to_owned());
         }
+        self.publish_workspace_signals();
+    }
+
+    fn publish_workspace_signals(&mut self) {
         self.core
             .signals
             .publish_if_changed("cwd", self.workspace.cwd().to_owned());
@@ -358,8 +614,9 @@ impl TuiApp {
         self.core
             .signals
             .publish_if_changed("cwd_managed_worktree", self.workspace.is_managed_worktree());
-        let branch = engine::paths::git_branch(&cwd).unwrap_or_default();
-        self.core.signals.publish_if_changed("branch", branch);
+        self.core
+            .signals
+            .publish_if_changed("branch", self.workspace.branch().to_owned());
     }
 
     pub(crate) fn publish_cwd_change(&mut self, user_visible: bool) {
@@ -374,6 +631,297 @@ impl TuiApp {
 #[cfg(test)]
 mod tests {
     use super::{worktree_display_path, StagedCwdTransition};
+
+    #[tokio::test]
+    async fn bash_rename_of_cwd_keeps_the_next_request_and_relative_tools_working() {
+        use crate::app::test_harness::{test_environment_guard, Action, SourceEvent, TestApp};
+        use engine::{HostCall, HostRequestDecision, PreparedRequestMessages};
+
+        async fn wait_for_bash(app: &mut TestApp, call_id: &str) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !app.actions().iter().any(|action| matches!(action,
+                Action::EngineSend(command) if matches!(command.as_ref(),
+                    protocol::UiCommand::ToolResult { call_id: completed, .. } if completed == call_id)))
+            {
+                assert!(std::time::Instant::now() < deadline, "bash tool stalled");
+                app.feed_one(SourceEvent::LuaWakeup);
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+
+        let environment = test_environment_guard();
+        let parent = tempfile::tempdir().unwrap();
+        let parent_path = std::fs::canonicalize(parent.path()).unwrap();
+        let original = parent_path.join("EV charger holder");
+        let renamed = parent_path.join("ev-charger-holder");
+        std::fs::create_dir(&original).unwrap();
+        std::env::set_current_dir(&original).unwrap();
+        let mut app = TestApp::builder()
+            .with_cwd(&original)
+            .build_with_test_environment_guard(&environment);
+        app.start_turn(42);
+        app.app.lua.core_shared().hooks.prepare_request.clear();
+
+        let command = format!(
+            "if [ -e '{}' ]; then printf 'Destination already exists; not renaming.\\n'; exit 1; fi; mv '{}' '{}'",
+            renamed.display(), original.display(), renamed.display()
+        );
+        app.feed_one(SourceEvent::engine(protocol::EngineEvent::ToolDispatch {
+            invocation_id: protocol::InvocationId::new(91),
+            request_id: 91,
+            call_id: "rename-cwd".into(),
+            tool_name: "bash".into(),
+            args: std::collections::HashMap::from([("command".into(), command.into())]),
+        }));
+        wait_for_bash(&mut app, "rename-cwd").await;
+        assert!(app.actions().iter().any(|action| matches!(action,
+            Action::EngineSend(command) if matches!(command.as_ref(),
+                protocol::UiCommand::ToolResult { call_id, is_error: false, .. }
+                if call_id == "rename-cwd"))));
+        assert_eq!(std::env::current_dir().unwrap(), renamed);
+
+        let (reply, mut response) = tokio::sync::oneshot::channel();
+        app.dispatch_host_call(HostCall::PrepareRequest {
+            turn_id: 42,
+            messages: PreparedRequestMessages::model_only(Vec::new()),
+            estimated_tokens: 0,
+            reply,
+        });
+        let decision = response.try_recv().unwrap();
+        assert!(
+            matches!(decision, HostRequestDecision::Continue),
+            "{decision:?}"
+        );
+        assert_eq!(app.core_probe().env.cwd(), renamed);
+        assert_eq!(app.workspace_probe().cwd_path(), renamed);
+        assert_eq!(app.session_snapshot().cwd.as_deref(), renamed.to_str());
+        assert_eq!(
+            std::env::var_os("PWD").as_deref(),
+            Some(renamed.as_os_str())
+        );
+        assert!(app
+            .drain_engine_sends()
+            .iter()
+            .any(|command| matches!(command,
+            protocol::UiCommand::UpdateAgentProjectContext(context) if context.cwd == renamed)));
+        assert!(app
+            .app
+            .model_history_messages()
+            .iter()
+            .any(
+                |message| message.content.as_ref().is_some_and(|content| content
+                    .text_content()
+                    .contains(&format!(
+                        "Current working directory: {}.",
+                        renamed.display()
+                    )))
+            ));
+
+        app.feed_one(SourceEvent::engine(protocol::EngineEvent::ToolDispatch {
+            invocation_id: protocol::InvocationId::new(92),
+            request_id: 92,
+            call_id: "relative-write".into(),
+            tool_name: "bash".into(),
+            args: std::collections::HashMap::from([(
+                "command".into(),
+                "printf ok > probe.txt".into(),
+            )]),
+        }));
+        wait_for_bash(&mut app, "relative-write").await;
+        assert_eq!(
+            std::fs::read_to_string(renamed.join("probe.txt")).unwrap(),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn cwd_rename_refreshes_project_paths_at_workspace_boundaries() {
+        use crate::app::test_harness::{test_environment_guard, TestApp};
+        use crossterm::event::KeyCode;
+        use engine::{HostCall, HostRequestDecision, PreparedRequestMessages};
+
+        for boundary in ["reload", "request", "auto_reload", "switch"] {
+            let environment = test_environment_guard();
+            let root = tempfile::tempdir().unwrap();
+            let root_path = std::fs::canonicalize(root.path()).unwrap();
+            let original = root_path.join("original");
+            let renamed = root_path.join("renamed");
+            std::fs::create_dir_all(original.join(".smelt/runtime")).unwrap();
+            std::fs::create_dir_all(original.join(".smelt/skills/local-probe")).unwrap();
+            std::fs::write(
+                original.join(".smelt/runtime/rename_probe.lua"),
+                "return 42",
+            )
+            .unwrap();
+            std::fs::write(
+                original.join(".smelt/skills/local-probe/SKILL.md"),
+                "---\nname: local-probe\ndescription: Local rename probe\n---\nUse local files.\n",
+            )
+            .unwrap();
+            std::fs::write(original.join("AGENTS.md"), "Rename probe instructions").unwrap();
+            std::env::set_current_dir(&original).unwrap();
+            let mut app = TestApp::builder()
+                .with_cwd(&original)
+                .build_with_test_environment_guard(&environment);
+            app.mark_project_trusted(&original).unwrap();
+            app.reload_lua();
+            let generation = app.lua_probe().id;
+            std::fs::rename(&original, &renamed).unwrap();
+            app.mark_project_trusted(&renamed).unwrap();
+
+            if boundary == "request" {
+                app.start_turn(42);
+                let (reply, mut response) = tokio::sync::oneshot::channel();
+                app.dispatch_host_call(HostCall::PrepareRequest {
+                    turn_id: 42,
+                    messages: PreparedRequestMessages::model_only(Vec::new()),
+                    estimated_tokens: 0,
+                    reply,
+                });
+                assert!(matches!(
+                    response.try_recv().unwrap(),
+                    HostRequestDecision::Continue
+                ));
+            } else {
+                match boundary {
+                    "reload" => {
+                        app.type_text("/reload");
+                        app.press(KeyCode::Enter);
+                    }
+                    "auto_reload" => app.app.reload_lua_config(),
+                    "switch" => assert!(app.run_lua("smelt.session.switch_cwd('.')")),
+                    _ => unreachable!(),
+                }
+                app.wait_for_workspace();
+            }
+            assert_eq!(app.core_probe().env.cwd(), renamed, "{boundary}");
+            assert!(app.run_lua("assert(require('rename_probe') == 42)"));
+            assert_eq!(app.lua_probe().id, generation.wrapping_add(1), "{boundary}");
+            assert_eq!(
+                app.lua_probe().manifest.target_cwd.as_deref(),
+                Some(renamed.as_path())
+            );
+            assert!(app
+                .lua_probe()
+                .manifest
+                .roots
+                .iter()
+                .all(|path| !path.starts_with(&original)));
+            let skills = app.core_probe().skills.as_ref().unwrap().info();
+            let local = skills
+                .iter()
+                .find(|skill| skill.name == "local-probe")
+                .unwrap();
+            assert!(std::path::Path::new(&local.location).starts_with(&renamed));
+        }
+    }
+
+    #[test]
+    fn failed_rename_transition_keeps_committed_state_and_can_be_retried() {
+        use crate::app::test_harness::{test_environment_guard, TestApp};
+        use engine::{HostCall, HostRequestDecision, PreparedRequestMessages};
+
+        for boundary in ["request", "reload"] {
+            let environment = test_environment_guard();
+            let root = tempfile::tempdir().unwrap();
+            let root_path = std::fs::canonicalize(root.path()).unwrap();
+            let original = root_path.join("original");
+            let renamed = root_path.join("renamed");
+            let init = root_path.join("init.lua");
+            std::fs::write(&init, "_G.rename_marker = 'original'").unwrap();
+            std::fs::create_dir(&original).unwrap();
+            std::env::set_current_dir(&original).unwrap();
+            let mut app = TestApp::builder()
+                .with_cwd(&original)
+                .with_init_lua(&init)
+                .build_with_test_environment_guard(&environment);
+            let generation = app.lua_probe().id;
+            let permissions = app.active_permissions();
+            let session_cwd = app.session_snapshot().cwd;
+            std::fs::rename(&original, &renamed).unwrap();
+            std::fs::write(&init, "error('rename config rejected')").unwrap();
+            if boundary == "request" {
+                app.start_turn(42);
+                let (reply, mut response) = tokio::sync::oneshot::channel();
+                app.dispatch_host_call(HostCall::PrepareRequest {
+                    turn_id: 42,
+                    messages: PreparedRequestMessages::model_only(Vec::new()),
+                    estimated_tokens: 0,
+                    reply,
+                });
+                assert!(
+                    matches!(response.try_recv().unwrap(), HostRequestDecision::Abort(error)
+                    if error.contains("rename config rejected"))
+                );
+                app.discard_turn(crate::app::TurnEnd::Cancelled);
+            } else {
+                app.schedule_lua_reload();
+                app.wait_for_workspace();
+                assert!(app
+                    .app
+                    .lua_reload_failure()
+                    .unwrap()
+                    .message
+                    .contains("rename config rejected"));
+            }
+            assert_eq!(std::env::current_dir().unwrap(), renamed);
+            assert_eq!(app.core_probe().env.cwd(), original);
+            assert_eq!(app.lua_probe().id, generation);
+            assert_eq!(app.lua_probe().core_shared().evaluation_cwd(), original);
+            assert_eq!(app.session_snapshot().cwd, session_cwd);
+            assert!(std::sync::Arc::ptr_eq(
+                &permissions,
+                &app.active_permissions()
+            ));
+            assert!(app.run_lua("assert(rename_marker == 'original')"));
+            std::fs::write(&init, "_G.rename_marker = 'renamed'").unwrap();
+            app.schedule_lua_reload();
+            app.wait_for_workspace();
+            assert_eq!(app.core_probe().env.cwd(), renamed);
+            assert!(app.run_lua("assert(rename_marker == 'renamed')"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renamed_process_cwd_tracks_directory_identity_not_path_existence() {
+        let _environment = smelt_test_support::ProcessEnvironmentGuard::capture();
+        let root = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(root.path()).unwrap();
+        let original_parent = root_path.join("original");
+        let renamed_parent = root_path.join("renamed");
+        let original = original_parent.join("child");
+        let renamed = renamed_parent.join("child");
+        std::fs::create_dir_all(&original).unwrap();
+        std::env::set_current_dir(&original).unwrap();
+        let mut workspace = super::WorkspaceState::new(
+            original.to_string_lossy().into_owned(),
+            root_path.clone(),
+            std::path::Path::new(".worktrees"),
+        );
+        assert!(workspace.renamed_process_cwd().is_none());
+
+        std::fs::rename(&original_parent, &renamed_parent).unwrap();
+        std::fs::create_dir_all(&original).unwrap();
+        assert_eq!(workspace.renamed_process_cwd(), Some(renamed.clone()));
+
+        std::env::set_current_dir(&original).unwrap();
+        assert!(workspace.renamed_process_cwd().is_none());
+        std::env::set_current_dir(&root_path).unwrap();
+        assert!(workspace.renamed_process_cwd().is_none());
+
+        workspace.install_cwd(original.clone());
+        std::env::set_current_dir(&renamed).unwrap();
+        assert!(workspace.renamed_process_cwd().is_none());
+        std::env::set_current_dir(&original).unwrap();
+        let moved_again = root_path.join("moved-again");
+        std::fs::rename(&original, &moved_again).unwrap();
+        assert_eq!(workspace.renamed_process_cwd(), Some(moved_again.clone()));
+
+        std::fs::remove_dir(&moved_again).unwrap();
+        assert!(workspace.renamed_process_cwd().is_none());
+        std::env::set_current_dir(&root_path).unwrap();
+    }
 
     #[test]
     fn staged_cwd_transition_rolls_back_when_not_committed() {
@@ -394,11 +942,111 @@ mod tests {
     }
 
     #[test]
+    fn prepared_tool_cwd_retains_input_and_discards_cancelled_results() {
+        use crate::app::test_harness::{test_environment_guard, Action, SourceEvent, TestApp};
+
+        for cancel in [false, true] {
+            let environment = test_environment_guard();
+            let target = tempfile::TempDir::new().unwrap();
+            let target = std::fs::canonicalize(target.path()).unwrap();
+            let mut app = TestApp::builder().build_with_test_environment_guard(&environment);
+            let original_cwd = app.core_probe().env.cwd();
+            let original_generation = app.lua_probe().id;
+            let prepared = app
+                .app
+                .prepare_lua_inputs(target.clone(), true)
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            let invocation = smelt_core::lua::ToolInvocationContext {
+                invocation_id: protocol::InvocationId::new(91),
+                request_id: 91,
+                execution_mode: protocol::ToolExecutionMode::Sequential,
+            };
+            app.start_turn(1);
+            app.app
+                .workspace
+                .schedule(target.clone(), true, Some(invocation));
+            app.complete_lua_tool(invocation, "prepared-cwd".into(), "ok".into(), false, None);
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.app
+                .workspace
+                .pending_change
+                .as_mut()
+                .unwrap()
+                .preparation = Some(rx);
+            app.clear_actions();
+
+            assert!(app.run_lua(
+                "local ok, err = pcall(smelt.session.switch_cwd, smelt.session.cwd()); assert(not ok and tostring(err):find('owns the pending cwd transition'))"
+            ));
+            app.type_text("input while preparing");
+            assert_eq!(app.state().prompt_text, "input while preparing");
+            assert_eq!(app.core_probe().env.cwd(), original_cwd);
+            assert!(!app.actions().iter().any(|action| matches!(action,
+                Action::EngineSend(command) if matches!(command.as_ref(), protocol::UiCommand::ToolResult { .. }))));
+
+            if cancel {
+                app.discard_turn(crate::app::TurnEnd::Cancelled);
+                assert!(tx.send(Ok(prepared)).is_err());
+                app.feed_one(SourceEvent::LuaWakeup);
+                assert_eq!(app.core_probe().env.cwd(), original_cwd);
+                assert_eq!(app.lua_probe().id, original_generation);
+                assert!(!app.app.workspace.has_pending_change());
+                assert!(!app.actions().iter().any(|action| matches!(action,
+                    Action::EngineSend(command) if matches!(command.as_ref(), protocol::UiCommand::ToolResult { .. }))));
+            } else {
+                app.app
+                    .core
+                    .permission_store
+                    .add_tool(
+                        &target.to_string_lossy(),
+                        smelt_core::permissions::store::PersistenceScope::Workspace,
+                        "bash",
+                        vec![],
+                    )
+                    .unwrap();
+                assert!(tx.send(Ok(prepared)).is_ok());
+                app.feed_one(SourceEvent::LuaWakeup);
+                assert_eq!(app.core_probe().env.cwd(), original_cwd);
+                assert_eq!(app.lua_probe().id, original_generation);
+                app.wait_for_tool_result("prepared-cwd");
+                assert_eq!(app.core_probe().env.cwd(), target);
+                assert_eq!(app.lua_probe().id, original_generation.wrapping_add(1));
+            }
+            assert_eq!(app.state().prompt_text, "input while preparing");
+        }
+    }
+
+    #[test]
+    fn restoring_current_session_cwd_discards_another_pending_transition() {
+        use crate::app::test_harness::{test_environment_guard, TestApp};
+
+        let environment = test_environment_guard();
+        let target = tempfile::tempdir().unwrap();
+        let mut app = TestApp::builder().build_with_test_environment_guard(&environment);
+        let original_cwd = app.core_probe().env.cwd();
+        app.app
+            .workspace
+            .schedule(target.path().to_owned(), true, None);
+        assert_eq!(
+            app.app.restore_session_cwd(original_cwd.to_str()),
+            super::SessionCwdRestore::Current
+        );
+        app.drain_idle_work();
+        assert!(!app.app.workspace.has_pending_change());
+        assert_eq!(app.core_probe().env.cwd(), original_cwd);
+    }
+
+    #[test]
     fn worktree_display_path_is_relative_to_project_root() {
         let context = smelt_core::worktree::ProjectContext {
             project_name: "smelt".into(),
             active_root: std::path::PathBuf::from("/home/dev/dev/smelt/.worktrees/test"),
             branch: "test".into(),
+            default_base: "main".into(),
+            default_base_path: Some(std::path::PathBuf::from("/home/dev/dev/smelt")),
             managed_worktree: true,
             worktree_name: Some("test".into()),
             base_path: Some(std::path::PathBuf::from("/home/dev/dev/smelt")),

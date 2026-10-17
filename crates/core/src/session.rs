@@ -17,7 +17,7 @@ static SESSION_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub struct ContextCheckpoint {
     #[serde(default = "default_checkpoint_kind")]
     pub kind: String,
-    pub summary: String,
+    pub summary: Arc<str>,
     pub first_live_index: usize,
     pub created_at_ms: u64,
     pub tokens_before: Option<u32>,
@@ -36,7 +36,7 @@ pub struct ContextCheckpoint {
 pub struct ContextCheckpointEvent {
     #[serde(default = "default_checkpoint_kind")]
     pub kind: String,
-    pub summary: String,
+    pub summary: Arc<str>,
     /// Canonical history boundary retained verbatim in model context.
     pub first_live_index: usize,
     /// Canonical history length when compaction completed and its transcript marker appeared.
@@ -148,7 +148,7 @@ pub struct SessionMetadataSnapshot {
     #[serde(default)]
     pub slug: Option<String>,
     #[serde(default)]
-    pub first_user_message: Option<String>,
+    pub first_user_message: Option<Arc<str>>,
 }
 
 impl SessionMetadataSnapshot {
@@ -169,7 +169,7 @@ impl Default for ContextCheckpoint {
     fn default() -> Self {
         Self {
             kind: default_checkpoint_kind(),
-            summary: String::new(),
+            summary: Arc::from(""),
             first_live_index: 0,
             created_at_ms: 0,
             tokens_before: None,
@@ -191,12 +191,12 @@ pub struct SessionForkTarget {
 ///
 /// Storage shape is `Vec<HistoryItem>` (the sum-type history that makes
 /// orphan tool_calls impossible).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct Session {
     pub id: String,
     pub title: Option<String>,
     pub slug: Option<String>,
-    pub first_user_message: Option<String>,
+    pub first_user_message: Option<Arc<str>>,
     /// Title/slug snapshots keyed by semantic history length. Rewind restores
     /// the latest snapshot at or before the retained history boundary.
     pub metadata_snapshots: HistorySnapshots<SessionMetadataSnapshot>,
@@ -210,7 +210,7 @@ pub struct Session {
     pub parent_id: Option<String>,
     pub history: Vec<HistoryItem>,
     pub checkpoint: Option<ContextCheckpoint>,
-    pub checkpoint_events: Vec<ContextCheckpointEvent>,
+    pub checkpoint_events: CheckpointEvents,
     pub context_tokens: Option<u32>,
     /// History length at the time `context_tokens` was recorded. Used to
     /// decide whether the provider baseline exactly covers the current
@@ -232,6 +232,72 @@ pub struct Session {
     /// Cumulative token usage across every turn this session has made;
     /// distinct from the per-turn `context_tokens` snapshot.
     pub session_usage: TokenUsage,
+    archive_owner: archives::ArchiveOwner,
+}
+
+impl Clone for Session {
+    fn clone(&self) -> Self {
+        let mut cloned = Self {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            slug: self.slug.clone(),
+            first_user_message: self.first_user_message.clone(),
+            metadata_snapshots: self.metadata_snapshots.clone(),
+            created_at_ms: self.created_at_ms,
+            updated_at_ms: self.updated_at_ms,
+            mode: self.mode.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            model: self.model.clone(),
+            fast_mode: self.fast_mode,
+            cwd: self.cwd.clone(),
+            parent_id: self.parent_id.clone(),
+            history: self.history.clone(),
+            checkpoint: self.checkpoint.clone(),
+            checkpoint_events: self.checkpoint_events.clone(),
+            context_tokens: self.context_tokens,
+            context_tokens_history_len: self.context_tokens_history_len,
+            context_token_identity: self.context_token_identity.clone(),
+            display_context_tokens: self.display_context_tokens,
+            display_context_token_identity: self.display_context_token_identity.clone(),
+            turn_metas: self.turn_metas.clone(),
+            context_snapshots: self.context_snapshots.clone(),
+            session_cost_usd: self.session_cost_usd,
+            session_usage: self.session_usage.clone(),
+            archive_owner: self.archive_owner.clone(),
+        };
+        cloned.rebind_cloned_archives(self);
+        cloned
+    }
+}
+
+impl PartialEq for Session {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.title == other.title
+            && self.slug == other.slug
+            && self.first_user_message == other.first_user_message
+            && self.metadata_snapshots == other.metadata_snapshots
+            && self.created_at_ms == other.created_at_ms
+            && self.updated_at_ms == other.updated_at_ms
+            && self.mode == other.mode
+            && self.reasoning_effort == other.reasoning_effort
+            && self.model == other.model
+            && self.fast_mode == other.fast_mode
+            && self.cwd == other.cwd
+            && self.parent_id == other.parent_id
+            && self.history == other.history
+            && self.checkpoint == other.checkpoint
+            && self.checkpoint_events == other.checkpoint_events
+            && self.context_tokens == other.context_tokens
+            && self.context_tokens_history_len == other.context_tokens_history_len
+            && self.context_token_identity == other.context_token_identity
+            && self.display_context_tokens == other.display_context_tokens
+            && self.display_context_token_identity == other.display_context_token_identity
+            && self.turn_metas == other.turn_metas
+            && self.context_snapshots == other.context_snapshots
+            && self.session_cost_usd == other.session_cost_usd
+            && self.session_usage == other.session_usage
+    }
 }
 
 const SESSION_FORMAT_VERSION: u32 = 1;
@@ -257,7 +323,7 @@ struct SessionWire {
     #[serde(deserialize_with = "deserialize_required_option")]
     pub slug: Option<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    pub first_user_message: Option<String>,
+    pub first_user_message: Option<Arc<str>>,
     pub metadata_snapshots: HistorySnapshots<SessionMetadataSnapshot>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -276,7 +342,7 @@ struct SessionWire {
     pub history: Vec<HistoryItem>,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub checkpoint: Option<ContextCheckpoint>,
-    pub checkpoint_events: Vec<ContextCheckpointEvent>,
+    pub checkpoint_events: CheckpointEvents,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub context_tokens: Option<u32>,
     #[serde(deserialize_with = "deserialize_required_option")]
@@ -293,105 +359,16 @@ struct SessionWire {
     pub session_usage: TokenUsage,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct HistorySnapshots<T>(Vec<(usize, T)>);
-
-impl<T> Default for HistorySnapshots<T> {
-    fn default() -> Self {
-        Self(Vec::new())
-    }
-}
-
-impl<T> HistorySnapshots<T> {
-    pub fn from_vec(entries: Vec<(usize, T)>) -> Self {
-        Self(entries)
-    }
-
-    pub fn into_vec(self) -> Vec<(usize, T)> {
-        self.0
-    }
-
-    pub fn as_slice(&self) -> &[(usize, T)] {
-        &self.0
-    }
-
-    pub fn push(&mut self, entry: (usize, T)) {
-        self.0.push(entry);
-    }
-
-    pub fn upsert_truncating_after(&mut self, len: usize, value: T) {
-        self.truncate_after(len);
-        if let Some((existing_len, existing)) = self.0.last_mut() {
-            if *existing_len == len {
-                *existing = value;
-                return;
-            }
-        }
-        self.push((len, value));
-    }
-
-    pub fn truncate_after(&mut self, len: usize) {
-        while self.0.last().is_some_and(|(entry_len, _)| *entry_len > len) {
-            self.0.pop();
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.0.clear();
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn last(&self) -> Option<&(usize, T)> {
-        self.0.last()
-    }
-
-    pub fn iter(&self) -> std::slice::Iter<'_, (usize, T)> {
-        self.0.iter()
-    }
-}
-
-impl<T: Clone> HistorySnapshots<T> {
-    pub fn last_value_cloned(&self) -> Option<T> {
-        self.0.last().map(|(_, value)| value.clone())
-    }
-}
+mod archives;
+mod snapshots;
+pub use archives::{CapturedArchiveSave, PreparedArchiveSave};
+pub use snapshots::{CheckpointEvents, HistorySnapshots, SnapshotSuffix, SnapshotVersion};
 
 #[derive(Debug, Default)]
 struct SessionSideTableState {
     turn_metas: HistorySnapshots<TurnMeta>,
     metadata_snapshots: HistorySnapshots<SessionMetadataSnapshot>,
     context_snapshots: HistorySnapshots<ContextSnapshot>,
-}
-
-impl<'a, T> IntoIterator for &'a HistorySnapshots<T> {
-    type Item = &'a (usize, T);
-    type IntoIter = std::slice::Iter<'a, (usize, T)>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
-
-impl<T> std::ops::Index<usize> for HistorySnapshots<T> {
-    type Output = (usize, T);
-
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.0[index]
-    }
-}
-
-impl<T> From<Vec<(usize, T)>> for HistorySnapshots<T> {
-    fn from(value: Vec<(usize, T)>) -> Self {
-        Self::from_vec(value)
-    }
 }
 
 impl From<SessionWire> for Session {
@@ -432,6 +409,7 @@ impl From<SessionWire> for Session {
             context_snapshots,
             session_cost_usd: w.session_cost_usd,
             session_usage: w.session_usage,
+            archive_owner: archives::ArchiveOwner::default(),
         }
     }
 }
@@ -496,7 +474,7 @@ pub struct SessionMeta {
     #[serde(default)]
     pub slug: Option<String>,
     #[serde(default)]
-    pub first_user_message: Option<String>,
+    pub first_user_message: Option<Arc<str>>,
     #[serde(default)]
     pub created_at_ms: u64,
     #[serde(default)]
@@ -522,7 +500,7 @@ pub struct SessionMeta {
     #[serde(default)]
     pub checkpoint: Option<ContextCheckpoint>,
     #[serde(default)]
-    pub checkpoint_events: Vec<ContextCheckpointEvent>,
+    pub checkpoint_events: CheckpointEvents,
     /// Approximate text byte size (message bodies, reasoning, tool-call args).
     /// Projected into the catalog so list consumers avoid opening session databases.
     #[serde(default)]
@@ -537,7 +515,7 @@ pub struct SessionListMeta {
     #[serde(default)]
     pub slug: Option<String>,
     #[serde(default)]
-    pub first_user_message: Option<String>,
+    pub first_user_message: Option<Arc<str>>,
     #[serde(default)]
     pub created_at_ms: u64,
     #[serde(default)]
@@ -630,7 +608,7 @@ pub struct SessionListPage {
     pub catalog: SessionCatalogStatus,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct SessionContextSnapshotState {
     #[serde(default)]
     session_usage: TokenUsage,
@@ -663,7 +641,7 @@ impl Session {
             parent_id: None,
             history: Vec::new(),
             checkpoint: None,
-            checkpoint_events: Vec::new(),
+            checkpoint_events: CheckpointEvents::default(),
             context_tokens: None,
             context_tokens_history_len: None,
             context_token_identity: None,
@@ -673,6 +651,7 @@ impl Session {
             context_snapshots: HistorySnapshots::default(),
             session_cost_usd: 0.0,
             session_usage: TokenUsage::default(),
+            archive_owner: archives::ArchiveOwner::default(),
         }
     }
 
@@ -801,10 +780,10 @@ impl Session {
         self.snapshot_context_at(self.history.len());
     }
 
-    pub fn snapshot_context_at(&mut self, hist_idx: usize) {
+    pub fn snapshot_context_at(&mut self, hist_idx: usize) -> bool {
         let snapshot = ContextSnapshot::from_session(self);
         self.context_snapshots
-            .upsert_truncating_after(hist_idx, snapshot);
+            .upsert_truncating_after(hist_idx, snapshot)
     }
 
     pub fn finish_turn_state(
@@ -812,18 +791,19 @@ impl Session {
         history_len: usize,
         meta: TurnMeta,
         update_context_token_history_len: bool,
-    ) {
-        self.turn_metas.upsert_truncating_after(history_len, meta);
+    ) -> bool {
+        let mut changed = self.turn_metas.upsert_truncating_after(history_len, meta);
         if update_context_token_history_len && self.context_tokens.is_some() {
+            changed |= self.context_tokens_history_len != Some(history_len);
             self.context_tokens_history_len = Some(history_len);
         }
-        self.snapshot_context_at(history_len);
+        changed | self.snapshot_context_at(history_len)
     }
 
-    pub fn snapshot_metadata_at(&mut self, hist_idx: usize) {
+    pub fn snapshot_metadata_at(&mut self, hist_idx: usize) -> bool {
         let snapshot = SessionMetadataSnapshot::from_session(self);
         self.metadata_snapshots
-            .upsert_truncating_after(hist_idx, snapshot);
+            .upsert_truncating_after(hist_idx, snapshot)
     }
 
     pub fn restore_metadata_after_rewind(&mut self, hist_idx: usize) {
@@ -1080,6 +1060,7 @@ impl Session {
             return false;
         }
         let created_at_ms = now_ms();
+        let summary: Arc<str> = summary.into();
         self.checkpoint_events.push(ContextCheckpointEvent {
             kind: kind.clone(),
             summary: summary.clone(),
@@ -1187,8 +1168,12 @@ impl Session {
     }
 
     /// Create metadata for a store-backed fork without materializing history.
+    /// Copied archive tokens remain unbound until the SDK fork result is verified.
     pub fn fork_store_backed(&self, pid: u32) -> Self {
-        self.fork_with_history(pid, Vec::new())
+        let mut forked = self.fork_with_history(pid, Vec::new());
+        forked.archive_owner = self.archive_owner.clone();
+        forked.rebind_cloned_archives(self);
+        forked
     }
 
     fn fork_with_history(&self, pid: u32, history: Vec<HistoryItem>) -> Self {
@@ -1219,6 +1204,7 @@ impl Session {
             context_snapshots: self.context_snapshots.clone(),
             session_cost_usd: self.session_cost_usd,
             session_usage: self.session_usage.clone(),
+            archive_owner: archives::ArchiveOwner::default(),
         }
     }
 }
@@ -1419,6 +1405,7 @@ pub struct SessionHeader {
 #[derive(Clone, Debug)]
 pub struct SessionStoreResume {
     pub header: SessionHeader,
+    pub user_turn_count: usize,
     pub session: Session,
     pub store_address: SessionStoreAddress,
     pub head: smelt_store::StoreHead,
@@ -1595,7 +1582,7 @@ fn checkpoint_json_for_history_len(
 fn checkpoint_events_from_json(
     value: Option<Value>,
     retained_history_len: usize,
-) -> Vec<ContextCheckpointEvent> {
+) -> CheckpointEvents {
     let mut events: Vec<ContextCheckpointEvent> = value
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
@@ -1603,7 +1590,7 @@ fn checkpoint_events_from_json(
         event.first_live_index <= event.completed_at_history_len
             && event.completed_at_history_len <= retained_history_len
     });
-    events
+    events.into()
 }
 
 fn checkpoint_events_json_for_history_len(
@@ -1645,7 +1632,7 @@ pub fn store_metadata_from_session(
     Ok(smelt_store::SessionMetadata {
         title: session.title.clone(),
         slug: session.slug.clone(),
-        first_user_message: session.first_user_message.clone(),
+        first_user_message: session.first_user_message.as_deref().map(str::to_owned),
         cwd: session.cwd.clone(),
         mode: session.mode.clone(),
         reasoning_effort: session
@@ -1883,7 +1870,7 @@ impl SessionStorage {
                     error,
                 )
             })?;
-        let transcript_records = reader
+        reader
             .transcript_range(0, state.head.transcript_record_count.get())
             .map_err(|error| {
                 crate::session_store::store_error(
@@ -1892,38 +1879,10 @@ impl SessionStorage {
                     error,
                 )
             })?;
-        session_from_full_store(
-            &resolved.id,
-            state.history_text_bytes,
-            smelt_store::FullSession {
-                session: smelt_store::StoredSession {
-                    identity: state.identity,
-                    metadata: state.metadata,
-                    head: state.head,
-                },
-                history,
-                turn_metas: state
-                    .side_tables
-                    .turn_metas
-                    .into_iter()
-                    .map(|(index, value)| (index.get(), value))
-                    .collect(),
-                metadata_snapshots: state
-                    .side_tables
-                    .metadata_snapshots
-                    .into_iter()
-                    .map(|(index, value)| (index.get(), value))
-                    .collect(),
-                context_snapshots: state
-                    .side_tables
-                    .context_snapshots
-                    .into_iter()
-                    .map(|(index, value)| (index.get(), value))
-                    .collect(),
-                transcript_records,
-            },
-        )
-        .map(Some)
+        let (header, _) = lineage_header_from_snapshot(&resolved, &state)?;
+        let mut session = session_from_lineage_snapshot(header.meta, state)?;
+        session.history = history;
+        Ok(Some(session))
     }
 
     pub fn load_meta(&self, id_or_prefix: &str) -> Option<SessionMeta> {
@@ -2028,8 +1987,21 @@ impl SessionStorage {
         record_width: u16,
         record_target_rows: u16,
     ) -> SessionStoreResult<Option<SessionStoreResume>> {
+        self.load_store_resume_cancellable(id_or_prefix, record_width, record_target_rows, &|| {
+            false
+        })
+    }
+
+    pub fn load_store_resume_cancellable(
+        &self,
+        id_or_prefix: &str,
+        record_width: u16,
+        record_target_rows: u16,
+        cancelled: &dyn Fn() -> bool,
+    ) -> SessionStoreResult<Option<SessionStoreResume>> {
         let resolved = self.resolve_session_for_read_result(id_or_prefix)?;
-        load_lineage_resume_from_resolved(resolved, record_width, record_target_rows).map(Some)
+        load_lineage_resume_from_resolved(resolved, record_width, record_target_rows, cancelled)
+            .map(Some)
     }
 
     pub fn load_store_header(
@@ -2046,13 +2018,6 @@ impl SessionStorage {
         let resolved = self.resolve_session_for_read_result(id_or_prefix)?;
         let (_, snapshot) = open_lineage_snapshot(&resolved)?;
         lineage_header_from_snapshot(&resolved, &snapshot).map(Some)
-    }
-
-    pub fn load_store_header_for_id(
-        &self,
-        session_id: &str,
-    ) -> Option<(SessionHeader, SessionStoreAddress)> {
-        self.load_store_header(session_id)
     }
 }
 
@@ -2092,20 +2057,26 @@ pub fn load_store_resume_result(
     process_storage().load_store_resume_result(id_or_prefix, record_width, record_target_rows)
 }
 
-fn open_lineage_snapshot(
+fn open_lineage_reader(
     resolved: &ResolvedSession,
-) -> SessionStoreResult<(
-    smelt_store::LineageSessionReader,
-    smelt_store::LineageSessionState,
-)> {
-    let reader = smelt_store::LineageSessionReader::open_existing_in_lineage(
+) -> SessionStoreResult<smelt_store::LineageSessionReader> {
+    smelt_store::LineageSessionReader::open_existing_in_lineage(
         &resolved.sessions_root,
         &resolved.lineage_id,
         &resolved.id,
     )
     .map_err(|error| {
         crate::session_store::store_error("open lineage session", &resolved.sessions_root, error)
-    })?;
+    })
+}
+
+fn open_lineage_snapshot(
+    resolved: &ResolvedSession,
+) -> SessionStoreResult<(
+    smelt_store::LineageSessionReader,
+    smelt_store::LineageSessionState,
+)> {
+    let reader = open_lineage_reader(resolved)?;
     let snapshot = reader.snapshot().map_err(|error| {
         crate::session_store::store_error(
             "read lineage session head",
@@ -2158,38 +2129,73 @@ fn load_lineage_resume_from_resolved(
     resolved: ResolvedSession,
     record_width: u16,
     record_target_rows: u16,
+    cancelled: &dyn Fn() -> bool,
 ) -> SessionStoreResult<SessionStoreResume> {
-    let (reader, snapshot) = open_lineage_snapshot(&resolved)?;
-    let transcript_count = snapshot
-        .head
-        .transcript_record_count
-        .as_usize()
-        .ok_or_else(|| SessionStoreError::Corrupt {
-            context: "lineage transcript length exceeds platform limits".into(),
-        })?;
-    let transcript_record_tail = reader
-        .transcript_tail_for_rows_with_total(transcript_count, record_width, record_target_rows)
+    let reader = open_lineage_reader(&resolved)?;
+    reader
+        .read_snapshot(|reader| {
+            let snapshot = reader.snapshot().map_err(|error| {
+                crate::session_store::store_error(
+                    "read lineage session head",
+                    &resolved.sessions_root,
+                    error,
+                )
+            })?;
+            let count = reader
+                .history_user_turn_count_before_cancellable(
+                    snapshot.head.history_len.get(),
+                    cancelled,
+                )
+                .map_err(|error| {
+                    crate::session_store::store_error(
+                        "read lineage user count",
+                        &resolved.sessions_root,
+                        error,
+                    )
+                })?;
+            let user_turn_count =
+                usize::try_from(count).map_err(|_| SessionStoreError::Corrupt {
+                    context: "lineage user count exceeds platform limits".into(),
+                })?;
+            let transcript_count = snapshot
+                .head
+                .transcript_record_count
+                .as_usize()
+                .ok_or_else(|| SessionStoreError::Corrupt {
+                    context: "lineage transcript length exceeds platform limits".into(),
+                })?;
+            let transcript_record_tail = reader
+                .transcript_tail_for_rows_with_total(
+                    transcript_count,
+                    record_width,
+                    record_target_rows,
+                )
+                .map_err(|error| {
+                    crate::session_store::store_error(
+                        "read lineage transcript tail",
+                        &resolved.sessions_root,
+                        error,
+                    )
+                })?;
+            let head = snapshot.head;
+            let (header, store_address) = lineage_header_from_snapshot(&resolved, &snapshot)?;
+            let session = session_from_lineage_snapshot(header.meta.clone(), snapshot)?;
+            Ok(SessionStoreResume {
+                header,
+                user_turn_count,
+                session,
+                store_address,
+                head,
+                transcript_record_tail,
+            })
+        })
         .map_err(|error| {
             crate::session_store::store_error(
-                "read lineage transcript tail",
+                "read lineage resume snapshot",
                 &resolved.sessions_root,
                 error,
             )
-        })?;
-    let head = snapshot.head;
-    let (header, store_address) = lineage_header_from_snapshot(&resolved, &snapshot)?;
-    let session = session_from_store_state(
-        header.meta.clone(),
-        session_side_table_state_from_store(snapshot.side_tables)?,
-        &snapshot.metadata,
-    );
-    Ok(SessionStoreResume {
-        header,
-        session,
-        store_address,
-        head,
-        transcript_record_tail,
-    })
+        })?
 }
 
 pub fn load_store_header(id_or_prefix: &str) -> Option<(SessionHeader, SessionStoreAddress)> {
@@ -2275,29 +2281,25 @@ fn session_from_store_state(
         context_snapshots,
         session_cost_usd,
         session_usage,
+        archive_owner: archives::ArchiveOwner::default(),
     }
 }
 
-fn session_from_full_store(
-    expected_session_id: &str,
-    text_bytes: u64,
-    snapshot: smelt_store::FullSession,
+fn session_from_lineage_snapshot(
+    meta: SessionMeta,
+    snapshot: smelt_store::LineageSessionState,
 ) -> SessionStoreResult<Session> {
-    let smelt_store::FullSession {
-        session: stored,
-        history,
-        turn_metas,
-        metadata_snapshots,
-        context_snapshots,
-        transcript_records: _,
-    } = snapshot;
-    let metadata = stored.metadata.clone();
-    let meta =
-        session_meta_from_stored_session(expected_session_id, stored, text_bytes, history.len())?;
-    let side_tables =
-        session_side_table_state_from_values(turn_metas, metadata_snapshots, context_snapshots)?;
-    let mut session = session_from_store_state(meta, side_tables, &metadata);
-    session.history = history;
+    let base = smelt_store::SessionArchiveBase {
+        lineage_id: snapshot.lineage_id,
+        revision_id: snapshot.revision_id,
+        branch_sequence: snapshot.head.revision,
+    };
+    let mut session = session_from_store_state(
+        meta,
+        session_side_table_state_from_store(snapshot.side_tables)?,
+        &snapshot.metadata,
+    );
+    session.bind_loaded_archives(base, &snapshot.metadata);
     Ok(session)
 }
 
@@ -2550,6 +2552,34 @@ impl SessionStorage {
         if let Ok(catalog) = self.catalog() {
             catalog.publish_commit(command, receipt);
         }
+    }
+
+    /// Publish a verified native result without rebuilding archived metadata.
+    pub fn publish_archive_save_catalog(
+        &self,
+        writer: &smelt_store::OwnedLineageWriter,
+        prepared: &PreparedArchiveSave,
+        result: &smelt_store::SessionCommitResult,
+    ) -> Result<(), smelt_store::StoreError> {
+        let sessions_root = self.sessions_dir();
+        if writer.sessions_root() != sessions_root {
+            return Err(smelt_store::StoreError::Integrity(
+                "catalog writer belongs to another storage root".into(),
+            ));
+        }
+        let message = prepared.catalog_message(result)?;
+        let (snapshot, pending_token) = {
+            let _lock =
+                smelt_store::CatalogMarkerLock::acquire(&sessions_root, writer.session_id())?;
+            let snapshot = writer.catalog_session_for_result(result, message)?;
+            let pending_token =
+                smelt_store::catalog_session_pending_token(&sessions_root, writer.session_id())?;
+            (snapshot, pending_token)
+        };
+        if let Ok(catalog) = self.catalog() {
+            catalog.publish_native(snapshot, pending_token);
+        }
+        Ok(())
     }
 
     pub fn publish_session_catalog_snapshot(
@@ -2852,7 +2882,7 @@ fn session_meta_from_stored_session(
         id: identity.id,
         title: metadata.title,
         slug: metadata.slug,
-        first_user_message: metadata.first_user_message,
+        first_user_message: metadata.first_user_message.map(Into::into),
         created_at_ms,
         updated_at_ms,
         mode: metadata.mode,
@@ -3124,7 +3154,7 @@ mod tests {
     fn checkpoint(summary: &str, first_live_index: usize) -> ContextCheckpoint {
         ContextCheckpoint {
             kind: "compaction".to_string(),
-            summary: summary.to_string(),
+            summary: summary.into(),
             first_live_index,
             created_at_ms: 0,
             tokens_before: None,
@@ -3140,6 +3170,49 @@ mod tests {
             model: Some("test-model".into()),
             api_base: Some("https://test.example".into()),
             provider_type: Some("test-provider".into()),
+        }
+    }
+
+    #[test]
+    fn metadata_snapshots_and_forks_share_unchanged_message_bytes() {
+        for bytes in [32_768, 1_048_576] {
+            let mut session = fixture_session();
+            session.history.push(user_item("synthetic"));
+            session.first_user_message = Some("m".repeat(bytes).into());
+            session.snapshot_metadata_at(1);
+            let body = session.first_user_message.as_deref().unwrap();
+            let snapshot = &session.metadata_snapshots.last().unwrap().1;
+            assert_eq!(snapshot.first_user_message.as_deref(), Some(body));
+            assert_eq!(
+                snapshot.first_user_message.as_ref().unwrap().as_ptr(),
+                body.as_ptr()
+            );
+            let fork = session.fork_store_backed(4242);
+            assert_eq!(
+                fork.first_user_message.as_ref().unwrap().as_ptr(),
+                body.as_ptr()
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_install_and_header_clones_share_unchanged_summary_bytes() {
+        for bytes in [32_768, 1_048_576] {
+            let mut session = fixture_session();
+            session.history.push(user_item("synthetic"));
+            assert!(session.install_context_checkpoint_at_history_index(
+                "compaction".into(),
+                "s".repeat(bytes),
+                1,
+                None,
+                1,
+            ));
+            let checkpoint = session.checkpoint.as_ref().unwrap();
+            let event = session.checkpoint_events.last().unwrap();
+            assert_eq!(checkpoint.summary.as_ptr(), event.summary.as_ptr());
+            let cloned = checkpoint.clone();
+            assert_eq!(cloned.summary.as_ptr(), checkpoint.summary.as_ptr());
+            assert_eq!(cloned, *checkpoint);
         }
     }
 
@@ -3198,6 +3271,51 @@ mod tests {
         assert_eq!(resumed.session_usage.prompt_tokens, Some(30));
         assert_eq!(resumed.session_usage.completion_tokens, Some(10));
         assert_eq!(resumed.context_snapshots.len(), 1);
+    }
+
+    #[test]
+    fn resume_user_count_and_header_share_a_snapshot_during_concurrent_publication() {
+        let state = tempfile::tempdir().unwrap();
+        let storage = SessionStorage::new(state.path().to_path_buf());
+        let mut session = Session::new(1, std::path::PathBuf::from("/tmp"));
+        session.title = Some("original".into());
+        session.history = vec![user_item("original request")];
+        storage.save_result(&session).unwrap();
+        let writer =
+            smelt_store::OwnedLineageWriter::open_existing(storage.sessions_dir(), &session.id)
+                .unwrap();
+        let expected = writer.store_head().unwrap();
+        session.title = Some("replacement".into());
+        session.history = vec![
+            HistoryItem::system("system one"),
+            HistoryItem::system("system two"),
+        ];
+        let mut command = initial_store_commit_from_session(&session).unwrap();
+        command.expected = expected;
+        let writer = std::cell::RefCell::new(writer);
+        let published = std::cell::Cell::new(false);
+        let resumed = storage
+            .load_store_resume_cancellable(&session.id, 80, 24, &|| {
+                if !published.replace(true) {
+                    writer.borrow_mut().commit_session(&command).unwrap();
+                }
+                false
+            })
+            .unwrap()
+            .unwrap();
+        assert!(published.get());
+        assert_eq!(resumed.header.history_len, 1);
+        assert_eq!(resumed.header.meta.title.as_deref(), Some("original"));
+        assert_eq!(resumed.user_turn_count, 1);
+        assert_eq!(resumed.head, expected);
+        let fresh = storage
+            .load_store_resume_result(&session.id, 80, 24)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.header.history_len, 2);
+        assert_eq!(fresh.header.meta.title.as_deref(), Some("replacement"));
+        assert_eq!(fresh.user_turn_count, 0);
+        assert!(fresh.head.revision > expected.revision);
     }
 
     #[test]
@@ -3828,18 +3946,18 @@ mod tests {
             boundary_update
                 .checkpoint
                 .as_ref()
-                .map(|checkpoint| checkpoint.summary.as_str()),
+                .map(|checkpoint| checkpoint.summary.as_ref()),
             Some("second summary")
         );
 
         s.restore_rewindable_snapshots_after_rewind(4, false);
 
         assert_eq!(s.checkpoint_events.len(), 1);
-        assert_eq!(s.checkpoint_events[0].summary, "first summary");
+        assert_eq!(s.checkpoint_events[0].summary.as_ref(), "first summary");
         assert_eq!(
             s.checkpoint
                 .as_ref()
-                .map(|checkpoint| checkpoint.summary.as_str()),
+                .map(|checkpoint| checkpoint.summary.as_ref()),
             Some("first summary")
         );
 
@@ -3899,7 +4017,7 @@ mod tests {
         s.context_tokens_history_len = Some(4);
         s.checkpoint = Some(ContextCheckpoint {
             kind: "compaction".to_string(),
-            summary: "summary".to_string(),
+            summary: "summary".into(),
             first_live_index: 2,
             created_at_ms: 0,
             tokens_before: Some(100),
@@ -3927,7 +4045,7 @@ mod tests {
         ];
         s.checkpoint = Some(ContextCheckpoint {
             kind: "compaction".to_string(),
-            summary: "summary".to_string(),
+            summary: "summary".into(),
             first_live_index: 2,
             created_at_ms: 0,
             tokens_before: None,
@@ -4023,6 +4141,38 @@ mod tests {
     }
 
     #[test]
+    fn session_forks_and_table_replacement_reject_parent_snapshot_acknowledgements() {
+        let mut session = fixture_session();
+        session.history.push(user_item("q1"));
+        session.history.push(assistant_text_item("a1"));
+        session.title = Some("parent".into());
+        session.snapshot_metadata_at(2);
+        let prepared = session.metadata_snapshots.changed_suffix().unwrap().version;
+
+        for mut fork in [session.fork(4242), session.fork_store_backed(4242)] {
+            assert_eq!(fork.metadata_snapshots, session.metadata_snapshots);
+            assert!(!fork.metadata_snapshots.acknowledge(prepared));
+            assert!(fork.metadata_snapshots.changed_suffix().is_some());
+            assert!(fork
+                .metadata_snapshots
+                .acknowledge(fork.metadata_snapshots.version()));
+            assert!(session.metadata_snapshots.changed_suffix().is_some());
+        }
+
+        let replacement = SessionMetadataSnapshot {
+            title: Some("replacement".into()),
+            slug: None,
+            first_user_message: None,
+        };
+        session.metadata_snapshots = vec![(2, replacement.clone())].into();
+        assert!(!session.metadata_snapshots.acknowledge(prepared));
+        assert_eq!(
+            session.metadata_snapshots.changed_suffix().unwrap().records,
+            &[(2, replacement)],
+        );
+    }
+
+    #[test]
     fn store_backed_fork_preserves_metadata_without_cloning_history() {
         let mut s = fixture_session();
         s.history.push(user_item("q1"));
@@ -4088,7 +4238,7 @@ mod tests {
             display_context_tokens: None,
             history_len: None,
             checkpoint: None,
-            checkpoint_events: Vec::new(),
+            checkpoint_events: CheckpointEvents::default(),
             text_bytes: None,
         };
         assert_eq!(session_updated_at(&m), 200);

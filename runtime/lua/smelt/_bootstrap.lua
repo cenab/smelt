@@ -480,19 +480,13 @@ if smelt.engine and smelt.lifecycle then
       for k, v in pairs(spec) do
         if k ~= "guard" then wrapped[k] = v end
       end
-      local on_response = spec.on_response
-      if type(on_response) == "function" then
-        wrapped.on_response = function(...)
-          if guard:alive() then
-            return on_response(...)
-          end
-        end
-      end
-      local on_delta = spec.on_delta
-      if type(on_delta) == "function" then
-        wrapped.on_delta = function(...)
-          if guard:alive() then
-            return on_delta(...)
+      for _, name in ipairs({ "on_response", "on_delta", "on_draft_rejected" }) do
+        local callback = spec[name]
+        if type(callback) == "function" then
+          wrapped[name] = function(...)
+            if guard:alive() then
+              return callback(...)
+            end
           end
         end
       end
@@ -529,6 +523,55 @@ local function external_or_err(start)
   local result = smelt.task.external(start)
   if result.err ~= nil then return nil, result.err end
   return result, nil
+end
+
+if smelt.session then
+  --- Read a bounded page of rewindable user turns off the UI thread, newest
+  --- page first and each page in chronological order. Uses the transcript
+  --- index without decoding assistant output. Returns `{ turns, next_before? }`;
+  --- pass `next_before` to read older turns. Must run in a yieldable task.
+  ---@tier ui_host
+  ---@type fun(before?: integer): table
+  function smelt.session.turns_page(before)
+    local request = internal.session.__prepare_turns_page(before)
+    if type(request) == "table" then return request end
+    local result = smelt.task.external(function(id) internal.session.__start_turns_page(id, request) end)
+    if result.err then error(result.err, 2) end
+    return result.page
+  end
+
+  --- Create or open a managed git worktree off the UI thread, then request a
+  --- coherent cwd transition. Must run in `smelt.spawn`, a command, or a tool.
+  --- `opts.name` is required and is normalized to a safe folder/branch name;
+  --- `opts.base` defaults to main, master, or HEAD. New worktrees use
+  --- `smelt.settings.worktree_root`, inside the repository for relative roots
+  --- or in a per-repository bucket for absolute roots. Returns
+  --- `{ name, branch, path, base, created, pending }`. The cwd, Lua project
+  --- config, prompt inputs, permissions, and watcher roots commit together.
+  --- Sequential tool results wait for the commit; concurrent cwd-changing
+  --- model tools are rejected. Other callers commit at an idle safe point.
+  ---@tier ui_host
+  ---@type fun(opts: { name: string, base?: string }): table
+  function smelt.session.enter_worktree(opts)
+    local name = tostring(opts and opts.name or ""):match("^%s*(.-)%s*$")
+    if name == "" then error("name is required", 2) end
+    local result = smelt.task.external(function(id)
+      internal.session.__start_enter_worktree(id, name, opts and opts.base)
+    end)
+    if result.err then error(result.err, 2) end
+    result.pending = smelt.session.switch_cwd(result.path).pending
+    return result
+  end
+
+  --- List managed worktrees off the UI thread. Must run in `smelt.spawn`, a
+  --- command, or a tool. Returns sorted `{ name, branch, path, base, current }` rows.
+  ---@tier ui_host
+  ---@type fun(): table
+  function smelt.session.worktrees()
+    local result = smelt.task.external(function(id) internal.session.__start_worktrees(id) end)
+    if result.err then error(result.err, 2) end
+    return result.worktrees
+  end
 end
 
 -- Read `path` off the main thread. Must be called from inside
@@ -601,10 +644,11 @@ if smelt.notebook then
 
   -- Apply a notebook edit off the main thread. Same return shape as
   -- `smelt.notebook.apply_edit`.
-  ---@type fun(args: table): table?, string?
-  function smelt.notebook.apply_edit_async(args)
+  -- `expected_mtime_ms` rejects writes if the notebook changed after preparation.
+  ---@type fun(args: table, expected_mtime_ms?: integer): table?, string?
+  function smelt.notebook.apply_edit_async(args, expected_mtime_ms)
     local result = smelt.task.external(function(id)
-      internal.notebook.__start_apply_edit(id, args or {})
+      internal.notebook.__start_apply_edit(id, args or {}, expected_mtime_ms)
     end)
     if result.err ~= nil then return nil, result.err end
     return { message = result.message, metadata = result.metadata }, nil

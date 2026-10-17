@@ -364,6 +364,12 @@ pub enum EngineEvent {
         content: String,
     },
 
+    /// Accept the current main-response draft after provider validation.
+    ResponseDraftAccepted,
+
+    /// Discard the current provider attempt's speculative text, reasoning, and tools.
+    ResponseDraftRejected,
+
     /// Streamed assistant text (may arrive in chunks).
     Text { content: String },
 
@@ -394,11 +400,10 @@ pub enum EngineEvent {
         arguments: String,
     },
 
-    /// A queued user message was consumed by the engine.
+    /// Queued inputs were consumed and committed to canonical history.
     Steered {
-        text: String,
-        count: usize,
-        sent_at_ms: u64,
+        turn_id: u64,
+        delta: CanonicalHistoryDelta,
     },
 
     /// A tool call has started.
@@ -476,6 +481,9 @@ pub enum EngineEvent {
     /// The final `EngineAskResponse` still carries the full assistant message.
     EngineAskDelta { id: u64, delta: String },
 
+    /// Discard only this auxiliary request's current streamed draft.
+    EngineAskDraftRejected { id: u64 },
+
     /// Response to a `UiCommand::EngineAsk` request. On success
     /// `error` is `None` and `message` is the assistant reply in the
     /// normal `protocol::Message` shape. On failure `error` carries a
@@ -511,6 +519,14 @@ pub enum EngineEvent {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         history: Option<CanonicalHistoryDelta>,
         meta: Option<TurnMeta>,
+    },
+
+    /// Request preparation failed before the provider started.
+    TurnPreparationError {
+        turn_id: u64,
+        session_id: String,
+        persistence: PersistenceScope,
+        message: String,
     },
 
     /// The agent turn ended with an error.

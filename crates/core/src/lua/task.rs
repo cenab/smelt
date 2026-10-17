@@ -32,7 +32,17 @@ pub struct ToolInvocationContext {
     pub execution_mode: protocol::ToolExecutionMode,
 }
 
+#[derive(Debug, Clone)]
+pub struct ToolEvaluationRequest {
+    pub request_id: u64,
+    pub invocation_id: protocol::InvocationId,
+    pub tool_name: String,
+    pub args: std::collections::HashMap<String, serde_json::Value>,
+    pub mode: protocol::AgentMode,
+}
+
 pub enum TaskCompletion {
+    ToolEvaluation(Box<ToolEvaluationRequest>),
     FireAndForget,
     /// Slash-command dispatch. `name` carries the cmd name so an error
     /// surfaces as `cmd `<name>`: …` instead of the opaque `task <id>: …`.
@@ -96,6 +106,10 @@ pub(crate) struct LuaTask {
 
 #[derive(Debug)]
 pub enum TaskDriveOutput {
+    ToolEvaluated {
+        request: Box<ToolEvaluationRequest>,
+        result: Result<mlua::Table, String>,
+    },
     ToolComplete {
         invocation: ToolInvocationContext,
         call_id: String,
@@ -128,6 +142,11 @@ pub struct ToolEnv<'a> {
     pub artifact_dir: &'a std::path::Path,
 }
 
+struct ScheduledTask {
+    task: LuaTask,
+    ready_key: Option<u64>,
+}
+
 /// Single-threaded task runtime; all methods must run on the Lua owner thread.
 ///
 /// **Invariant**: the `LuaShared::tasks` mutex guarding this struct must never
@@ -138,14 +157,22 @@ pub struct ToolEnv<'a> {
 /// task out via `take_next_ready`, dropping the lock for the duration of
 /// `step_task_owned`, then reacquiring to `put_back` the parked task.
 pub struct LuaTaskRuntime {
-    tasks: Vec<LuaTask>,
+    tasks: std::collections::BTreeMap<u64, ScheduledTask>,
+    ready: std::collections::BTreeMap<u64, u64>,
+    wakeups: std::collections::BTreeSet<(Instant, u64)>,
+    external: std::collections::BTreeSet<(u64, u64)>,
+    next_ready_key: u64,
     next_task_id: AtomicU64,
 }
 
 impl LuaTaskRuntime {
     pub fn new() -> Self {
         Self {
-            tasks: Vec::new(),
+            tasks: Default::default(),
+            ready: Default::default(),
+            wakeups: Default::default(),
+            external: Default::default(),
+            next_ready_key: 0,
             next_task_id: AtomicU64::new(1),
         }
     }
@@ -178,7 +205,7 @@ impl LuaTaskRuntime {
     ) -> LuaResult<u64> {
         let thread = lua.create_thread(func)?;
         let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
-        self.tasks.push(LuaTask {
+        self.put_back(LuaTask {
             id,
             thread,
             wait: TaskWait::Ready(initial_args),
@@ -192,15 +219,20 @@ impl LuaTaskRuntime {
 
     /// Resolve a `TaskWait::External(id)` wait; returns `true` if found.
     pub fn resolve_external(&mut self, external_id: u64, value: LuaValue) -> bool {
-        for task in &mut self.tasks {
-            if matches!(&task.wait, TaskWait::External { id, .. } if *id == external_id) {
-                let mut mv = LuaMultiValue::new();
-                mv.push_back(value);
-                task.wait = TaskWait::Ready(mv);
-                return true;
-            }
-        }
-        false
+        let Some((_, id)) = self
+            .external
+            .range((external_id, 0)..=(external_id, u64::MAX))
+            .next()
+            .copied()
+        else {
+            return false;
+        };
+        let mut task = self.take_task(id).expect("indexed external task");
+        let mut args = LuaMultiValue::new();
+        args.push_back(value);
+        task.wait = TaskWait::Ready(args);
+        self.put_back(task);
+        true
     }
 
     /// Cancel a single task by id. Returns `true` if the task was found.
@@ -208,19 +240,17 @@ impl LuaTaskRuntime {
     /// next `drive()` step delivers the marker to the coroutine so user
     /// code in `smelt.sleep` / `task.wait` raises `cancelled` and unwinds.
     pub fn cancel_task(&mut self, lua: &Lua, id: u64) -> bool {
-        let marker = cancelled_marker(lua);
-        for task in &mut self.tasks {
-            if task.id == id {
-                task.cancel.cancel();
-                if matches!(&task.wait, TaskWait::Sleep(_) | TaskWait::External { .. }) {
-                    let mut mv = LuaMultiValue::new();
-                    mv.push_back(marker);
-                    task.wait = TaskWait::Ready(mv);
-                }
-                return true;
-            }
+        let Some(mut task) = self.take_task(id) else {
+            return false;
+        };
+        task.cancel.cancel();
+        if matches!(&task.wait, TaskWait::Sleep(_) | TaskWait::External { .. }) {
+            let mut args = LuaMultiValue::new();
+            args.push_back(cancelled_marker(lua));
+            task.wait = TaskWait::Ready(args);
         }
-        false
+        self.put_back(task);
+        true
     }
 
     pub fn cancel_scope(&mut self, lua: &Lua, scope: TaskScope) {
@@ -232,20 +262,14 @@ impl LuaTaskRuntime {
     }
 
     fn cancel_matching(&mut self, lua: &Lua, mut matches: impl FnMut(&LuaTask) -> bool) {
-        let marker = cancelled_marker(lua);
-        for task in &mut self.tasks {
-            if !matches(task) {
-                continue;
-            }
-            task.cancel.cancel();
-            match &task.wait {
-                TaskWait::Sleep(_) | TaskWait::External { .. } => {
-                    let mut mv = LuaMultiValue::new();
-                    mv.push_back(marker.clone());
-                    task.wait = TaskWait::Ready(mv);
-                }
-                TaskWait::Ready(_) => {}
-            }
+        let ids: Vec<_> = self
+            .tasks
+            .values()
+            .filter(|entry| matches(&entry.task))
+            .map(|entry| entry.task.id)
+            .collect();
+        for id in ids {
+            self.cancel_task(lua, id);
         }
     }
 
@@ -254,10 +278,13 @@ impl LuaTaskRuntime {
     /// letting tasks resume on the next `drive()` would invoke stale
     /// closures.
     pub fn cancel_and_clear(&mut self) {
-        for task in &mut self.tasks {
-            task.cancel.cancel();
+        for entry in self.tasks.values() {
+            entry.task.cancel.cancel();
         }
         self.tasks.clear();
+        self.ready.clear();
+        self.wakeups.clear();
+        self.external.clear();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -269,10 +296,11 @@ impl LuaTaskRuntime {
     }
 
     pub(crate) fn next_wakeup(&self, now: Instant) -> Option<Instant> {
-        self.tasks
-            .iter()
-            .filter_map(|task| task.next_wakeup(now))
-            .min()
+        if self.ready.is_empty() {
+            self.wakeups.first().map(|(at, _)| (*at).max(now))
+        } else {
+            Some(now)
+        }
     }
 
     /// Pop a ready task out of the runtime, returning it by value. `drive_tasks`
@@ -280,28 +308,73 @@ impl LuaTaskRuntime {
     /// that re-enters the runtime (e.g. `smelt.spawn` from inside a coroutine)
     /// can acquire the lock synchronously instead of deadlocking.
     pub(crate) fn take_next_ready(&mut self, now: Instant) -> Option<LuaTask> {
-        let idx = self.tasks.iter().position(|t| t.ready_at(now))?;
-        self.tasks[idx].resume_deadline_if_paused(now);
-        Some(self.tasks.swap_remove(idx))
+        // Promote at most one timer per work unit. A timer burst must not bypass
+        // the pump budget or starve tasks already waiting in the ready FIFO.
+        if let Some((at, id)) = self.wakeups.first().copied().filter(|(at, _)| *at <= now) {
+            self.wakeups.remove(&(at, id));
+            let key = self.next_ready_key;
+            let entry = self.tasks.get_mut(&id).expect("indexed timer task");
+            if entry.ready_key.is_none() {
+                entry.ready_key = Some(key);
+                self.ready.insert(key, id);
+                self.next_ready_key = key.checked_add(1).expect("ready queue sequence overflow");
+            }
+        }
+        let (_, id) = self.ready.first_key_value()?;
+        let mut task = self.take_task(*id).expect("indexed ready task");
+        task.resume_deadline_if_paused(now);
+        Some(task)
     }
 
     pub(crate) fn take_task(&mut self, id: u64) -> Option<LuaTask> {
-        let idx = self.tasks.iter().position(|t| t.id == id)?;
-        Some(self.tasks.swap_remove(idx))
+        let entry = self.tasks.remove(&id)?;
+        if let Some(key) = entry.ready_key {
+            self.ready.remove(&key);
+        }
+        if let Some(at) = entry.task.next_timer() {
+            self.wakeups.remove(&(at, id));
+        }
+        if let TaskWait::External { id: external_id } = entry.task.wait {
+            self.external.remove(&(external_id, id));
+        }
+        Some(entry.task)
     }
 
     pub(crate) fn put_back(&mut self, task: LuaTask) {
-        self.tasks.push(task);
+        let id = task.id;
+        let ready_key = if matches!(task.wait, TaskWait::Ready(_)) {
+            let key = self.next_ready_key;
+            self.next_ready_key = key.checked_add(1).expect("ready queue sequence overflow");
+            self.ready.insert(key, id);
+            Some(key)
+        } else {
+            None
+        };
+        if let Some(at) = task.next_timer() {
+            self.wakeups.insert((at, id));
+        }
+        if let TaskWait::External { id: external_id } = task.wait {
+            self.external.insert((external_id, id));
+        }
+        assert!(
+            self.tasks
+                .insert(id, ScheduledTask { task, ready_key })
+                .is_none(),
+            "task scheduled twice"
+        );
     }
 
-    /// Drive every ready task once. Used by tests; production callers use
+    /// Drive a bounded batch of ready tasks. Used by tests; production callers use
     /// `take_next_ready` + `step_task_owned` + `put_back` so the lock can be
     /// dropped during the resume.
     pub fn drive(&mut self, lua: &Lua, now: Instant) -> Vec<TaskDriveOutput> {
         let mut outputs = Vec::new();
-        while let Some(task) = self.take_next_ready(now) {
+        for _ in 0..super::MAX_LUA_WORK_PER_PUMP {
+            let Some(task) = self.take_next_ready(now) else {
+                break;
+            };
             if let Some(parked) = step_task_owned(lua, task, now, &mut outputs) {
-                self.tasks.push(parked);
+                self.put_back(parked);
             }
         }
         outputs
@@ -314,19 +387,7 @@ impl LuaTask {
             .is_some_and(|deadline| deadline.paused_at.is_none() && deadline.at <= now)
     }
 
-    fn ready_at(&self, now: Instant) -> bool {
-        self.timed_out(now)
-            || match &self.wait {
-                TaskWait::Ready(_) => true,
-                TaskWait::Sleep(deadline) => self.cancel.is_cancelled() || *deadline <= now,
-                TaskWait::External { .. } => false,
-            }
-    }
-
-    fn next_wakeup(&self, now: Instant) -> Option<Instant> {
-        if self.ready_at(now) {
-            return Some(now);
-        }
+    fn next_timer(&self) -> Option<Instant> {
         let wait_at = match &self.wait {
             TaskWait::Sleep(deadline) => Some(*deadline),
             TaskWait::Ready(_) | TaskWait::External { .. } => None,
@@ -402,6 +463,16 @@ pub(crate) fn step_task_owned(
             if task.thread.is_finished() {
                 match &task.completion {
                     TaskCompletion::FireAndForget | TaskCompletion::Command { .. } => {}
+                    TaskCompletion::ToolEvaluation(request) => {
+                        let result = match v {
+                            LuaValue::Table(table) => Ok(table),
+                            _ => Err("tool evaluation must return a table".into()),
+                        };
+                        outputs.push(TaskDriveOutput::ToolEvaluated {
+                            request: request.clone(),
+                            result,
+                        });
+                    }
                     TaskCompletion::ToolResult {
                         invocation,
                         call_id,
@@ -577,6 +648,12 @@ fn is_cancelled_lua_error(err: &mlua::Error) -> bool {
 }
 
 fn fail_completion(completion: &TaskCompletion, msg: &str, outputs: &mut Vec<TaskDriveOutput>) {
+    if let TaskCompletion::ToolEvaluation(request) = completion {
+        outputs.push(TaskDriveOutput::ToolEvaluated {
+            request: request.clone(),
+            result: Err(msg.into()),
+        });
+    }
     if let TaskCompletion::ToolResult {
         invocation,
         call_id,
@@ -697,6 +774,84 @@ mod tests {
     }
 
     #[test]
+    fn parked_tasks_have_no_ready_scan_and_external_resolution_uses_its_index() {
+        let lua = lua_with_sleep();
+        let mut rt = LuaTaskRuntime::new();
+        let func: mlua::Function = lua
+            .load("function(id) coroutine.yield({__yield = 'external', id = id}) end")
+            .eval()
+            .unwrap();
+        let now = Instant::now();
+        let mut last = 0;
+        for id in 1..=8_192 {
+            last = rt
+                .spawn(
+                    &lua,
+                    func.clone(),
+                    LuaMultiValue::from_vec(vec![LuaValue::Integer(id)]),
+                    TaskCompletion::FireAndForget,
+                )
+                .unwrap();
+        }
+        while !rt.ready.is_empty() {
+            assert!(rt.drive(&lua, now).is_empty());
+        }
+        assert_eq!(rt.external.len(), 8_192);
+        assert!(rt.wakeups.is_empty());
+        assert_eq!(rt.next_wakeup(now), None);
+        assert!(rt.resolve_external(8_192, LuaValue::Nil));
+        assert_eq!(rt.ready.len(), 1);
+        let task = rt.take_next_ready(now).unwrap();
+        assert_eq!(task.id, last);
+        assert_eq!(rt.external.len(), 8_191);
+        assert_eq!(rt.next_wakeup(now), None);
+        assert!(step_task_owned(&lua, task, now, &mut Vec::new()).is_none());
+        rt.cancel_and_clear();
+        assert!(rt.ready.is_empty() && rt.external.is_empty() && rt.wakeups.is_empty());
+    }
+
+    #[test]
+    fn timer_bursts_promote_one_task_per_step_and_preserve_fifo_fairness() {
+        let lua = lua_with_sleep();
+        let mut rt = LuaTaskRuntime::new();
+        let func: mlua::Function = lua.load("function() smelt.sleep(10) end").eval().unwrap();
+        let now = Instant::now();
+        for _ in 0..512 {
+            rt.spawn(
+                &lua,
+                func.clone(),
+                LuaMultiValue::new(),
+                TaskCompletion::FireAndForget,
+            )
+            .unwrap();
+        }
+        while !rt.ready.is_empty() {
+            rt.drive(&lua, now);
+        }
+        assert_eq!(rt.wakeups.len(), 512);
+        let ready = rt
+            .spawn(
+                &lua,
+                lua.load("function() end").eval().unwrap(),
+                LuaMultiValue::new(),
+                TaskCompletion::FireAndForget,
+            )
+            .unwrap();
+        let later = now + Duration::from_millis(20);
+        let task = rt.take_next_ready(later).unwrap();
+        assert_eq!(task.id, ready);
+        assert_eq!(rt.wakeups.len(), 511);
+        assert_eq!(rt.ready.len(), 1);
+        rt.drive(&lua, later);
+        assert_eq!(rt.len(), 256);
+        assert_eq!(rt.wakeups.len(), 255);
+        assert_eq!(rt.ready.len(), 1);
+        rt.drive(&lua, later);
+        assert!(rt.is_empty());
+        assert!(rt.wakeups.is_empty() && rt.ready.is_empty() && rt.external.is_empty());
+    }
+
+    #[test]
     fn fire_and_forget_returns_immediately() {
         let lua = lua_with_sleep();
         let mut rt = LuaTaskRuntime::new();
@@ -743,7 +898,10 @@ mod tests {
 
         assert!(rt.drive(&lua, t0).is_empty());
         assert_eq!(rt.tasks.len(), 1);
-        assert!(matches!(rt.tasks[0].wait, TaskWait::External { id: 7, .. }));
+        assert!(matches!(
+            rt.tasks.first_key_value().unwrap().1.task.wait,
+            TaskWait::External { id: 7, .. }
+        ));
 
         let out = rt.drive(&lua, t0 + Duration::from_millis(101));
         assert!(
@@ -820,7 +978,12 @@ mod tests {
 
         assert!(rt.drive(&lua, t0).is_empty());
         assert_eq!(rt.tasks.len(), 1);
-        assert!(rt.tasks[0]
+        assert!(rt
+            .tasks
+            .first_key_value()
+            .unwrap()
+            .1
+            .task
             .deadline
             .is_some_and(|deadline| deadline.paused_at == Some(t0)));
 
@@ -859,7 +1022,10 @@ mod tests {
         let out = rt.drive(&lua, t0);
         assert!(out.is_empty());
         assert_eq!(rt.tasks.len(), 1);
-        assert!(matches!(rt.tasks[0].wait, TaskWait::Sleep(_)));
+        assert!(matches!(
+            rt.tasks.first_key_value().unwrap().1.task.wait,
+            TaskWait::Sleep(_)
+        ));
 
         // Second drive before deadline - still parked.
         let out = rt.drive(&lua, t0 + Duration::from_millis(50));
@@ -1034,7 +1200,7 @@ mod tests {
                     display_content,
                     ..
                 } => Some((content, is_error, metadata, display_content)),
-                TaskDriveOutput::NotifyError(_) => None,
+                TaskDriveOutput::NotifyError(_) | TaskDriveOutput::ToolEvaluated { .. } => None,
             })
             .unwrap();
         assert!(*completion.1);
@@ -1216,11 +1382,17 @@ mod tests {
         let out = rt.drive(&lua, Instant::now());
         assert!(out.is_empty());
         assert_eq!(rt.tasks.len(), 1);
-        assert!(matches!(rt.tasks[0].wait, TaskWait::Sleep(_)));
+        assert!(matches!(
+            rt.tasks.first_key_value().unwrap().1.task.wait,
+            TaskWait::Sleep(_)
+        ));
 
         // Cancel all tasks.
         rt.cancel_all(&lua);
-        assert!(matches!(rt.tasks[0].wait, TaskWait::Ready(_)));
+        assert!(matches!(
+            rt.tasks.first_key_value().unwrap().1.task.wait,
+            TaskWait::Ready(_)
+        ));
 
         // Next drive resumes with cancel marker and finishes.
         let out = rt.drive(&lua, Instant::now());
@@ -1254,13 +1426,16 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(rt.tasks.len(), 1);
         assert!(matches!(
-            rt.tasks[0].wait,
+            rt.tasks.first_key_value().unwrap().1.task.wait,
             TaskWait::External { id: 42, .. }
         ));
 
         // Cancel all tasks.
         rt.cancel_all(&lua);
-        assert!(matches!(rt.tasks[0].wait, TaskWait::Ready(_)));
+        assert!(matches!(
+            rt.tasks.first_key_value().unwrap().1.task.wait,
+            TaskWait::Ready(_)
+        ));
 
         // Next drive resumes with cancel marker and finishes.
         let out = rt.drive(&lua, Instant::now());
@@ -1340,7 +1515,10 @@ mod tests {
         rt.cancel_scope(&lua, TaskScope::Turn);
         assert!(rt.drive(&lua, now).is_empty());
         assert_eq!(rt.tasks.len(), 1);
-        assert_eq!(rt.tasks[0].scope, TaskScope::App);
+        assert_eq!(
+            rt.tasks.first_key_value().unwrap().1.task.scope,
+            TaskScope::App
+        );
     }
 
     #[test]

@@ -193,14 +193,19 @@ fn apply(app: &mut TestApp, model: &mut Model, op: Op) {
                     delta: "partial".to_string(),
                 },
             );
+            let items = vec![
+                HistoryItem::user(Content::text(small_text(text)))
+                    .with_sent_at_ms(1_742_567_823_000);
+                usize::from(count).min(MAX_HISTORY_ITEMS)
+            ];
             feed(
                 app,
                 EngineEvent::Steered {
-                    text: small_text(text),
-                    count: usize::from(count),
-                    sent_at_ms: 1_742_567_823_000,
+                    turn_id: model.active_turn.expect("active turn"),
+                    delta: CanonicalHistoryDelta::new(model.history.len(), items.clone()),
                 },
             );
+            model.history.extend(items);
             let streaming = app.streaming_state();
             assert!(!streaming.text && !streaming.thinking);
         }

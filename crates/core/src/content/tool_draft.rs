@@ -122,6 +122,12 @@ impl ToolArguments {
         self.string_fields.iter().map(|field| &field.content)
     }
 
+    pub(crate) fn contents_mut(&mut self) -> impl Iterator<Item = &mut TranscriptContent> {
+        self.string_fields
+            .iter_mut()
+            .map(|field| &mut field.content)
+    }
+
     pub fn content_hash(&self) -> u64 {
         let mut fields = self
             .string_fields

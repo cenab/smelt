@@ -30,6 +30,7 @@ pub(crate) mod session_document;
 pub(crate) mod session_load;
 pub(crate) mod session_preview;
 pub(crate) mod shell_panel;
+pub(crate) mod stream_animation;
 #[cfg(any(test, feature = "harness"))]
 pub mod test_harness;
 pub(crate) mod transcript;
@@ -318,7 +319,6 @@ pub struct TuiApp {
     pub(crate) task_label: Option<String>,
     pub(crate) pending_quit: bool,
     pub(crate) pending_session_save: bool,
-    pending_turn_dispatch: Option<crate::app::agent::PendingTurnDispatch>,
     pub(crate) paint_registry: crate::lua::paint::PaintRegistry,
     pub(crate) working: smelt_core::working::WorkingState,
     host_work: host_dispatch::HostWorkState,
@@ -331,11 +331,15 @@ pub struct TuiApp {
         Option<crate::app::transcript_hydration::TranscriptHydrationWorker>,
     transcript_detail: crate::app::transcript_detail::TranscriptDetailRuntime,
     session_load: crate::app::session_load::SessionLoadRuntime,
+    pending_rewind: Option<crate::app::history::PendingRewind>,
+    rewind_operations: crate::app::session_load::SessionOperationRuntime,
     session_preview: crate::app::session_preview::SessionPreviewRuntime,
     pending_transcript_search: Option<crate::app::search::PendingTranscriptSearch>,
     frame_scheduler: crate::app::render_loop::FrameScheduler,
     transcript_work: crate::app::transcript_work::TranscriptWorkQueue,
     continuing_engine_ask_ids: std::collections::HashSet<u64>,
+    pub(crate) stream_event_arrived_at: Option<Instant>,
+    pub(crate) plugin_streams: Vec<crate::lua::api::transcript::WeakTranscriptStream>,
     pub(crate) last_width: u16,
     pub(crate) last_height: u16,
     managed_models: crate::app::managed_models::ManagedModelState,
@@ -524,7 +528,9 @@ pub enum AppEvent {
     TranscriptHydrationCompleted(
         Box<crate::app::transcript_hydration::TranscriptHydrationWorkerResult>,
     ),
+    TurnInputPrepared(Box<crate::app::agent::TurnInputPrepared>),
     SessionLoadCompleted(Box<crate::app::session_load::SessionLoadWorkerResult>),
+    RewindPrepared(Box<crate::app::history::RewindWorkerResult>),
     SessionPreviewCompleted(crate::app::session_preview::SessionPreviewWorkerResult),
     ShutdownSignal,
 }
@@ -1313,9 +1319,7 @@ impl TuiApp {
     }
 
     pub(crate) fn turn_lifecycle_is_active(&self) -> bool {
-        self.agent_is_running()
-            || self.turn_submission_is_pending()
-            || self.conversation.canonical_operations_are_pending()
+        self.agent_is_running() || self.turn_submission_is_pending()
     }
 
     pub(crate) fn request_urgent_render(&mut self) {
@@ -1343,16 +1347,10 @@ impl TuiApp {
     }
 
     pub(crate) fn prompt_work_state(&self) -> PromptWorkState {
-        let turn_active = self.agent_is_running()
-            || self.turn_submission_is_active()
-            || self.working.is_compacting();
+        let turn_active = self.turn_lifecycle_is_active() || self.working.is_compacting();
         if turn_active {
             PromptWorkState::TurnActive
-        } else if self.busy_stack.is_busy()
-            || self.turn_submission_is_pending()
-            || self.conversation.canonical_operations_are_pending()
-        {
-            // Persistence delays dispatch, but there is no live response to steer or interrupt.
+        } else if self.busy_stack.is_busy() {
             PromptWorkState::BackgroundBusy
         } else if self
             .conversation
@@ -1422,9 +1420,19 @@ impl TuiApp {
         queued: QueuedInput,
         target: QueueStage,
     ) -> bool {
-        let accepted = match target {
-            QueueStage::Turn => self.prompt.try_queue_turn(queued),
-            QueueStage::Request => self.queue_input_for_request(queued),
+        let replacing_cancelled_turn = self.conversation.canonical_operations_are_pending()
+            && self
+                .conversation
+                .turn_pause()
+                .is_some_and(|pause| pause.kind == Some(protocol::EngineAskErrorKind::Cancelled));
+        let accepted = if replacing_cancelled_turn {
+            // The replacement must precede preserved follow-ups while its receipt is pending.
+            self.prompt.try_queue_replacement(queued)
+        } else {
+            match target {
+                QueueStage::Turn => self.prompt.try_queue_turn(queued),
+                QueueStage::Request => self.queue_input_for_request(queued),
+            }
         };
         if accepted {
             self.clear_cancelled_pause();
@@ -1573,9 +1581,7 @@ impl TuiApp {
     }
 
     pub(crate) fn current_context_note_text(&self) -> String {
-        self.workspace.context_note(std::path::Path::new(
-            &self.core.config.settings.worktree_root,
-        ))
+        self.workspace.context_note()
     }
 
     fn latest_context_note_text(&self, name: &str) -> Option<&str> {
@@ -1712,6 +1718,11 @@ impl TuiApp {
     pub(crate) fn start_queued_input(&mut self, queued: QueuedInput) -> Result<(), QueuedInput> {
         self.clear_prompt_prediction();
         let retry = queued.clone();
+        let recovery = matches!(queued, QueuedInput::Request(_)).then(|| {
+            crate::app::prompt_runtime::PendingPromptRecovery::for_queued_request(
+                queued.prompt_replay(),
+            )
+        });
         let started = match queued {
             QueuedInput::Request(req) => {
                 let req = *req;
@@ -1759,6 +1770,9 @@ impl TuiApp {
             QueuedInput::ProcessStatus(_) => true,
         };
         if started {
+            if let Some(recovery) = recovery {
+                self.preserve_pending_prompt_submission(recovery);
+            }
             Ok(())
         } else {
             Err(retry)
@@ -1776,10 +1790,19 @@ impl TuiApp {
             return false;
         };
         let was_animating = self.working.is_animating();
+        if !was_animating
+            && self.working.last_outcome() == Some(smelt_core::working::TurnOutcome::Done)
+        {
+            self.working
+                .continue_from_last(smelt_core::working::TurnPhase::Working);
+        }
         if let Err(queued) = self.start_queued_input(queued) {
             self.prompt.queue_front(stage, queued);
         }
-        if was_animating && !self.conversation.is_active() {
+        if self.working.is_animating()
+            && !self.conversation.is_active()
+            && !self.turn_submission_is_pending()
+        {
             self.working.finish(smelt_core::working::TurnOutcome::Done);
         }
         true
@@ -2095,7 +2118,6 @@ impl TuiApp {
             task_label: None,
             pending_quit: false,
             pending_session_save: false,
-            pending_turn_dispatch: None,
             paint_registry: crate::lua::paint::PaintRegistry::default(),
             working: smelt_core::working::WorkingState::new(working_clock),
             host_work: host_dispatch::HostWorkState::default(),
@@ -2105,11 +2127,15 @@ impl TuiApp {
             transcript_hydration_worker: None,
             transcript_detail: crate::app::transcript_detail::TranscriptDetailRuntime::default(),
             session_load: crate::app::session_load::SessionLoadRuntime::default(),
+            pending_rewind: None,
+            rewind_operations: crate::app::session_load::SessionOperationRuntime::default(),
             session_preview: crate::app::session_preview::SessionPreviewRuntime::default(),
             pending_transcript_search: None,
             frame_scheduler: crate::app::render_loop::FrameScheduler::default(),
             transcript_work: crate::app::transcript_work::TranscriptWorkQueue::default(),
             continuing_engine_ask_ids: std::collections::HashSet::new(),
+            stream_event_arrived_at: None,
+            plugin_streams: Vec::new(),
             last_width: term_w,
             last_height: term_h,
             managed_models,
@@ -2568,45 +2594,41 @@ impl TuiApp {
         if !self.core.signals.has_pending() {
             return;
         }
-        let fires = self.core.signals.drain_pending();
-        let lua = self.lua.lua();
-        let mut calls = Vec::new();
-        for fire in fires {
+        let work = self.lua.shared().begin_work();
+        for _ in 0..crate::lua::LUA_WORK_BATCH {
+            if !self.core.signals.has_pending() || !self.lua.shared().claim_work() {
+                break;
+            }
+            let Some(fire) = self.core.signals.pop_pending_callback() else {
+                break;
+            };
+            let callback = fire.callbacks.front().expect("one pending callback");
+            let lua = self.lua.lua();
             let value = self.core.signals.project_to_lua(&*fire.value, lua);
             let prev = fire
                 .prev
                 .as_deref()
                 .map(|prev| self.core.signals.project_to_lua(prev, lua))
                 .unwrap_or(mlua::Value::Nil);
-            for cb in &fire.callbacks {
-                let smelt_core::signals::SubscriberKind::Lua(handle) = &cb.kind;
-                let func = match lua.registry_value::<mlua::Function>(&handle.key) {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                calls.push((
-                    fire.name.clone(),
-                    value.clone(),
-                    prev.clone(),
-                    func,
-                    cb.is_glob,
-                ));
-            }
-        }
-        let lua = self.lua.execution();
-        crate::lua::scope_app(self, move || {
-            for (name, value, prev, func, is_glob) in calls {
+            let smelt_core::signals::SubscriberKind::Lua(handle) = &callback.kind;
+            let Ok(func) = lua.registry_value::<mlua::Function>(&handle.key) else {
+                continue;
+            };
+            let is_glob = callback.is_glob;
+            let lua = self.lua.execution();
+            crate::lua::scope_app(self, move || {
                 let _perf = smelt_perf::perf::begin("lua:cell_cb");
                 let result = if is_glob {
-                    func.call::<()>((name.clone(), value, prev))
+                    func.call::<()>((fire.name.clone(), value, prev))
                 } else {
                     func.call::<()>((value, prev))
                 };
-                if let Err(e) = result {
-                    lua.record_error(format!("cell `{name}`: {e}"));
+                if let Err(error) = result {
+                    lua.record_error(format!("cell `{}`: {error}", fire.name));
                 }
-            }
-        });
+            });
+        }
+        self.finish_lua_work(&work);
     }
 
     pub(crate) fn sync_prompt_placeholder_display(&mut self) {
@@ -2817,6 +2839,8 @@ impl TuiApp {
 
     pub(crate) fn drain_persist_reports(&mut self) {
         let Some(report) = self.conversation.drain_persistence_report() else {
+            self.drive_canonical_operations();
+            self.poll_session_adoption();
             return;
         };
         if let Some(Err(cause)) = report.startup {
@@ -2851,6 +2875,7 @@ impl TuiApp {
             self.notify_warn(warning);
         }
         self.drive_canonical_operations();
+        self.poll_session_adoption();
     }
 
     fn handle_canonical_completion(
@@ -2897,15 +2922,6 @@ impl TuiApp {
                 match event {
                     crate::app::conversation::CanonicalOperationEvent::Submit(outcome) => {
                         self.handle_canonical_submit_outcome(outcome);
-                    }
-                    crate::app::conversation::CanonicalOperationEvent::TransitionDurable(
-                        acknowledgement,
-                    ) => {
-                        if acknowledgement.receipt.state.is_terminal() {
-                            self.conversation
-                                .mark_terminal(acknowledgement.receipt.turn_id.get());
-                            self.start_next_queued_input_if_idle();
-                        }
                     }
                     crate::app::conversation::CanonicalOperationEvent::Failed {
                         command_id,
@@ -2995,9 +3011,11 @@ impl TuiApp {
                     }
                 }
             }
+            AppEvent::TurnInputPrepared(result) => self.handle_turn_input_prepared(*result),
             AppEvent::SessionLoadCompleted(result) => {
                 self.handle_session_load_worker_result(*result)
             }
+            AppEvent::RewindPrepared(result) => self.handle_rewind_worker_result(*result),
             AppEvent::SessionPreviewCompleted(result) => {
                 self.handle_session_preview_worker_result(result)
             }

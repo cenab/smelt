@@ -344,7 +344,7 @@ Native random-access row source. Attach with `win:document(source)`; each window
 
 **Classification:** `Supported` - Primary alpha facade for user config and plugins.
 
-Typed error table delivered to `on_response` when the underlying provider call fails. `kind` is a stable string the caller can branch on; `message` is a human-readable single-line description. The struct exists purely as a doc / LuaCATS schema target - the actual table is built in `LuaExecution::fire_ask_callback` because it lands on a callback path that bypasses `FromLua` decoding.
+Typed error table delivered to `on_response` when the underlying provider call fails. `kind` is a stable string the caller can branch on; `message` is a human-readable single-line description. The struct exists purely as a doc / LuaCATS schema target - the actual table is serialized by the shared auxiliary callback dispatcher.
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -387,9 +387,10 @@ Spec for `smelt.engine.ask`.
 | `model` | `string` |  | Model reference (`"provider/model"` or a bare name resolved against the configured providers). When `nil`, falls back to the primary model. |
 | `response_format` | [smelt.engine.AskResponseFormat](types.md#smeltengineaskresponseformat) |  | JSON-schema response constraint. |
 | `reasoning_effort` | `string` |  | Reasoning effort for the request. Provider-defined labels are accepted. When omitted, starts at `"off"` and reconciles to the selected model's advertised levels. |
-| `guard` | `table` |  | Lifecycle guard returned by `smelt.lifecycle.guard(...)`. When provided, the Lua bootstrap suppresses `on_delta` and `on_response` after the guard expires. |
+| `guard` | `table` |  | Lifecycle guard returned by `smelt.lifecycle.guard(...)`. When provided, the Lua bootstrap suppresses all ask callbacks after the guard expires. |
 | `visible_retries` | `boolean` |  | Surface provider retry events on the main work indicator. Intended for foreground auxiliary work such as compaction. |
 | `on_delta` | `fun(value: string)` |  | Fires for each streamed assistant text delta when provided. The final `on_response` still fires once with the full assistant message. |
+| `on_draft_rejected` | `fun()` |  | Discard the current streamed draft before a retry or terminal failure. Does not fire on cancellation, which preserves partial output. |
 | `on_response` | `fun(arg1: any, arg2: smelt.engine.AskError?)` |  | Fires once with `(response, err)`. On success `err` is `nil` and `response` is a full assistant message table; on failure `response` is `nil` and `err` is a `smelt.engine.AskError` table. |
 
 ### `smelt.engine.CommandOverrides`
@@ -438,9 +439,10 @@ Spec for `smelt.engine.ask_inherited`.
 | `model` | `string` |  | Model reference (`"provider/model"` or a bare name resolved against the configured providers). When `nil`, falls back to the primary model. |
 | `response_format` | [smelt.engine.AskResponseFormat](types.md#smeltengineaskresponseformat) |  | JSON-schema response constraint. |
 | `reasoning_effort` | `string` |  | Reasoning effort override for the request. Provider-defined labels are accepted. When omitted, inherits the current session's effort and reconciles it to the selected model's advertised levels. |
-| `guard` | `table` |  | Lifecycle guard returned by `smelt.lifecycle.guard(...)`. When provided, the Lua bootstrap suppresses `on_delta` and `on_response` after the guard expires. |
+| `guard` | `table` |  | Lifecycle guard returned by `smelt.lifecycle.guard(...)`. When provided, the Lua bootstrap suppresses all ask callbacks after the guard expires. |
 | `visible_retries` | `boolean` |  | Surface provider retry events on the main work indicator. Intended for foreground auxiliary work such as compaction. |
 | `on_delta` | `fun(value: string)` |  | Fires for each streamed assistant text delta when provided. The final `on_response` still fires once with the full assistant message. |
+| `on_draft_rejected` | `fun()` |  | Discard the current streamed draft before a retry or terminal failure. Does not fire on cancellation, which preserves partial output. |
 | `on_response` | `fun(arg1: any, arg2: smelt.engine.AskError?)` |  | Fires once with `(response, err)`. On success `err` is `nil` and `response` is a full assistant message table; on failure `response` is `nil` and `err` is a `smelt.engine.AskError` table. |
 
 ### `smelt.engine.PrepareContextEstimate`
@@ -785,7 +787,18 @@ Permission slots that apply within a single agent mode.
 | --- | --- | --- | --- |
 | `tools` | [smelt.permissions.RuleSet](types.md#smeltpermissionsruleset) |  | Exact tool-name `allow`/`ask`/`deny` entries. |
 | `effects` | [smelt.permissions.EffectRules](types.md#smeltpermissionseffectrules) |  | Effect-level decisions keyed by effect name. |
+| `paths` | [smelt.permissions.PathRules](types.md#smeltpermissionspathrules) |  | Trusted directory prefixes for path-aware tool calls in this mode. |
 | `patterns` | `table<string, smelt.permissions.RuleSet>` |  | Tool-specific argument patterns keyed by tool name (`"bash"`, `"web_fetch"`, …). |
+
+### `smelt.permissions.PathRules`
+
+**Classification:** `Supported` - Primary alpha facade for user config and plugins.
+
+Directory prefixes trusted for path-aware tools and shell commands outside the workspace.
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `allow` | `string[]` |  | Directory prefixes to trust without a path prompt (supports `~` and symlinks). |
 
 ### `smelt.permissions.PolicySpec`
 
@@ -1024,12 +1037,14 @@ One model entry in a provider's `models` list. Plugin authors can pass either a 
 | `top_k` | `integer` |  | Default top-k sampling cutoff. |
 | `min_p` | `number` |  | Default minimum-probability cutoff. |
 | `repeat_penalty` | `number` |  | Default repeat penalty. |
+| `chat_template_kwargs` | `table` |  | JSON-compatible chat-template options forwarded to OpenAI-compatible servers, for example { enable_thinking = true }. Independent of reasoning_effort. |
 | `tool_calling` | `boolean` |  | Whether the model supports tool calls. |
 | `input_cost` | `number` |  | Cost per 1M input tokens in USD. |
 | `output_cost` | `number` |  | Cost per 1M output tokens in USD. |
 | `cache_read_cost` | `number` |  | Cost per 1M cache-read tokens in USD. |
 | `cache_write_cost` | `number` |  | Cost per 1M cache-write tokens in USD. |
 | `max_tokens` | `integer` |  | Maximum output tokens for this model. Defaults to the model's own limit, falling back to 4096 if unknown. |
+| `thinking_token_budget` | `integer` |  | Per-response reasoning token limit for OpenAI-compatible servers. Sent only when configured. |
 | `thinking_budgets` | `table` |  | Per-level token budgets for budget-based thinking. |
 | `context_window` | `integer` |  | Total context window, in tokens. |
 | `supports_reasoning` | `boolean` |  | Whether this model supports reasoning/thinking parameters. |
@@ -1160,7 +1175,7 @@ Plugin tool definition passed to `smelt.tools.register`. `execute` is required; 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `name` | `string` | yes | Tool name; used as the engine-facing identifier. |
-| `execute` | `function` | yes | Required handler: `execute(args, ctx)` - returns the tool result. |
+| `execute` | `function` | yes | Required handler: `execute(args, ctx)` - returns the tool result. `ctx.prepared` contains this invocation's preparation snapshot, when provided. |
 | `description` | `string` |  | Human-readable description shown to the model. |
 | `parameters` | `table` |  | JSON-schema parameters table passed through to the model. |
 | `permission_defaults` | [smelt.tools.PermissionDefaults](types.md#smelttoolspermissiondefaults) |  | Per-mode default decisions. |
@@ -1170,11 +1185,12 @@ Plugin tool definition passed to `smelt.tools.register`. `execute` is required; 
 | `modes` | `table` |  | Agent modes the tool is available in; nil means all modes. |
 | `execution_mode` | `string` |  | `"concurrent"` (default) or `"sequential"`. |
 | `summary` | `function` |  | `summary(args) -> string | styled_lines | nil` - styled label rendered in the transcript header AND confirm dialog body header. Plain string is auto-wrapped as one plain span; the styled-lines form is `{ { { text, syntax?, selectable?, title_suffix?, style? }, ... }, ... }` - same span shape as `buf:styled` plus optional `selectable = false` for chrome text and `title_suffix = true` for metadata rendered after the live tool timer. |
-| `approval_patterns` | `function` |  | `approval_patterns(args, ctx) -> string[]` - patterns offered as one-click approvals. |
-| `preflight` | `function` |  | `preflight(args, ctx) -> table?` - validation hook; nil result skips. |
+| `approval_patterns` | `function` |  | `approval_patterns(args, prepared) -> string[]?` - yielding hook for one-click approval patterns. |
+| `prepare` | `function` |  | `prepare(args) -> table?` - yielding, read-only preparation for this invocation. The returned snapshot is passed to preflight and preview callbacks. Use async APIs for file I/O; rendering callbacks must only format prepared data. |
+| `preflight` | `function` |  | `preflight(args, prepared) -> string?` - yielding validation hook; return an error string to reject execution. Errors and timeouts fail closed. |
 | `paths_for_workspace` | `function` |  | `paths_for_workspace(args) -> (string|{ path: string, kind?: "file"|"directory"|"unknown" })[]` - paths this invocation will touch. Callback errors and malformed entries reject tool evaluation rather than being treated as no paths. |
-| `preview` | `function` |  | `preview(args) -> smelt.layout` - pre-execute preview render. The confirm dialog renders it directly into the preview pane. |
-| `preview_output` | `function` |  | `preview_output(args) -> { content, is_error?, metadata?, display_content? }|nil` - immutable pending transcript output derived from final streamed arguments before execution. Growing display payloads belong in `display_content`, not JSON metadata. |
+| `preview` | `function` |  | `preview(args, prepared) -> smelt.layout` - pure pre-execute preview render. The confirm dialog renders the invocation's prepared snapshot without I/O. |
+| `preview_output` | `function` |  | `preview_output(args, prepared) -> { content, is_error?, metadata?, display_content? }|nil` - immutable pending transcript output derived from final streamed arguments before execution. Growing display payloads belong in `display_content`, not JSON metadata. |
 | `draft_preview` | `function` |  | `draft_preview(args, ctx, block, opts) -> smelt.layout|nil` - best-effort renderer for streamed partial arguments in the transcript. |
 | `watchdog_timeout_ms` | `integer` |  | Outer watchdog deadline for this tool's coroutine, in milliseconds. This is separate from any timeout the tool implements internally. |
 | `watchdog_max_timeout_ms` | `integer` |  | Maximum watchdog deadline accepted from tool arguments, in milliseconds. |
@@ -1402,7 +1418,7 @@ Transcript-shaped streaming renderer for plugin-owned buffers. Append model text
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
-| `append` | `fun(delta: string): nil` | yes | Append one assistant text delta and re-render the target buffer. |
+| `append` | `fun(delta: string): nil` | yes | Queue one received assistant text delta for grapheme-safe, frame-paced display. Callback delivery is immediate; finish drains pending text and reset discards it. |
 | `finish` | `fun(final_text: string?): nil` | yes | Finalize the streaming block. If `final_text` is provided and differs from the streamed text, the final text is rendered instead. |
 | `reset` | `fun(): nil` | yes | Clear the stream and the target buffer. |
 | `width` | `fun(width: integer?): integer?` | yes | Read or set the render width in terminal cells. |

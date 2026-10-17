@@ -1,8 +1,11 @@
 ---
 source: crates/tui/tests/storybook/app_ctx.rs
-expression: text
+expression: frame.text()
 ---
 * edit_notebook analysis.ipynb
+  new cell source (not validated)
+   1   import pandas as pd
+   2   df = pd.read_csv("data.csv")
 
 * edit_notebook analysis.ipynb                                             14:37:03
    1 - import pandas
@@ -12,9 +15,6 @@ expression: text
 
 * edit_notebook analysis.ipynb                                             14:37:03
    1   print("new cell")
-
-
-
 
 
 

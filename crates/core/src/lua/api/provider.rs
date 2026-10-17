@@ -1,5 +1,7 @@
 //! `smelt.provider` - config-time provider and model registration.
 
+use crate::lua::api::lua_value_to_json;
+use crate::lua::json_to_lua;
 use mlua::prelude::*;
 use std::sync::Arc;
 
@@ -29,6 +31,8 @@ pub struct LuaProviderModel {
     pub min_p: Option<f64>,
     /// Default repeat penalty.
     pub repeat_penalty: Option<f64>,
+    /// JSON-compatible chat-template options forwarded to OpenAI-compatible servers, for example { enable_thinking = true }. Independent of reasoning_effort.
+    pub chat_template_kwargs: Option<mlua::Table>,
     /// Whether the model supports tool calls.
     pub tool_calling: Option<bool>,
     /// Cost per 1M input tokens in USD.
@@ -41,6 +45,8 @@ pub struct LuaProviderModel {
     pub cache_write_cost: Option<f64>,
     /// Maximum output tokens for this model. Defaults to the model's own limit, falling back to 4096 if unknown.
     pub max_tokens: Option<u32>,
+    /// Per-response reasoning token limit for OpenAI-compatible servers. Sent only when configured.
+    pub thinking_token_budget: Option<u32>,
     /// Per-level token budgets for budget-based thinking.
     pub thinking_budgets: Option<LuaThinkingBudgets>,
     /// Total context window, in tokens.
@@ -148,12 +154,24 @@ impl FromLua for LuaModelEntry {
                     top_k: m.top_k,
                     min_p: m.min_p,
                     repeat_penalty: m.repeat_penalty,
+                    chat_template_kwargs: m
+                        .chat_template_kwargs
+                        .map(|table| {
+                            lua_value_to_json(lua, &mlua::Value::Table(table))
+                                .as_object()
+                                .cloned()
+                                .ok_or_else(|| {
+                                    mlua::Error::external("chat_template_kwargs must be an object")
+                                })
+                        })
+                        .transpose()?,
                     tool_calling: m.tool_calling,
                     input_cost: m.input_cost,
                     output_cost: m.output_cost,
                     cache_read_cost: m.cache_read_cost,
                     cache_write_cost: m.cache_write_cost,
                     max_tokens: m.max_tokens,
+                    thinking_token_budget: m.thinking_token_budget,
                     thinking_budgets: m.thinking_budgets.map(Into::into),
                     context_window: m.context_window,
                     supports_reasoning: m.supports_reasoning,
@@ -270,12 +288,16 @@ pub(super) fn register(lua: &Lua, smelt: &mlua::Table, shared: &Arc<LuaShared>) 
                         row.set("top_k", m.top_k)?;
                         row.set("min_p", m.min_p)?;
                         row.set("repeat_penalty", m.repeat_penalty)?;
+                        if let Some(kwargs) = &m.chat_template_kwargs {
+                            row.set("chat_template_kwargs", json_to_lua(lua, &serde_json::json!(kwargs))?)?;
+                        }
                         row.set("tool_calling", m.tool_calling)?;
                         row.set("input_cost", m.input_cost)?;
                         row.set("output_cost", m.output_cost)?;
                         row.set("cache_read_cost", m.cache_read_cost)?;
                         row.set("cache_write_cost", m.cache_write_cost)?;
                         row.set("max_tokens", m.max_tokens)?;
+                        row.set("thinking_token_budget", m.thinking_token_budget)?;
                         row.set("supports_reasoning", m.supports_reasoning)?;
                         if let Some(efforts) = &m.supported_reasoning_efforts {
                             row.set("supported_reasoning_efforts", efforts.iter().map(|effort| effort.label()).collect::<Vec<_>>())?;
@@ -328,6 +350,26 @@ For streaming observation use `smelt.events.on(\"stream_delta\", ...)` - synchro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_parses_explicit_thinking_token_budget() {
+        let lua = Lua::new();
+        for budget in [0, 8192, u32::MAX] {
+            let model: LuaModelEntry = lua
+                .load(format!("return {{ thinking_token_budget = {budget} }}"))
+                .eval()
+                .unwrap();
+            assert_eq!(model.0.thinking_token_budget, Some(budget));
+        }
+        let model: LuaModelEntry = lua.load("return {}").eval().unwrap();
+        assert_eq!(model.0.thinking_token_budget, None);
+        for budget in ["-1", "4294967296"] {
+            assert!(lua
+                .load(format!("return {{ thinking_token_budget = {budget} }}"))
+                .eval::<LuaModelEntry>()
+                .is_err());
+        }
+    }
 
     #[test]
     fn custom_reasoning_model_parses_native_levels() {

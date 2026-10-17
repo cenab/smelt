@@ -495,6 +495,10 @@ impl LuaRuntime {
         }
     }
 
+    pub(crate) fn shared(&self) -> &Arc<LuaShared> {
+        &self.shared
+    }
+
     /// Clone the VM-facing portion needed for synchronous callback execution.
     pub fn execution(&self) -> LuaExecution {
         LuaExecution {
@@ -1504,18 +1508,14 @@ impl LuaRuntime {
             }
         }
 
-        // Run the handler on the Lua task runtime so it executes inside a
-        // coroutine. Yieldable APIs (`smelt.dialog.open`, `smelt.sleep`,
-        // `smelt.task.wait`, ...) then work without each command wrapping its
-        // body in `smelt.spawn`. Non-yielding handlers finish in the
-        // synchronous drive below; yielding handlers park on the runtime and
-        // resume on the next main-loop `drive_tasks` tick.
-        let spawn_result = {
+        // Start only this command's coroutine. Yielding handlers park for the
+        // next task tick; unrelated ready tasks keep their queue position.
+        let task = {
             let Ok(mut rt) = self.shared.tasks.lock() else {
                 self.record_error(format!("cmd `{name}`: task runtime unavailable"));
                 return true;
             };
-            rt.spawn(
+            match rt.spawn(
                 &self.lua,
                 func,
                 initial_args,
@@ -1524,13 +1524,23 @@ impl LuaRuntime {
                     queue_target,
                     sent_at_ms,
                 },
-            )
+            ) {
+                Ok(id) => rt.take_task(id),
+                Err(error) => {
+                    self.record_error(format!("cmd `{name}`: {error}"));
+                    return true;
+                }
+            }
         };
-        if let Err(e) = spawn_result {
-            self.record_error(format!("cmd `{name}`: {e}"));
-            return true;
+        if let Some(task) = task {
+            let mut outputs = Vec::new();
+            let _ = self.step_task_outside_runtime_lock(task, Instant::now(), &mut outputs);
+            for output in outputs {
+                if let TaskDriveOutput::NotifyError(message) = output {
+                    self.record_error(message);
+                }
+            }
         }
-        let _ = self.drive_tasks(Instant::now());
         true
     }
 
@@ -1911,26 +1921,24 @@ impl LuaRuntime {
     }
 
     pub fn pump_task_events(&self) {
-        let json_pending: Vec<(u64, serde_json::Value)> = {
-            let Ok(mut inbox) = self.shared.json_inbox.lock() else {
-                return;
-            };
-            std::mem::take(&mut *inbox)
-        };
-        if !json_pending.is_empty() {
-            if let Ok(mut main) = self.shared.task_inbox.lock() {
-                for (external_id, value) in json_pending {
-                    main.push(TaskEvent::ExternalResolvedJson { external_id, value });
-                }
+        let _work = self.shared.begin_work();
+        for index in 0..super::shared::LUA_WORK_BATCH {
+            if !self.shared.claim_work() {
+                break;
             }
-        }
-        let events: Vec<TaskEvent> = {
-            let Ok(mut inbox) = self.shared.task_inbox.lock() else {
-                return;
+            // Alternate sources so a busy owner-thread producer cannot starve
+            // cross-thread completions. Each inbox retains its FIFO order.
+            let pop_main = || self.shared.task_inbox.lock().ok()?.pop_front();
+            let pop_json = || {
+                let (external_id, value) = self.shared.json_inbox.lock().ok()?.pop_front()?;
+                Some(TaskEvent::ExternalResolvedJson { external_id, value })
             };
-            std::mem::take(&mut *inbox)
-        };
-        for ev in events {
+            let event = if index % 2 == 0 {
+                pop_main().or_else(pop_json)
+            } else {
+                pop_json().or_else(pop_main)
+            };
+            let Some(ev) = event else { break };
             match ev {
                 TaskEvent::ExternalResolved { external_id, value } => {
                     let v = self.lua.registry_value(&value).unwrap_or(mlua::Value::Nil);
@@ -1940,6 +1948,11 @@ impl LuaRuntime {
                     let v = json_to_lua(&self.lua, &value).unwrap_or(mlua::Value::Nil);
                     self.resolve_external(external_id, v);
                 }
+            }
+        }
+        if self.shared.has_pending_task_events() {
+            if let Some(sender) = self.shared.wakeup_tx.get() {
+                let _ = sender.send(());
             }
         }
     }
@@ -1952,6 +1965,11 @@ impl LuaRuntime {
     }
 
     pub fn cancel_turn_tasks(&self) {
+        self.shared
+            .tool_preparations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         let Ok(mut rt) = self.shared.tasks.lock() else {
             return;
         };
@@ -1994,8 +2012,9 @@ impl LuaRuntime {
     }
 
     pub fn drive_tasks(&self, now: Instant) -> Vec<TaskDriveOutput> {
+        let _work = self.shared.begin_work();
         let mut outs = Vec::new();
-        loop {
+        while self.shared.claim_work() {
             let task = match self.take_next_ready_task(now) {
                 Ok(Some(task)) => task,
                 Ok(None) => break,
@@ -2008,10 +2027,19 @@ impl LuaRuntime {
                 return Vec::new();
             }
         }
+        if self.next_task_wakeup(now).is_some_and(|at| at <= now) {
+            if let Some(sender) = self.shared.wakeup_tx.get() {
+                let _ = sender.send(());
+            }
+        }
         let mut forward = Vec::with_capacity(outs.len());
         for out in outs {
             match out {
-                TaskDriveOutput::ToolComplete { .. } => forward.push(out),
+                TaskDriveOutput::ToolComplete { invocation, .. } => {
+                    self.release_tool_preparation(invocation.invocation_id);
+                    forward.push(out);
+                }
+                TaskDriveOutput::ToolEvaluated { .. } => forward.push(out),
                 TaskDriveOutput::NotifyError(msg) => self.record_error(msg),
             }
         }
@@ -2235,7 +2263,7 @@ impl LuaRuntime {
         tool_name: &str,
         args: &HashMap<String, serde_json::Value>,
     ) -> Option<crate::content::block_layout::BlockLayout> {
-        match Self::call_tool_preview(&self.lua, &self.shared, tool_name, args) {
+        match Self::call_tool_preview(&self.lua, &self.shared, tool_name, args, None) {
             Ok(layout) => layout,
             Err(error) => {
                 self.record_error(error);
@@ -2252,6 +2280,7 @@ impl LuaRuntime {
         shared: &LuaShared,
         tool_name: &str,
         args: &HashMap<String, serde_json::Value>,
+        invocation_id: Option<protocol::InvocationId>,
     ) -> Result<Option<crate::content::block_layout::BlockLayout>, String> {
         let preview_fn = {
             let handlers = shared
@@ -2272,7 +2301,7 @@ impl LuaRuntime {
 
         let _perf = smelt_perf::perf::begin("lua:tool");
         let result: mlua::Value = preview_fn
-            .call(args_table)
+            .call((args_table, Self::tool_preparation(shared, invocation_id)))
             .map_err(|error| format!("tool preview `{tool_name}`: {error}"))?;
 
         match result {
@@ -2293,6 +2322,7 @@ impl LuaRuntime {
         &self,
         tool_name: &str,
         args: &HashMap<String, serde_json::Value>,
+        invocation_id: Option<protocol::InvocationId>,
     ) -> Option<ToolOutputRef> {
         let preview_output_fn = {
             let handlers = self.shared.tools.lock().unwrap_or_else(|e| e.into_inner());
@@ -2310,7 +2340,10 @@ impl LuaRuntime {
         };
 
         let _perf = smelt_perf::perf::begin("lua:tool");
-        let result: mlua::Value = match preview_output_fn.call(args_table) {
+        let result: mlua::Value = match preview_output_fn.call((
+            args_table,
+            Self::tool_preparation(&self.shared, invocation_id),
+        )) {
             Ok(v) => v,
             Err(e) => {
                 self.record_error(format!("tool preview_output `{tool_name}`: {e}"));
@@ -2415,61 +2448,169 @@ impl LuaRuntime {
         }
     }
 
+    /// Run preparation and validation as a turn-scoped coroutine. `None` means
+    /// evaluation yielded; its result is delivered by `drive_tasks`.
     pub fn evaluate_tool_metadata(
         &self,
-        tool_name: &str,
-        args: &HashMap<String, serde_json::Value>,
-    ) -> protocol::ToolMetadata {
-        let mut out = protocol::ToolMetadata::default();
-
-        let (approval_patterns_fn, preflight_fn) = {
+        request: &super::ToolEvaluationRequest,
+        now: Instant,
+    ) -> Result<Option<protocol::ToolMetadata>, String> {
+        self.release_tool_preparation(request.invocation_id);
+        let (prepare, approval_patterns, preflight) = {
             let handlers = self.shared.tools.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(h) = handlers.get(tool_name) else {
-                return out;
+            let Some(handler) = handlers.get(&request.tool_name) else {
+                return Ok(Some(protocol::ToolMetadata::default()));
             };
-            let ap = h
-                .approval_patterns
-                .as_ref()
-                .and_then(|h| self.lua.registry_value::<mlua::Function>(&h.key).ok());
-            let pf = h
-                .preflight
-                .as_ref()
-                .and_then(|h| self.lua.registry_value::<mlua::Function>(&h.key).ok());
-            (ap, pf)
+            let function =
+                |handle: &Option<super::LuaHandle>| -> LuaResult<Option<mlua::Function>> {
+                    handle
+                        .as_ref()
+                        .map(|handle| self.lua.registry_value(&handle.key))
+                        .transpose()
+                };
+            (
+                function(&handler.prepare),
+                function(&handler.approval_patterns),
+                function(&handler.preflight),
+            )
         };
-
-        let args_table = match self.args_to_lua_table(args) {
-            Ok(t) => t,
-            Err(e) => {
-                self.record_error(format!("tool metadata: build args: {e}"));
-                return out;
-            }
-        };
-
-        if let Some(func) = approval_patterns_fn {
-            let _perf = smelt_perf::perf::begin("lua:tool");
-            match func.call::<Option<mlua::Table>>(args_table.clone()) {
-                Ok(Some(t)) => {
-                    out.approval_patterns = t
-                        .sequence_values::<String>()
-                        .filter_map(|r| r.ok())
-                        .collect();
+        let prepare = prepare.map_err(|error| error.to_string())?;
+        let approval_patterns = approval_patterns.map_err(|error| error.to_string())?;
+        let preflight = preflight.map_err(|error| error.to_string())?;
+        if prepare.is_none() && approval_patterns.is_none() && preflight.is_none() {
+            return Ok(Some(protocol::ToolMetadata {
+                summary: self.tool_summary(&request.tool_name, &request.args),
+                ..Default::default()
+            }));
+        }
+        let function = self.lua.load(r#"
+            return function(prepare, approval_patterns, preflight, args)
+                local prepared = prepare and prepare(args) or nil
+                return {
+                    prepared = prepared,
+                    approval_patterns = approval_patterns and approval_patterns(args, prepared) or nil,
+                    preflight_error = preflight and preflight(args, prepared) or nil,
                 }
-                Ok(None) => {}
-                Err(e) => self.record_error(format!("tool hook approval_patterns: {e}")),
+            end
+        "#).eval::<mlua::Function>().map_err(|error| error.to_string())?;
+        let initial = (
+            prepare,
+            approval_patterns,
+            preflight,
+            self.args_to_lua_table(&request.args)
+                .map_err(|error| error.to_string())?,
+        )
+            .into_lua_multi(&self.lua)
+            .map_err(|error| error.to_string())?;
+        let timeout_ms = self.tool_timeout_ms(&request.tool_name, &request.args);
+        let deadline = timeout_ms.map(|ms| super::task::TaskDeadline {
+            at: now + std::time::Duration::from_millis(ms),
+            label_ms: ms,
+            paused_at: None,
+        });
+        let task = {
+            let mut tasks = self
+                .shared
+                .tasks
+                .lock()
+                .map_err(|_| "task runtime poisoned".to_string())?;
+            let id = tasks
+                .spawn_scoped(
+                    &self.lua,
+                    function,
+                    initial,
+                    TaskCompletion::ToolEvaluation(Box::new(request.clone())),
+                    super::TaskScope::Turn,
+                    deadline,
+                )
+                .map_err(|error| error.to_string())?;
+            tasks.take_task(id)
+        };
+        let mut outputs = Vec::new();
+        if let Some(task) = task {
+            self.step_task_outside_runtime_lock(task, now, &mut outputs)
+                .map_err(|_| "task runtime poisoned".to_string())?;
+        }
+        let mut metadata = None;
+        for output in outputs {
+            match output {
+                TaskDriveOutput::ToolEvaluated { request, result } => {
+                    metadata = Some(self.finish_tool_evaluation(&request, result));
+                }
+                TaskDriveOutput::NotifyError(message) => self.record_error(message),
+                TaskDriveOutput::ToolComplete { .. } => {
+                    unreachable!("evaluation cannot complete a tool")
+                }
             }
         }
-        if let Some(func) = preflight_fn {
-            let _perf = smelt_perf::perf::begin("lua:tool");
-            match func.call::<Option<String>>(args_table) {
-                Ok(Some(s)) => out.preflight_error = Some(s),
-                Ok(None) => {}
-                Err(e) => self.record_error(format!("tool hook preflight: {e}")),
-            }
-        }
+        Ok(metadata)
+    }
 
-        out.summary = self.tool_summary(tool_name, args);
-        out
+    pub fn finish_tool_evaluation(
+        &self,
+        request: &super::ToolEvaluationRequest,
+        result: Result<mlua::Table, String>,
+    ) -> protocol::ToolMetadata {
+        let mut metadata = protocol::ToolMetadata {
+            summary: self.tool_summary(&request.tool_name, &request.args),
+            ..Default::default()
+        };
+        let parsed = result.and_then(|result| -> Result<_, String> {
+            let prepared = result
+                .get::<Option<mlua::Table>>("prepared")
+                .map_err(|error| error.to_string())?;
+            let error = result
+                .get::<Option<String>>("preflight_error")
+                .map_err(|error| error.to_string())?;
+            let patterns = result
+                .get::<Option<mlua::Table>>("approval_patterns")
+                .map_err(|error| error.to_string())?
+                .map(|patterns| {
+                    patterns
+                        .sequence_values::<String>()
+                        .collect::<LuaResult<Vec<_>>>()
+                })
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .unwrap_or_default();
+            Ok((prepared, error, patterns))
+        });
+        match parsed {
+            Ok((prepared, error, patterns)) => {
+                metadata.preflight_error = error;
+                metadata.approval_patterns = patterns;
+                if let Some(prepared) = prepared {
+                    self.shared
+                        .tool_preparations
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(request.invocation_id, prepared);
+                }
+            }
+            Err(error) => metadata.preflight_error = Some(format!("tool preparation: {error}")),
+        }
+        metadata
+    }
+
+    pub fn release_tool_preparation(&self, invocation_id: protocol::InvocationId) {
+        self.shared
+            .tool_preparations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&invocation_id);
+    }
+
+    fn tool_preparation(
+        shared: &LuaShared,
+        invocation_id: Option<protocol::InvocationId>,
+    ) -> Option<mlua::Table> {
+        let invocation_id = invocation_id?;
+        shared
+            .tool_preparations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&invocation_id)
+            .cloned()
     }
 
     pub fn transcript_renderer_generation(&self) -> u64 {
@@ -2794,6 +2935,18 @@ impl LuaRuntime {
             }
         };
 
+        if let Err(error) = ctx_table.set(
+            "prepared",
+            Self::tool_preparation(&self.shared, Some(invocation.invocation_id)),
+        ) {
+            return ToolExecResult::Immediate {
+                content: format!("tool preparation context: {error}"),
+                is_error: true,
+                metadata: None,
+                display_content: Vec::new(),
+                attachment: None,
+            };
+        }
         let mut initial = mlua::MultiValue::new();
         initial.push_back(mlua::Value::Table(args_table));
         initial.push_back(mlua::Value::Table(ctx_table));
@@ -2879,9 +3032,12 @@ impl LuaRuntime {
                         attachment: attachment.map(|attachment| *attachment),
                     });
                 }
-                TaskDriveOutput::ToolComplete { .. } => {}
+                TaskDriveOutput::ToolComplete { .. } | TaskDriveOutput::ToolEvaluated { .. } => {}
                 TaskDriveOutput::NotifyError(msg) => self.record_error(msg),
             }
+        }
+        if immediate.is_some() {
+            self.release_tool_preparation(invocation.invocation_id);
         }
         match immediate {
             Some(LuaToolResultParts {
@@ -4009,8 +4165,8 @@ fn load_bootstrap_group_with_roots(
 
 /// Extract the embedded `runtime/lua/smelt/` tree to
 /// `<data_dir>/builtins/lua/smelt/` so the agent (and humans) can inspect
-/// the built-in source as worked examples. Versioned by `CARGO_PKG_VERSION`:
-/// re-extracts on smelt upgrade, skips otherwise.
+/// the built-in source as worked examples. Re-extracts when the package
+/// version or embedded Lua and skills content changes.
 ///
 /// Best-effort. Returns the target directory on success, or the I/O
 /// error on failure - callers should log and continue, since the
@@ -4022,7 +4178,7 @@ fn load_bootstrap_group_with_roots(
 pub fn ensure_builtins_extracted(data_dir: &std::path::Path) -> std::io::Result<PathBuf> {
     let target = data_dir.join("builtins");
     let version_file = target.join(".version");
-    let expected = env!("CARGO_PKG_VERSION");
+    let expected = embedded_builtins_cache_key();
     if let Ok(found) = std::fs::read_to_string(&version_file) {
         let has_lua = target.join("lua").join("smelt").exists();
         let has_skills = target.join("skills").exists();
@@ -4043,6 +4199,46 @@ pub fn ensure_builtins_extracted(data_dir: &std::path::Path) -> std::io::Result<
 
     std::fs::write(&version_file, expected)?;
     Ok(target)
+}
+
+fn embedded_builtins_cache_key() -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for (name, dir) in [("lua/smelt", &EMBEDDED_LUA), ("skills", &EMBEDDED_SKILLS)] {
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hash_embedded_dir(&mut hasher, dir);
+    }
+    format!(
+        "{}:{}",
+        env!("CARGO_PKG_VERSION"),
+        crate::utils::hex_lower(&hasher.finalize())
+    )
+}
+
+fn hash_embedded_dir(hasher: &mut sha2::Sha256, dir: &Dir<'_>) {
+    use sha2::Digest;
+
+    let mut entries: Vec<_> = dir.entries().iter().collect();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        match entry {
+            DirEntry::File(file) => {
+                hasher.update(b"file\0");
+                hasher.update(file.path().to_string_lossy().as_bytes());
+                hasher.update([0]);
+                hasher.update((file.contents().len() as u64).to_le_bytes());
+                hasher.update(file.contents());
+            }
+            DirEntry::Dir(dir) => {
+                hasher.update(b"dir\0");
+                hasher.update(dir.path().to_string_lossy().as_bytes());
+                hasher.update([0]);
+                hash_embedded_dir(hasher, dir);
+            }
+        }
+    }
 }
 
 fn write_dir_recursive(dir: &Dir<'_>, target: &std::path::Path) -> std::io::Result<()> {
@@ -4303,6 +4499,58 @@ fn build_tool_ctx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtins_refresh_when_same_version_mirror_has_old_content() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let target = ensure_builtins_extracted(data_dir.path()).unwrap();
+        let meta = target.join("lua/smelt/_meta/_types.lua");
+        let embedded = EMBEDDED_LUA
+            .get_file("_meta/_types.lua")
+            .unwrap()
+            .contents();
+        std::fs::write(&meta, "old build").unwrap();
+        std::fs::write(target.join(".version"), env!("CARGO_PKG_VERSION")).unwrap();
+
+        ensure_builtins_extracted(data_dir.path()).unwrap();
+        assert_eq!(std::fs::read(meta).unwrap(), embedded);
+    }
+
+    #[test]
+    fn embedded_dir_hash_changes_with_file_contents() {
+        use include_dir::File;
+        use sha2::{Digest, Sha256};
+
+        let first_entries = [DirEntry::File(File::new("example.lua", b"first"))];
+        let second_entries = [DirEntry::File(File::new("example.lua", b"second"))];
+        let first = Dir::new("", &first_entries);
+        let second = Dir::new("", &second_entries);
+        let mut first_hash = Sha256::new();
+        let mut second_hash = Sha256::new();
+        hash_embedded_dir(&mut first_hash, &first);
+        hash_embedded_dir(&mut second_hash, &second);
+        assert_ne!(first_hash.finalize(), second_hash.finalize());
+    }
+
+    #[test]
+    fn builtins_refresh_when_embedded_content_hash_changes() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let target = ensure_builtins_extracted(data_dir.path()).unwrap();
+        let old_file = target.join("skills/removed-in-new-build.md");
+        std::fs::write(&old_file, "old build").unwrap();
+        std::fs::write(
+            target.join(".version"),
+            format!("{}:{}", env!("CARGO_PKG_VERSION"), "0".repeat(64)),
+        )
+        .unwrap();
+
+        ensure_builtins_extracted(data_dir.path()).unwrap();
+        assert!(!old_file.exists());
+        assert_eq!(
+            std::fs::read_to_string(target.join(".version")).unwrap(),
+            embedded_builtins_cache_key()
+        );
+    }
 
     #[test]
     fn stored_command_semantics_accent_only_the_slash_token() {

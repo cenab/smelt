@@ -873,6 +873,7 @@ impl TuiApp {
         out: &mut W,
         on_transient_frame: F,
     ) -> bool {
+        let arrived_at = self.core.clock.instant_now();
         if self.render_transient_frame_before_engine_event_to(&ev, out) {
             on_transient_frame(self);
         }
@@ -883,11 +884,11 @@ impl TuiApp {
             _ => self.conversation.has_live_transcript_blocks(),
         };
         if is_engine_continuation(&ev) && continuation_started {
-            self.queue_engine_continuation(ev);
+            self.queue_engine_continuation_at(ev, arrived_at);
             self.request_continuation_render();
             return true;
         }
-        let keep_streaming = self.dispatch_engine_event(ev);
+        let keep_streaming = self.dispatch_engine_event_at(ev, arrived_at);
         self.request_urgent_render();
         keep_streaming
     }
@@ -908,6 +909,20 @@ impl TuiApp {
         self.ensure_main_layout()
     }
 
+    /// Measure the same retained prompt projection and wrapping used for paint.
+    fn measure_prompt_input_rows(&mut self, width: u16) -> u16 {
+        let placeholder_is_empty = self
+            .prompt
+            .placeholder_text(crate::app::PROMPT_WIN)
+            .is_none_or(str::is_empty);
+        let ctx = crate::input::prompt_ctx_mut(&mut self.ui);
+        let usable = ctx.win.config.gutters.content_width(width);
+        ctx.buf.ensure_rendered_at(usable);
+        ctx.win.wrap_cursor_padding = !ctx.buf.source().is_empty() || placeholder_is_empty;
+        ctx.win.ensure_layout(ctx.buf, usable);
+        ctx.win.layout().visual_count().clamp(1, u16::MAX as usize) as u16
+    }
+
     fn ensure_main_layout(&mut self) -> (layout::Rect, u16) {
         if smelt_core::host::host_access_active() {
             self.lua.shared().request_layout_refresh();
@@ -915,9 +930,7 @@ impl TuiApp {
         }
         let applying_deferred_layout = self.lua.shared().take_layout_refresh();
         let (term_w, term_h) = self.ui.terminal_size();
-        let width = term_w as usize;
-        let ghost = self.prompt.placeholder_text(crate::app::PROMPT_WIN);
-        let wrapped_rows = self.measure_prompt_input_rows(self.prompt_buf(), width, ghost);
+        let wrapped_rows = self.measure_prompt_input_rows(term_w);
         // Auto-height keeps the transcript usable; a deliberate manual resize
         // can claim more room for prompt review without taking the full screen.
         let input_rows = self.prompt.resolve_height(wrapped_rows, term_h);
@@ -994,6 +1007,39 @@ impl TuiApp {
             .begin_frame(self.core.clock.instant_now());
         let _perf = smelt_perf::perf::begin("app:tick_compositor");
         self.apply_pending_transcript_work();
+        let streams = self
+            .plugin_streams
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .collect::<Vec<_>>();
+        self.plugin_streams
+            .retain(|stream| stream.strong_count() > 0);
+        let now = self.core.clock.instant_now();
+        let pending = crate::lua::scope_app(self, || {
+            let mut pending = false;
+            for stream in streams {
+                pending |= stream.borrow_mut().advance(now);
+            }
+            pending
+        });
+        if pending {
+            self.request_continuation_render();
+        }
+        if self
+            .conversation
+            .advance_stream_animation(self.core.clock.instant_now())
+        {
+            self.request_continuation_render();
+        }
+        if self.conversation.advance_compaction_animation(now) {
+            self.request_continuation_render();
+        }
+        for block_id in self.conversation.advance_tool_draft_animations(now) {
+            self.transcript_work.request_tool_draft_summary(block_id);
+        }
+        if self.conversation.has_pending_tool_draft_animation() {
+            self.request_continuation_render();
+        }
         self.refresh_pending_tool_draft_summaries();
         if !self.transcript_work.is_empty() && !self.transcript_work.front_waits_for_hydration() {
             self.request_continuation_render();
@@ -1451,6 +1497,95 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unchanged_large_prompt_height_reuses_projection_and_wrapping_without_allocating() {
+        use crate::app::test_harness::{SourceEvent, TestApp};
+
+        for input in ["x".repeat(65_537), "界".repeat(32_768)] {
+            let mut app = TestApp::builder().with_vim(false).build();
+            app.set_terminal_size(100, 32);
+            app.feed_one(SourceEvent::Term(crossterm::event::Event::Paste(input)));
+            app.render_silent();
+            let expected = app.app.measure_prompt_input_rows(100);
+            assert!(expected > 600);
+            let enabled = smelt_perf::alloc::enabled();
+            smelt_perf::alloc::set_enabled(true);
+            let before = smelt_perf::alloc::thread_snapshot();
+            for _ in 0..10 {
+                assert_eq!(app.app.measure_prompt_input_rows(100), expected);
+            }
+            let after = smelt_perf::alloc::thread_snapshot();
+            smelt_perf::alloc::set_enabled(enabled);
+            assert_eq!(after, before, "unchanged height measurement allocated");
+        }
+    }
+
+    #[test]
+    fn prompt_height_and_paint_share_cursor_padding_and_gutter_width() {
+        use crate::app::test_harness::{SourceEvent, TestApp};
+
+        let mut app = TestApp::builder().with_vim(false).build();
+        let width = 80;
+        let usable = app
+            .app
+            .ui
+            .win(crate::app::PROMPT_WIN)
+            .unwrap()
+            .config
+            .gutters
+            .content_width(width);
+        let text = "x".repeat(usable as usize);
+        app.app
+            .set_placeholder(crate::app::PROMPT_WIN, text.clone());
+        assert_eq!(app.app.measure_prompt_input_rows(width), 1);
+        assert!(
+            !app.app
+                .ui
+                .win(crate::app::PROMPT_WIN)
+                .unwrap()
+                .wrap_cursor_padding
+        );
+        app.feed_one(SourceEvent::Term(crossterm::event::Event::Paste(text)));
+        assert_eq!(app.app.measure_prompt_input_rows(width), 2);
+        assert!(
+            app.app
+                .ui
+                .win(crate::app::PROMPT_WIN)
+                .unwrap()
+                .wrap_cursor_padding
+        );
+        app.press(crossterm::event::KeyCode::Backspace);
+        assert_eq!(app.app.measure_prompt_input_rows(width), 1);
+        app.app
+            .ui
+            .win_mut(crate::app::PROMPT_WIN)
+            .unwrap()
+            .config
+            .gutters
+            .pad_left += 2;
+        assert_eq!(app.app.measure_prompt_input_rows(width), 2);
+        assert_eq!(
+            app.app
+                .ui
+                .win(crate::app::PROMPT_WIN)
+                .unwrap()
+                .layout()
+                .visual_count(),
+            2
+        );
+    }
+
+    #[test]
+    fn prompt_height_saturates_instead_of_wrapping_at_terminal_row_limit() {
+        use crate::app::test_harness::{SourceEvent, TestApp};
+
+        let mut app = TestApp::builder().with_vim(false).build();
+        app.feed_one(SourceEvent::Term(crossterm::event::Event::Paste(
+            "\n".repeat(u16::MAX as usize),
+        )));
+        assert_eq!(app.app.measure_prompt_input_rows(80), u16::MAX);
+    }
+
+    #[test]
     fn continuation_requests_wait_for_frame_interval() {
         let start = std::time::Instant::now();
         let mut scheduler = FrameScheduler::default();
@@ -1559,10 +1694,68 @@ mod tests {
             };
             content.snapshot()
         }
-        assert_eq!(streamed_text(&app), "first");
+        assert_eq!(streamed_text(&app), "f");
 
+        app.clock.advance(CONTINUATION_FRAME_INTERVAL);
+        assert!(app.app.render_pending_transient_frame_to(&mut sink));
+        assert_eq!(streamed_text(&app), "fir");
+        app.clock.advance(std::time::Duration::from_millis(250));
         assert!(app.app.render_pending_transient_frame_to(&mut sink));
         assert_eq!(streamed_text(&app), "first second third");
+    }
+
+    #[test]
+    fn response_draft_rejection_waits_for_queued_stream_continuations() {
+        let mut app = crate::app::test_harness::TestApp::builder().build();
+        app.start_turn(1);
+        app.app
+            .dispatch_engine_event(protocol::EngineEvent::TextDelta {
+                delta: "rejected first".into(),
+            });
+        app.app
+            .queue_engine_continuation(protocol::EngineEvent::TextDelta {
+                delta: " rejected queued".into(),
+            });
+        app.app
+            .dispatch_engine_event(protocol::EngineEvent::ResponseDraftRejected);
+        app.app
+            .queue_engine_continuation(protocol::EngineEvent::TextDelta {
+                delta: "valid answer".into(),
+            });
+        app.app.apply_pending_transcript_work();
+        app.render_to_frame();
+        app.clock.advance(std::time::Duration::from_millis(250));
+        let frame = app.render_to_frame().text();
+        assert!(frame.contains("valid answer"));
+        assert!(!frame.contains("rejected"));
+        app.assert_invariants();
+    }
+
+    #[test]
+    fn response_draft_acceptance_waits_for_queued_stream_continuations() {
+        let mut app = crate::app::test_harness::TestApp::builder().build();
+        app.start_turn(1);
+        app.app
+            .dispatch_engine_event(protocol::EngineEvent::TextDelta {
+                delta: "accepted first".into(),
+            });
+        app.app
+            .queue_engine_continuation(protocol::EngineEvent::TextDelta {
+                delta: " accepted queued".into(),
+            });
+        app.app
+            .dispatch_engine_event(protocol::EngineEvent::ResponseDraftAccepted);
+        app.app
+            .queue_engine_continuation(protocol::EngineEvent::TextDelta {
+                delta: "rejected next".into(),
+            });
+        app.app
+            .dispatch_engine_event(protocol::EngineEvent::ResponseDraftRejected);
+        app.app.apply_pending_transcript_work();
+        let frame = app.render_to_frame().text();
+        assert!(frame.contains("accepted first accepted queued"));
+        assert!(!frame.contains("rejected"));
+        app.assert_invariants();
     }
 
     #[test]

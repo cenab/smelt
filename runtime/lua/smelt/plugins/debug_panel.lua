@@ -96,8 +96,7 @@ local function compose_lines(win)
 	local window = smelt.session.context_window()
 	local cost = smelt.session.cost()
 	local tokens = smelt.session.tokens()
-	local turns = smelt.session.turns()
-	local messages = smelt.session.messages.list()
+	local history_items = smelt.session.history_len()
 	local session_id = smelt.session.id()
 	local session_title = smelt.session.title.get()
 	local cwd = smelt.session.cwd()
@@ -229,8 +228,7 @@ local function compose_lines(win)
 		add_kv(lines, spans, "cost_override", table.concat(cost_parts, " "), width)
 	end
 
-	add_kv(lines, spans, "turns", tostring(#turns), width)
-	add_kv(lines, spans, "messages", tostring(#messages), width)
+	add_kv(lines, spans, "history_items", tostring(history_items), width)
 	add_kv(lines, spans, "work_state", work_state, width)
 
 	return lines, spans

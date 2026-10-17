@@ -1,8 +1,13 @@
 ---
 source: crates/tui/tests/storybook/app_ctx.rs
-expression: text
+expression: frame.text()
 ---
 * edit_file src/lib.rs
+   1 - fn add(a: i32, b: i32) -> i32 {
+   2 -     a + b
+   1 + fn add(a: i64, b: i64) -> i64 {
+   2 +     a.checked_add(b).expect("overflow")
+   3   }
 
 * edit_file src/pending.rs                                                 14:37:03
 
@@ -21,11 +26,6 @@ expression: text
 
 * edit_file src/lib.rs                                                     14:37:03
   old_string not found in src/lib.rs
-
-
-
-
-
 
 
 ─ ✿ working… ───────────────────────────────────────────────────────────────────────

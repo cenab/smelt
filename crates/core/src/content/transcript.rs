@@ -112,6 +112,11 @@ impl Transcript {
         self.history.push(block);
     }
 
+    pub fn insert_before(&mut self, before: BlockId, block: Block) -> Option<BlockId> {
+        self.history
+            .insert_before(before, Self::normalize_block(block)?)
+    }
+
     pub fn push_compaction_preview(&mut self, summary: String) -> Option<BlockId> {
         let block = Self::normalize_block(Block::CompactionPreview { summary })?;
         Some(self.history.push(block))
@@ -295,6 +300,40 @@ mod tests {
             content: "hello".into(),
         });
         assert_eq!(t.history.len(), 1);
+    }
+
+    #[test]
+    fn insert_before_normalizes_text_and_rejects_missing_anchors() {
+        let mut t = Transcript::new();
+        t.push(Block::Text {
+            content: "later".into(),
+        });
+        let later = t.history.last_block_id().unwrap();
+        t.history.clear_record_dirty();
+        let earlier = t
+            .insert_before(
+                later,
+                Block::Text {
+                    content: "  earlier  ".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(t.history.order, [earlier, later]);
+        assert_eq!(t.history.record_dirty_from(), Some(0));
+        assert!(matches!(t.block(earlier), Some(Block::Text { content }) if content == "earlier"));
+        let generation = t.history.record_dirty_generation();
+        for (anchor, text) in [(later, "   "), (BlockId::new(u64::MAX), "missing")] {
+            assert!(t
+                .insert_before(
+                    anchor,
+                    Block::Text {
+                        content: text.into()
+                    }
+                )
+                .is_none());
+        }
+        assert_eq!(t.history.record_dirty_generation(), generation);
+        assert_eq!(t.history.order, [earlier, later]);
     }
 
     #[test]

@@ -124,6 +124,7 @@ fn fuzz_summary(
 #[cfg(any(test, feature = "fuzz"))]
 fn count_delta(summary: &mut FuzzProviderSummary, event: ProviderStreamEvent<'_>) {
     match event {
+        ProviderStreamEvent::DraftRejected => {}
         ProviderStreamEvent::TextDelta(_) => summary.text_deltas += 1,
         ProviderStreamEvent::Reasoning(event) => {
             if matches!(event, ReasoningStreamEvent::Delta { .. }) {
@@ -140,8 +141,17 @@ fn count_delta(summary: &mut FuzzProviderSummary, event: ProviderStreamEvent<'_>
 }
 
 #[cfg(any(test, feature = "fuzz"))]
-pub fn fuzz_drain_sse_bytes(buf: &mut Vec<u8>) -> Vec<serde_json::Value> {
-    sse::drain_sse_bytes(buf)
+pub use sse::{Decoder as FuzzSseDecoder, Event as FuzzSseEvent, StreamSummary as FuzzSseSummary};
+
+#[cfg(any(test, feature = "fuzz"))]
+pub fn fuzz_parse_sse_event(
+    wire: u8,
+    event: &FuzzSseEvent,
+) -> Result<serde_json::Value, ProviderError> {
+    match wire % 3 {
+        0 | 1 => error::parse_openai_stream_event(event),
+        _ => anthropic::parse_stream_event(event),
+    }
 }
 
 #[cfg(any(test, feature = "fuzz"))]
@@ -184,8 +194,20 @@ pub fn fuzz_build_chat_completions_body(
     model: &str,
     effort: protocol::ReasoningEffort,
     config: &ModelConfig,
+    provider: ProviderKind,
+    endpoint: &str,
 ) -> serde_json::Value {
-    chat_completions::build_body(messages, tools, model, effort, config)
+    let target = chat_completions::Target::new(provider, endpoint, model);
+    chat_completions::build_body(messages, tools, &target, effort, config)
+}
+
+#[cfg(any(test, feature = "fuzz"))]
+pub fn fuzz_chat_reasoning_origin(
+    provider: ProviderKind,
+    endpoint: &str,
+    model: &str,
+) -> serde_json::Value {
+    chat_completions::reasoning_origin(provider, endpoint, model)
 }
 
 #[cfg(any(test, feature = "fuzz"))]

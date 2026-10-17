@@ -6,7 +6,7 @@
 //! `mlua::Value` at drain time.
 
 use std::any::{Any, TypeId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use protocol::{TokenUsage, TurnMeta};
@@ -64,13 +64,13 @@ pub struct PendingFire {
     pub name: String,
     pub value: Rc<dyn Any>,
     pub prev: Option<Rc<dyn Any>>,
-    pub callbacks: Vec<PendingCallback>,
+    pub callbacks: VecDeque<PendingCallback>,
 }
 
 pub struct Signals {
     slots: HashMap<String, Slot>,
     glob_subs: Vec<GlobSubscriber>,
-    pending: Vec<PendingFire>,
+    pending: VecDeque<PendingFire>,
     next_id: SubscriptionId,
     lua_projectors: HashMap<TypeId, LuaProjector>,
 }
@@ -86,7 +86,7 @@ impl Signals {
         let mut s = Self {
             slots: HashMap::new(),
             glob_subs: Vec::new(),
-            pending: Vec::new(),
+            pending: VecDeque::new(),
             next_id: 0,
             lua_projectors: HashMap::new(),
         };
@@ -162,8 +162,8 @@ impl Signals {
         }
     }
 
-    fn callbacks_for(&self, name: &str, subscribers: &[Subscriber]) -> Vec<PendingCallback> {
-        let mut callbacks: Vec<PendingCallback> = subscribers
+    fn callbacks_for(&self, name: &str, subscribers: &[Subscriber]) -> VecDeque<PendingCallback> {
+        let mut callbacks: VecDeque<PendingCallback> = subscribers
             .iter()
             .map(|s| PendingCallback {
                 kind: s.kind.clone(),
@@ -173,7 +173,7 @@ impl Signals {
             .collect();
         for g in &self.glob_subs {
             if g.pattern.matches(name) {
-                callbacks.push(PendingCallback {
+                callbacks.push_back(PendingCallback {
                     kind: g.kind.clone(),
                     is_glob: true,
                     generation: g.generation,
@@ -191,7 +191,7 @@ impl Signals {
             };
             let prev = std::mem::replace(&mut slot.value, value);
             let snapshot = Rc::clone(&slot.value);
-            let callbacks: Vec<PendingCallback> = slot
+            let callbacks: VecDeque<PendingCallback> = slot
                 .subscribers
                 .iter()
                 .map(|s| PendingCallback {
@@ -206,7 +206,7 @@ impl Signals {
         let mut callbacks = direct_callbacks;
         for g in &self.glob_subs {
             if g.pattern.matches(name) {
-                callbacks.push(PendingCallback {
+                callbacks.push_back(PendingCallback {
                     kind: g.kind.clone(),
                     is_glob: true,
                     generation: g.generation,
@@ -216,7 +216,7 @@ impl Signals {
         if callbacks.is_empty() {
             return true;
         }
-        self.pending.push(PendingFire {
+        self.pending.push_back(PendingFire {
             name: name.to_string(),
             value: snapshot,
             prev: Some(prev),
@@ -234,7 +234,7 @@ impl Signals {
         if callbacks.is_empty() {
             return true;
         }
-        self.pending.push(PendingFire {
+        self.pending.push_back(PendingFire {
             name: name.to_string(),
             value: payload,
             prev: None,
@@ -317,7 +317,23 @@ impl Signals {
     }
 
     pub fn drain_pending(&mut self) -> Vec<PendingFire> {
-        std::mem::take(&mut self.pending)
+        self.pending.drain(..).collect()
+    }
+
+    /// Take one callback without dropping or reordering the remaining notifications.
+    pub fn pop_pending_callback(&mut self) -> Option<PendingFire> {
+        let fire = self.pending.front_mut()?;
+        let callback = fire.callbacks.pop_front()?;
+        let result = PendingFire {
+            name: fire.name.clone(),
+            value: Rc::clone(&fire.value),
+            prev: fire.prev.clone(),
+            callbacks: VecDeque::from([callback]),
+        };
+        if fire.callbacks.is_empty() {
+            self.pending.pop_front();
+        }
+        Some(result)
     }
 
     pub fn has_pending(&self) -> bool {

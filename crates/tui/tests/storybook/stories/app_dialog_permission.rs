@@ -72,6 +72,50 @@ app_story!(bash_lua_doc_validation_permission_targets_tmp, |ctx| {
     ctx.assert_snapshot();
 });
 
+app_story!(
+    bash_nested_validation_script_never_offers_root_grant,
+    |ctx| {
+        ctx.set_viewport(120, 30);
+        ctx.restrict_permissions_to_cwd();
+        ctx.approve_tool_for_session("bash");
+        let command = concat!(
+        "cd /home/dev/dev/smelt/.worktrees/lua-api-audit && ",
+        "export RUSTUP_TOOLCHAIN=1.95.0 CARGO_BUILD_JOBS=1 ",
+        "TMPDIR=/home/dev/.cache/smelt-phase4-validation-tmp && ",
+        "flock target/.phase1-validation.lock bash -c '",
+        "set -euo pipefail; cargo fmt 2>&1 | tail -15; ",
+        "cargo test -p smelt-tui --features harness public_message_log_returns_independent_ordered_typed_rows 2>&1 | tail -38; ",
+        "cargo test -p smelt-tui --features harness public_message_log_bounds_aggregate_retained_bodies 2>&1 | tail -38; ",
+        "cargo test -p smelt-tui --features harness messages_dialog_ 2>&1 | tail -38; ",
+        "cargo xtask gen-lua-docs 2>&1 | tail -13; ",
+        "before=$(sha256sum runtime/lua/smelt/_meta/*.lua ",
+        "docs/docs/reference/api/*.md | sha256sum); ",
+        "cargo xtask gen-lua-docs 2>&1 | tail -13; ",
+        "after=$(sha256sum runtime/lua/smelt/_meta/*.lua ",
+        "docs/docs/reference/api/*.md | sha256sum); ",
+        "test \"$before\" = \"$after\" && printf \"generated contracts unchanged\\n\"'",
+    );
+        ctx.request_permission(
+            "bash",
+            args([
+                ("command", json!(command)),
+                ("description", json!("Validate Lua API contracts")),
+            ]),
+            vec![],
+        );
+
+        let frame = ctx.frame_text();
+        assert!(
+            frame.contains("allow /home/dev/dev/smelt/.worktrees/lua-api-audit for this session"),
+            "expected a grant for the actual outside worktree: {frame}"
+        );
+        assert!(
+            !frame.contains("allow / for this session"),
+            "must not offer a root session grant: {frame}"
+        );
+    }
+);
+
 app_story!(bash_brace_expansion_permission_targets_directory, |ctx| {
     ctx.set_viewport(120, 30);
     ctx.restrict_permissions_to_cwd();
@@ -358,9 +402,7 @@ app_story!(edit_file_permission_dialog_multiline_diff, |ctx| {
 
 app_story!(notebook_edit_permission_dialog_with_diff, |ctx| {
     ctx.set_viewport(80, 28);
-    // notebook_edit's preview reads the source notebook from disk
-    // via `smelt.notebook.preview_data`. Seed a 2-cell fixture so
-    // the preview pipeline produces a real cell-level diff.
+    // Prepare a read snapshot of a two-cell notebook for the cell-level diff.
     let nb_json = r##"{
       "nbformat": 4,
       "nbformat_minor": 5,
@@ -374,6 +416,7 @@ app_story!(notebook_edit_permission_dialog_with_diff, |ctx| {
       ]
     }"##;
     let path = ctx.write_fixture("analysis.ipynb", nb_json);
+    ctx.cache_file_read(&path, nb_json);
     ctx.request_permission(
         "edit_notebook",
         args([
@@ -403,6 +446,7 @@ app_story!(notebook_edit_permission_dialog_insert_cell, |ctx| {
       ]
     }"##;
     let path = ctx.write_fixture("insert.ipynb", nb_json);
+    ctx.cache_file_read(&path, nb_json);
     ctx.request_permission(
         "edit_notebook",
         args([

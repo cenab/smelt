@@ -1,6 +1,7 @@
 //! Lua runtime types for `smelt-core`.
 
 pub mod api;
+pub mod ask;
 pub mod doc;
 pub mod hooks;
 pub mod lua_type;
@@ -21,16 +22,17 @@ pub use runtime::{
 };
 pub use shared::{
     AskCallbacks, CliFlagKind, CliFlagSpec, CliFlagValue, CommandBusyBehavior, DefaultShell, Hooks,
-    LuaHostServices, LuaResumeSink, LuaShared, Phase, RegisteredCommand, RegisteredKeymap,
-    RegisteredWinRenderer, ToolHandles, TranscriptGroupBucket, TranscriptGroupFieldMatch,
-    TranscriptGroupSelector, TranscriptGroupSpec, LUA_BUF_ID_BASE,
+    LuaHostServices, LuaResumeSink, LuaShared, LuaWorkGuard, Phase, RegisteredCommand,
+    RegisteredKeymap, RegisteredWinRenderer, ToolHandles, TranscriptGroupBucket,
+    TranscriptGroupFieldMatch, TranscriptGroupSelector, TranscriptGroupSpec, LUA_BUF_ID_BASE,
+    LUA_WORK_BATCH, MAX_LUA_WORK_PER_PUMP,
 };
 pub(crate) use task::step_task_owned;
 pub use task::{
     current_command_queue_target, current_command_sent_at_ms, current_task_cancel,
     current_task_scope, current_tool_invocation, with_task_cancel, CommandQueueTarget,
     LuaTaskRuntime, TaskCompletion, TaskDriveOutput, TaskEvent, TaskScope, ToolEnv,
-    ToolInvocationContext,
+    ToolEvaluationRequest, ToolInvocationContext,
 };
 
 /// Identifiers carried together through one plugin tool execution.

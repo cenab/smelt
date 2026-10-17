@@ -886,7 +886,167 @@ mod tests {
     }
 
     #[test]
-    fn self_queued_lua_command_stops_at_flush_limit() {
+    fn signal_feedback_yields_to_input_and_preserves_callback_order() {
+        let mut app = crate::app::test_harness::TestApp::builder().build();
+        app.run_lua_result(
+            r#"
+            _G.feedback_runs = 0
+            _G.feedback_order = {}
+            smelt.signal.new("test.feedback", 0)
+            smelt.signal.subscribe("test.feedback", function(value)
+                _G.feedback_runs = _G.feedback_runs + 1
+                table.insert(_G.feedback_order, value * 2)
+                if value < 300 then smelt.signal.set("test.feedback", value + 1) end
+            end)
+            smelt.signal.subscribe("test.feedback", function(value)
+                table.insert(_G.feedback_order, value * 2 + 1)
+            end)
+            smelt.signal.set("test.feedback", 1)
+        "#,
+        )
+        .unwrap();
+        app.app.pump_lua();
+        assert!(
+            app.app.core.signals.has_pending(),
+            "feedback must yield before reaching a fixpoint"
+        );
+        let started = std::time::Instant::now();
+        app.type_char('x');
+        assert_eq!(app.prompt_source(), "x");
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+        for _ in 0..8 {
+            app.settle_lua();
+        }
+        assert_eq!(app.lua_int_global("feedback_runs"), Some(300));
+        assert!(app.run_lua(
+            r#"
+            assert(#_G.feedback_order == 600)
+            for index, value in ipairs(_G.feedback_order) do assert(value == index + 1) end
+        "#
+        ));
+    }
+
+    #[test]
+    fn task_resume_payloads_yield_to_input_without_losing_values() {
+        for (owner_thread, cross_thread) in [(true, false), (false, true), (true, true)] {
+            let mut app = crate::app::test_harness::TestApp::builder().build();
+            app.run_lua_result(
+                r#"
+                _G.resume_ids = {}
+                _G.resume_values = {}
+                _G.parked_tasks = 0
+                for index = 1, 300 do
+                    local id = smelt.task.alloc()
+                    _G.resume_ids[index] = id
+                    smelt.spawn(function()
+                        _G.parked_tasks = _G.parked_tasks + 1
+                        _G.resume_values[index] = smelt.task.wait(id)
+                    end)
+                end
+            "#,
+            )
+            .unwrap();
+            for _ in 0..8 {
+                app.settle_lua();
+            }
+            assert_eq!(app.lua_int_global("parked_tasks"), Some(300));
+            let shared = std::sync::Arc::clone(app.app.lua.core_shared());
+            if cross_thread {
+                let ids: Vec<u64> = app.eval_lua("return _G.resume_ids").unwrap();
+                let sink = shared.resume_sink();
+                std::thread::spawn(move || {
+                    for (index, id) in ids.into_iter().enumerate() {
+                        if !owner_thread || index % 2 == 1 {
+                            sink.resolve_json(id, serde_json::json!(index + 1));
+                        }
+                    }
+                })
+                .join()
+                .unwrap();
+            }
+            if owner_thread {
+                app.exec_lua_entry(&format!(
+                    "for index, id in ipairs(_G.resume_ids) do if not {cross_thread} or index % 2 == 1 then smelt.task.resume(id, index) end end",
+                ))
+                .unwrap();
+            }
+            let main_before = shared.task_inbox.lock().unwrap().len();
+            let json_before = shared.json_inbox.lock().unwrap().len();
+            app.app.lua.pump_task_events();
+            if owner_thread && cross_thread {
+                assert!(shared.task_inbox.lock().unwrap().len() < main_before);
+                assert!(shared.json_inbox.lock().unwrap().len() < json_before);
+            }
+            let pending =
+                shared.task_inbox.lock().unwrap().len() + shared.json_inbox.lock().unwrap().len();
+            assert!(
+                pending >= 300 - smelt_core::lua::LUA_WORK_BATCH,
+                "resume pump drained {pending} pending values"
+            );
+            let started = std::time::Instant::now();
+            app.type_char('x');
+            assert_eq!(app.prompt_source(), "x");
+            assert!(started.elapsed() < std::time::Duration::from_millis(250));
+            for _ in 0..16 {
+                app.settle_lua();
+            }
+            let values: Vec<usize> = app.eval_lua("return _G.resume_values").unwrap();
+            assert_eq!(values, (1..=300).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn ready_lua_tasks_yield_fairly_to_input_without_losing_work() {
+        let mut app = crate::app::test_harness::TestApp::builder().build();
+        app.run_lua_result(
+            r#"
+            _G.task_runs = {0, 0, 0}
+            for index = 1, 3 do
+                smelt.spawn(function()
+                    for _ = 1, 300 do
+                        _G.task_runs[index] = _G.task_runs[index] + 1
+                        smelt.sleep(0)
+                    end
+                end)
+            end
+        "#,
+        )
+        .unwrap();
+        app.drive_lua_tasks();
+        let runs: Vec<i64> = app.eval_lua("return _G.task_runs").unwrap();
+        assert!(runs.iter().all(|runs| *runs > 0 && *runs < 300), "{runs:?}");
+        let started = std::time::Instant::now();
+        app.type_char('x');
+        assert_eq!(app.prompt_source(), "x");
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+        for _ in 0..8 {
+            app.settle_lua();
+        }
+        let runs: Vec<i64> = app.eval_lua("return _G.task_runs").unwrap();
+        assert_eq!(runs, vec![300; 3]);
+    }
+
+    #[test]
+    fn self_queued_lua_commands_resume_without_losing_tail() {
+        let mut app = crate::app::test_harness::TestApp::builder().build();
+        let total = crate::lua::MAX_PENDING_LUA_COMMANDS + 17;
+        app.run_lua_result(&format!(
+            r#"
+            _G.command_runs = 0
+            smelt.cmd.register("test.deferred", function()
+                _G.command_runs = _G.command_runs + 1
+                if _G.command_runs < {total} then smelt.cmd.run("test.deferred") end
+            end)
+            smelt.cmd.run("test.deferred")
+        "#
+        ))
+        .unwrap();
+        app.settle_lua();
+        assert_eq!(app.lua_int_global("command_runs"), Some(total as i64));
+    }
+
+    #[test]
+    fn self_queued_lua_command_yields_with_pending_work_intact() {
         let mut app = crate::app::test_harness::TestApp::builder().build();
         app.run_lua_result(
             r#"
@@ -900,11 +1060,12 @@ mod tests {
         )
         .expect("run self-queued command");
 
-        assert_eq!(
-            app.lua_int_global("fuzz_command_runs"),
-            Some(crate::lua::MAX_PENDING_LUA_COMMANDS as i64)
-        );
-        assert!(app.app.lua.shared().drain_commands().is_empty());
+        let runs = app.lua_int_global("fuzz_command_runs").unwrap();
+        assert!(runs > 0 && runs <= smelt_core::lua::MAX_LUA_WORK_PER_PUMP as i64);
+        assert!(app.app.lua.shared().has_pending_commands());
+        app.app.flush_lua_callbacks();
+        assert!(app.lua_int_global("fuzz_command_runs").unwrap() > runs);
+        assert!(app.app.lua.shared().has_pending_commands());
     }
 
     fn set_active_model(

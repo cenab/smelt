@@ -21,6 +21,13 @@ pub struct Args {
     command: Option<Commands>,
     /// Initial message to send (auto-submits on startup)
     message: Option<String>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "message",
+        help = "Read the initial message from a UTF-8 file (auto-submits on startup)"
+    )]
+    prompt_file: Option<PathBuf>,
     #[arg(long, value_name = "PATH", help = "Path to a custom init.lua")]
     config: Option<String>,
     #[arg(
@@ -96,7 +103,10 @@ pub struct Args {
     log_level: String,
     #[arg(long, help = "Print performance timing summary on exit")]
     bench: bool,
-    #[arg(long, help = "Run headless (no TUI), requires a message argument")]
+    #[arg(
+        long,
+        help = "Run headless (no TUI), requires a message or --prompt-file"
+    )]
     headless: bool,
     #[arg(
         long,
@@ -568,7 +578,11 @@ fn write_backup_manifest(
 }
 
 fn resolve_session_target(reference: &str) -> Result<(String, PathBuf), String> {
-    let id = smelt_core::session::resolve_prefix(reference).map_err(|err| err.to_string())?;
+    // Canonical readers/writers check exact IDs. Derived catalog publication is
+    // not required to diagnose, back up or reclaim canonical storage.
+    let id = smelt_core::session_id::SessionId::parse(reference)
+        .or_else(|_| smelt_core::session::resolve_prefix(reference))
+        .map_err(|err| err.to_string())?;
     Ok((id.into_string(), smelt_core::session::sessions_dir()))
 }
 
@@ -896,10 +910,28 @@ fn run_session_command(args: SessionArgs) {
         }
         SessionCommand::Gc(args) => with_lineage_writer(&args.session, |writer| {
             const RECLAMATION_ROWS_PER_TRANSACTION: usize = 256;
+            let mut sharing_cursor = smelt_store::ObjectSharingCursor::default();
+            let mut objects_shared = 0usize;
+            let mut sharing_pages_saved = 0u64;
+            loop {
+                let step = writer
+                    .share_objects(&mut sharing_cursor)
+                    .map_err(|err| format!("failed to share lineage objects: {err}"))?;
+                objects_shared += step.objects_shared;
+                sharing_pages_saved += step.pages_saved;
+                if step.complete {
+                    break;
+                }
+                if step.objects_scanned == 0 {
+                    return Err("object sharing made no bounded progress".into());
+                }
+            }
             let mut branch_heads_cleared = 0usize;
             let mut canonical_rows_deleted = 0usize;
             let mut objects_deleted = 0usize;
-            let mut search_segments_deleted = 0usize;
+            let search_segments_deleted = writer
+                .prune_search_projection()
+                .map_err(|err| format!("failed to prune derived search data: {err}"))?;
             let mut transactions = 0usize;
             loop {
                 let step = writer
@@ -911,18 +943,18 @@ fn run_session_command(args: SessionArgs) {
                 canonical_rows_deleted =
                     canonical_rows_deleted.saturating_add(step.canonical_rows_deleted);
                 objects_deleted = objects_deleted.saturating_add(step.objects_deleted);
-                search_segments_deleted =
-                    search_segments_deleted.saturating_add(step.search_segments_deleted);
                 if step.complete {
                     break;
                 }
-                if step.work_rows() == 0 {
+                if !step.made_progress() {
                     return Err("lineage reclamation made no bounded progress".into());
                 }
             }
             let vacuum = writer
                 .vacuum()
                 .map_err(|err| format!("failed to vacuum reclaimed lineage pages: {err}"))?;
+            println!("shared_objects: {objects_shared}");
+            println!("sharing_pages_saved: {sharing_pages_saved}");
             println!("cleared_branch_heads: {branch_heads_cleared}");
             println!("deleted_canonical_rows: {canonical_rows_deleted}");
             println!("deleted_objects: {objects_deleted}");
@@ -930,6 +962,7 @@ fn run_session_command(args: SessionArgs) {
             println!("free_pages_before: {}", vacuum.free_pages_before);
             println!("free_pages_after: {}", vacuum.free_pages_after);
             println!("pages_reclaimed: {}", vacuum.pages_reclaimed);
+            println!("wal_truncated: {}", vacuum.wal_truncated);
             println!("transactions: {transactions}");
             Ok(())
         }),
@@ -1068,7 +1101,7 @@ async fn async_main() {
     // We do the early run BEFORE detecting the `auth` subcommand
     // because clap can't know about Lua flags until early has fired.
     let lua_early_startup = smelt_perf::perf::begin("startup:lua_early");
-    let mut cwd = startup::resolve_project_cwd(std::env::args_os(), env.cwd());
+    let (mut cwd, initial_message) = startup::prepare_launch(std::env::args_os(), env.cwd());
     env.set_cwd(cwd.clone());
     let mut lua_runtime = tui::lua::LuaRuntime::new_for_runtime(
         &env,
@@ -1133,6 +1166,17 @@ async fn async_main() {
         }
     }
 
+    let initial_message = initial_message
+        .unwrap_or_else(|error| {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        })
+        .or_else(|| args.message.take());
+    if args.headless && initial_message.is_none() {
+        eprintln!("error: --headless requires a message argument or --prompt-file");
+        std::process::exit(1);
+    }
+
     if !args.headless {
         if let Some(restored_cwd) = startup_resume
             .as_deref()
@@ -1178,15 +1222,16 @@ async fn async_main() {
         lua_runtime.load_user_config();
         lua_runtime.load_global_plugins();
         let project_trust = lua_runtime.load_project_config(&cwd);
+        if let Some(err) = lua_runtime.load_error() {
+            eprintln!("error: lua init: {err}");
+            std::process::exit(1);
+        }
         let resolved = startup::resolve(
             &args,
             lua_runtime.to_config(),
             &lua_runtime.mode_names(),
             &env,
         );
-        if let Some(err) = lua_runtime.load_error() {
-            eprintln!("warning: lua init: {err}");
-        }
         (resolved, project_trust)
     } else {
         let inputs = startup::parse(&args, &env);
@@ -1234,11 +1279,6 @@ async fn async_main() {
 
     std::thread::spawn(tui::warm_up_syntect);
     std::thread::spawn(engine::redact::warm_up);
-
-    if args.headless && args.message.is_none() {
-        eprintln!("error: --headless requires a message argument");
-        std::process::exit(1);
-    }
 
     if args.headless && runtime.active_model().is_none() {
         eprintln!(
@@ -1397,11 +1437,7 @@ async fn async_main() {
             } else {
                 engine::SystemPromptBehavior::Interactive
             },
-            host_callbacks: if args.headless {
-                engine::HostCallbacks::Disabled
-            } else {
-                engine::HostCallbacks::Enabled
-            },
+            host_callbacks: engine::HostCallbacks::Enabled,
             skill_section: prompt_inputs.skill_section.clone(),
             ..engine::EngineConfig::new(cwd.clone(), Arc::clone(&clock))
         },
@@ -1443,11 +1479,7 @@ async fn async_main() {
             prompt_inputs.instructions.as_deref(),
             prompt_inputs.skill_section.as_deref(),
         );
-        let headless_lua = if capabilities.tool_calling {
-            Some(lua_runtime.into_core())
-        } else {
-            None
-        };
+        let headless_lua = Some(lua_runtime.into_core());
         let sink = smelt_core::HeadlessSink::new(output_format, color_mode, args.verbose);
         let mut headless = smelt_core::HeadlessApp::new(
             core,
@@ -1479,7 +1511,7 @@ async fn async_main() {
             );
         }
         let exit = headless
-            .run_oneshot(args.message.unwrap(), headless_cancel)
+            .run_oneshot(initial_message.unwrap(), headless_cancel)
             .await;
         if exit != smelt_core::HeadlessExit::Success {
             std::process::exit(exit.code());
@@ -1522,7 +1554,7 @@ async fn async_main() {
         redirect_stderr();
 
         println!();
-        app.run(startup_http_client.clone(), args.message).await;
+        app.run(startup_http_client.clone(), initial_message).await;
         // Fire `smelt.lifecycle.on("shutdown", fn)` hooks. The TUI is torn
         // down at this point so stdout is in cooked mode - plugins (e.g.
         // the bundled resume-hint banner) can `print(...)` straight to the

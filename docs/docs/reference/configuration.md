@@ -143,6 +143,7 @@ Per-model overrides:
 | `cache_read_cost`    | USD per 1M cache-read tokens                                                                              |
 | `cache_write_cost`   | USD per 1M cache-write tokens                                                                             |
 | `max_tokens`         | Maximum output tokens for this model. Defaults to the model's own limit, falling back to 4096 if unknown. |
+| `thinking_token_budget` | Per-response reasoning token limit sent to compatible Chat Completions endpoints. Omitted unless configured; independent of `reasoning_effort` and `max_tokens`. |
 | `thinking_budgets`   | Per-level budgets for budget-based thinking: `{ low = 2048, medium = 8192, high = 16384, max = 16384 }`   |
 | `context_window`     | Total context window in tokens. Overrides provider/catalog metadata when set.                             |
 | `supports_reasoning` | Whether this model supports reasoning/thinking parameters. Overrides provider/catalog metadata when set.  |
@@ -211,6 +212,15 @@ sends `reasoning_effort = "none"`. Omitting the field would leave thinking at th
 server's default. Unknown or explicitly non-reasoning models receive no reasoning
 parameter when off. `/thinking off` only folds the displayed thinking blocks; it
 does not disable model reasoning.
+
+Chat Completions reasoning replay is automatic: smelt records the received field
+(`reasoning_content`, `reasoning`, or `reasoning_text`) and replays it only for the
+same provider type, endpoint, API and model. No extra setting is needed. Endpoints
+that return no recognized reasoning field receive no reasoning fields. Disabling
+new thinking does not discard existing tool-continuation reasoning. Earlier-turn
+filtering is left to the server's chat template; smelt does not assume which
+template is deployed. Reasoning without recorded origin, including older sessions,
+is kept in history but is not replayed in native reasoning fields.
 
 #### Pricing
 

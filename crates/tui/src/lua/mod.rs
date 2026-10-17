@@ -377,10 +377,12 @@ impl TranscriptViewWatchers {
     }
 }
 
+pub(crate) use smelt_core::lua::{LuaWorkGuard, LUA_WORK_BATCH};
+
 /// TUI-specific state shared by Lua callbacks and the app loop.
 pub(crate) struct LuaShared {
     pub(crate) core: Arc<smelt_core::lua::LuaShared>,
-    pub(crate) pending_invocations: Mutex<Vec<PendingInvocation>>,
+    pub(crate) pending_invocations: Mutex<std::collections::VecDeque<PendingInvocation>>,
     pending_commands: Mutex<std::collections::VecDeque<String>>,
     command_drain_active: AtomicBool,
     layout_refresh_pending: AtomicBool,
@@ -411,7 +413,7 @@ impl LuaShared {
     fn with_core(core: Arc<smelt_core::lua::LuaShared>) -> Self {
         Self {
             core,
-            pending_invocations: Mutex::new(Vec::new()),
+            pending_invocations: Mutex::new(std::collections::VecDeque::new()),
             pending_commands: Mutex::new(std::collections::VecDeque::new()),
             command_drain_active: AtomicBool::new(false),
             layout_refresh_pending: AtomicBool::new(false),
@@ -436,11 +438,24 @@ impl LuaShared {
         Ok(())
     }
 
-    pub(crate) fn drain_commands(&self) -> Vec<String> {
+    pub(crate) fn pop_command(&self) -> Option<String> {
+        self.pending_commands.lock().ok()?.pop_front()
+    }
+
+    pub(crate) fn has_pending_commands(&self) -> bool {
         self.pending_commands
             .lock()
-            .map(|mut commands| commands.drain(..).collect())
-            .unwrap_or_default()
+            .is_ok_and(|commands| !commands.is_empty())
+    }
+
+    pub(crate) fn has_pending_callbacks(&self) -> bool {
+        self.pending_invocations
+            .lock()
+            .is_ok_and(|callbacks| !callbacks.is_empty())
+    }
+
+    pub(crate) fn begin_work(self: &Arc<Self>) -> LuaWorkGuard {
+        self.core.begin_work()
     }
 
     pub(crate) fn try_begin_command_drain(&self) -> bool {
@@ -566,17 +581,12 @@ impl LuaExecution {
         Ok(collect_desired_state(&self.core))
     }
 
-    pub(crate) fn fire_ask_callback(
-        &self,
-        id: u64,
-        message: Option<&protocol::Message>,
-        error: Option<protocol::EngineAskError>,
-    ) {
-        invoke_ask_callback(&self.core, &self.shared, id, message, error);
-    }
-
-    pub(crate) fn fire_ask_delta_callback(&self, id: u64, delta: &str) {
-        invoke_ask_delta_callback(&self.core, &self.shared, id, delta);
+    pub(crate) fn fire_ask_event(&self, event: &protocol::EngineEvent) {
+        if let Err(error) =
+            smelt_core::lua::ask::dispatch_callbacks(&self.shared, &self.core.lua, event)
+        {
+            self.core.record_error(format!("ask callback: {error}"));
+        }
     }
 
     pub(crate) fn fire_confirm_open(&self, handle_id: u64) {
@@ -1152,77 +1162,6 @@ pub(crate) fn mode_block(
     }
 }
 
-fn invoke_ask_callback(
-    core: &smelt_core::lua::LuaRuntime,
-    shared: &LuaShared,
-    id: u64,
-    message: Option<&protocol::Message>,
-    error: Option<protocol::EngineAskError>,
-) {
-    let callbacks = {
-        let Ok(mut callbacks) = shared.ask_callbacks.lock() else {
-            return;
-        };
-        callbacks.remove(&id)
-    };
-    let Some(callbacks) = callbacks else {
-        return;
-    };
-    let Some(handle) = callbacks.response else {
-        return;
-    };
-    let Ok(func) = core.lua.registry_value::<mlua::Function>(&handle.key) else {
-        return;
-    };
-    let response_value = match message {
-        Some(message) => smelt_core::lua::serde_to_lua_preserving_nulls(&core.lua, message)
-            .unwrap_or(mlua::Value::Nil),
-        None => mlua::Value::Nil,
-    };
-    let error_value = match error {
-        None => mlua::Value::Nil,
-        Some(error) => match core.lua.create_table() {
-            Ok(table) => {
-                let _ = table.set("kind", error.kind.as_str());
-                let _ = table.set("message", error.message);
-                mlua::Value::Table(table)
-            }
-            Err(_) => mlua::Value::Nil,
-        },
-    };
-    let _perf = smelt_perf::perf::begin("lua:ask_cb");
-    if let Err(error) = func.call::<()>((response_value, error_value)) {
-        core.record_error(format!("ask callback: {error}"));
-    }
-}
-
-fn invoke_ask_delta_callback(
-    core: &smelt_core::lua::LuaRuntime,
-    shared: &LuaShared,
-    id: u64,
-    delta: &str,
-) {
-    let func = {
-        let Ok(callbacks) = shared.ask_callbacks.lock() else {
-            return;
-        };
-        let Some(callbacks) = callbacks.get(&id) else {
-            return;
-        };
-        let Some(handle) = callbacks.delta.as_ref() else {
-            return;
-        };
-        let Ok(func) = core.lua.registry_value::<mlua::Function>(&handle.key) else {
-            return;
-        };
-        func
-    };
-    let _perf = smelt_perf::perf::begin("lua:ask_delta_cb");
-    if let Err(error) = func.call::<()>(delta.to_string()) {
-        core.record_error(format!("ask delta callback: {error}"));
-    }
-}
-
 impl Default for LuaRuntime {
     fn default() -> Self {
         Self::new()
@@ -1426,11 +1365,11 @@ mod tests {
         assert_eq!(fired, 0);
     }
 
-    /// `fire_ask_callback` must only look at `ask_callbacks`. A non-ask
+    /// `ask_response_dispatch` must only look at `ask_callbacks`. A non-ask
     /// handler registered with the same id in the win/overlay/paint map
     /// must NOT fire when an `EngineAskResponse` arrives with that id.
     #[test]
-    fn fire_ask_callback_ignores_non_ask_handles() {
+    fn ask_response_dispatch_ignores_non_ask_handles() {
         let rt = LuaRuntime::new();
         rt.lua
             .load("_G.fired = 0; _G.cb = function() _G.fired = _G.fired + 1 end")
@@ -1446,14 +1385,19 @@ mod tests {
         // handler - verify the ask path stays in its own lane.
         let msg =
             protocol::Message::assistant(Some(protocol::Content::text("synthetic")), None, None);
-        rt.execution().fire_ask_callback(id, Some(&msg), None);
+        rt.execution()
+            .fire_ask_event(&protocol::EngineEvent::EngineAskResponse {
+                id,
+                message: Some(msg),
+                error: None,
+            });
 
         let fired: u64 = rt.lua.load("return _G.fired").eval().unwrap();
         assert_eq!(fired, 0, "non-ask handle must not fire on ask response");
     }
 
     #[test]
-    fn fire_ask_delta_callback_streams_until_final_response() {
+    fn ask_delta_dispatch_streams_until_final_response() {
         let rt = LuaRuntime::new();
         rt.lua
             .load("_G.delta = ''; _G.cb = function(d) _G.delta = _G.delta .. d end")
@@ -1466,17 +1410,26 @@ mod tests {
             smelt_core::lua::AskCallbacks {
                 response: None,
                 delta: Some(handle),
+                rejected: None,
             },
         );
 
         let execution = rt.execution();
-        execution.fire_ask_delta_callback(7, "hel");
-        execution.fire_ask_delta_callback(7, "lo");
+        for delta in ["hel", "lo"] {
+            execution.fire_ask_event(&protocol::EngineEvent::EngineAskDelta {
+                id: 7,
+                delta: delta.into(),
+            });
+        }
         let delta: String = rt.lua.load("return _G.delta").eval().unwrap();
         assert_eq!(delta, "hello");
 
         let msg = protocol::Message::assistant(Some(protocol::Content::text("hello")), None, None);
-        execution.fire_ask_callback(7, Some(&msg), None);
+        execution.fire_ask_event(&protocol::EngineEvent::EngineAskResponse {
+            id: 7,
+            message: Some(msg),
+            error: None,
+        });
         assert!(rt.shared.ask_callbacks.lock().unwrap().is_empty());
     }
 
@@ -1546,6 +1499,37 @@ mod tests {
         assert_eq!(decision, "deny");
         assert_eq!(label, "Review");
         assert_eq!(runtime.execution().mode_note("review"), "review carefully");
+    }
+
+    #[test]
+    fn settings_are_available_without_an_active_tui_entry() {
+        let runtime = LuaRuntime::new();
+        runtime
+            .lua
+            .load(
+                r#"
+                assert(smelt.settings.restrict_to_workspace == true)
+                assert(smelt.settings.fast_mode == false)
+                smelt.settings.autoupgrade = "off"
+                smelt.settings.fast_mode = true
+                smelt.settings.restrict_to_workspace = false
+                assert(smelt.settings.fast_mode == true)
+                local count = 0
+                for key, value in pairs(smelt.settings) do
+                    assert(value ~= nil, key)
+                    count = count + 1
+                end
+                assert(count >= #smelt.settings.schema())
+                assert(not pcall(function() smelt.settings.fast_mode = "true" end))
+                assert(not pcall(function() smelt.settings.unknown_setting = true end))
+                "#,
+            )
+            .exec()
+            .expect("headless settings retain defaults, overrides, iteration, and validation");
+        let config = runtime.to_config();
+        assert_eq!(config.settings.autoupgrade, "off");
+        assert!(config.settings.fast_mode);
+        assert!(!config.settings.restrict_to_workspace);
     }
 
     #[test]
@@ -1665,6 +1649,105 @@ mod tests {
                 "unexpected {api} error: {error}"
             );
         }
+    }
+
+    #[test]
+    fn headless_lua_policy_paths_cover_registered_file_and_shell_tools() {
+        use smelt_core::permissions::{
+            resolve_permissions, store::PermissionStore, PermissionRuntimePaths, PermissionsHandle,
+            ToolOrigin,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("workspace");
+        let trusted = root.path().join("trusted");
+        let config_dir = root.path().join("config");
+        for path in [&cwd, &trusted, &config_dir] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            config_dir.join("init.lua"),
+            format!(
+                r#"smelt.permissions.extend({{
+                    default = {{
+                        tools = {{ allow = {{ "read_file" }} }},
+                        patterns = {{ bash = {{ allow = {{ "cat *" }} }} }},
+                        paths = {{ allow = {{ "{}" }} }},
+                    }},
+                }})"#,
+                trusted.display()
+            ),
+        )
+        .unwrap();
+        let env = engine::env::RuntimeEnv::scripted(
+            4242,
+            root.path().join("home"),
+            config_dir.clone(),
+            root.path().join("state"),
+            root.path().join("cache"),
+            root.path().join("data"),
+            root.path().join("runtime"),
+            cwd.clone(),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        );
+        let mut lua = LuaRuntime::new_for_runtime(&env, Some(config_dir), None, Some(cwd.clone()));
+        lua.load_host_bootstrap();
+        lua.load_host_autoload();
+        lua.load_user_config();
+        assert!(
+            lua.load_error.is_none(),
+            "headless startup: {:?}",
+            lua.load_error
+        );
+        let permissions = PermissionsHandle::from_resolution(
+            resolve_permissions(
+                &lua.permission_rules_snapshot().unwrap(),
+                &lua.tool_defaults(),
+                lua.mode_behaviors(),
+                &smelt_core::config::ResolvedSettings::default(),
+                PermissionRuntimePaths {
+                    cwd: &cwd,
+                    home: env.home(),
+                },
+                &PermissionStore::new(env.state_dir().clone()),
+                None,
+            )
+            .unwrap(),
+        );
+        let path = trusted.join("file.txt");
+        let args = std::collections::HashMap::from([("file_path".into(), serde_json::json!(path))]);
+        let paths = lua.tool_paths_for_workspace("read_file", &args).unwrap();
+        assert!(matches!(
+            paths,
+            smelt_core::lua::ToolWorkspacePaths::Declared(_)
+        ));
+        assert_eq!(
+            permissions
+                .evaluate_tool_with_paths_and_approvals(
+                    protocol::AgentMode::normal(),
+                    ToolOrigin::Lua,
+                    "read_file",
+                    &args,
+                    paths.as_slice(),
+                )
+                .decision,
+            protocol::Decision::Allow,
+        );
+        let args = std::collections::HashMap::from([(
+            "command".into(),
+            serde_json::json!(format!("cat {}", path.display())),
+        )]);
+        assert_eq!(
+            permissions
+                .evaluate_tool_with_approvals(
+                    protocol::AgentMode::normal(),
+                    ToolOrigin::Lua,
+                    "bash",
+                    &args,
+                )
+                .decision,
+            protocol::Decision::Allow,
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -5,6 +5,11 @@
 use crate::app::TuiApp;
 use engine::{HostCall, HostRequestDecision, PreparedRequestMessages};
 use protocol::Message;
+#[cfg(test)]
+use smelt_core::context_estimate::PrepareContextEstimateSource;
+use smelt_core::context_estimate::{
+    PrepareContextEstimate, HISTORY_DELTA_MAX_ITEMS as PREPARE_CONTEXT_HISTORY_DELTA_MAX_ITEMS,
+};
 use smelt_core::lua::{HookRegistry, LuaShared};
 use smelt_core::working::TurnPhase;
 use std::cell::RefCell;
@@ -13,7 +18,6 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 type MessageReply = oneshot::Sender<HostRequestDecision>;
-const PREPARE_CONTEXT_HISTORY_DELTA_MAX_ITEMS: usize = 256;
 
 thread_local! {
     static DEFERRED_HOST_REPLIES: RefCell<Vec<DeferredHostReply>> = const { RefCell::new(Vec::new()) };
@@ -29,9 +33,22 @@ enum DeferredRequestDecision {
 
 #[derive(Default)]
 pub(super) struct HostWorkState {
+    project_request: Option<ProjectRequest>,
     pending: Option<Rc<RequestHook>>,
     context_recalculation: Option<super::BusyToken>,
     handoff_turn: Option<u64>,
+}
+
+struct ProjectRequest {
+    target_cwd: std::path::PathBuf,
+    turn_id: u64,
+    cancel_generation: u64,
+    lua_generation: u64,
+    runtime_revision: u64,
+    messages: PreparedRequestMessages,
+    estimated_tokens: u32,
+    reply: MessageReply,
+    preparation: super::cwd::ProjectPreparation,
 }
 
 struct RequestHook {
@@ -225,6 +242,9 @@ impl TuiApp {
     }
 
     pub(super) fn cancel_request_hook(&mut self) {
+        if let Some(request) = self.host_work.project_request.take() {
+            let _ = request.reply.send(HostRequestDecision::Stop);
+        }
         if let Some(owner) = self.host_work.pending.clone() {
             let decision = self.resolve_request_hook(&owner, DeferredRequestDecision::Stop);
             if let Some(reply) = owner.reply.borrow_mut().take() {
@@ -370,9 +390,104 @@ impl TuiApp {
                     let _ = reply.send(HostRequestDecision::Stop);
                     return;
                 }
-                self.dispatch_prepare_request(turn_id, messages, estimated_tokens, reply);
+                self.prepare_project_request(turn_id, messages, estimated_tokens, reply);
             }
         }
+    }
+
+    fn prepare_project_request(
+        &mut self,
+        turn_id: u64,
+        messages: PreparedRequestMessages,
+        estimated_tokens: u32,
+        reply: MessageReply,
+    ) {
+        if let Some(previous) = self.host_work.project_request.take() {
+            let _ = previous.reply.send(HostRequestDecision::Stop);
+        }
+        let target_cwd = self.current_project_cwd();
+        match self.prepare_project_context(target_cwd.clone()) {
+            Ok(preparation) => {
+                self.host_work.project_request = Some(ProjectRequest {
+                    target_cwd,
+                    turn_id,
+                    cancel_generation: self.conversation.cancel_generation(),
+                    lua_generation: self.lua.id,
+                    runtime_revision: self.core.config.revision,
+                    messages,
+                    estimated_tokens,
+                    reply,
+                    preparation,
+                })
+            }
+            Err(error) => {
+                let _ = reply.send(HostRequestDecision::Abort(error));
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "harness"))]
+    pub(super) fn project_context_pending(&self) -> bool {
+        self.host_work.project_request.is_some()
+    }
+
+    /// Refresh before every provider request, including those following tools.
+    /// The engine waits for the snapshot, while the terminal keeps processing input.
+    pub(super) fn poll_project_request(&mut self) -> bool {
+        let Some(request) = self.host_work.project_request.as_ref() else {
+            return false;
+        };
+        if self.active_agent_turn_id() != Some(request.turn_id)
+            || self.conversation.cancel_generation() != request.cancel_generation
+        {
+            let request = self.host_work.project_request.take().unwrap();
+            let _ = request.reply.send(HostRequestDecision::Stop);
+            return true;
+        }
+        let prepared = match request.preparation.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("project preparation worker stopped".into())
+            }
+        };
+        let request = self.host_work.project_request.take().unwrap();
+        if request.lua_generation != self.lua.id
+            || request.runtime_revision != self.core.config.revision
+            || request.target_cwd != self.current_project_cwd()
+            || prepared
+                .as_ref()
+                .is_ok_and(|prepared| !prepared.permissions().is_current())
+        {
+            self.prepare_project_request(
+                request.turn_id,
+                request.messages,
+                request.estimated_tokens,
+                request.reply,
+            );
+            return true;
+        }
+        match prepared.and_then(|prepared| self.install_prepared_project_context(prepared)) {
+            Ok(context_changed) => {
+                if self.active_agent_turn_id() != Some(request.turn_id)
+                    || self.conversation.cancel_generation() != request.cancel_generation
+                {
+                    let _ = request.reply.send(HostRequestDecision::Stop);
+                    return true;
+                }
+                self.dispatch_prepare_request(
+                    request.turn_id,
+                    request.messages,
+                    request.estimated_tokens,
+                    request.reply,
+                    context_changed,
+                );
+            }
+            Err(error) => {
+                let _ = request.reply.send(HostRequestDecision::Abort(error));
+            }
+        }
+        true
     }
 
     /// Hand the first registered `smelt.engine.on_context_limit` hook the
@@ -414,6 +529,7 @@ impl TuiApp {
         messages: PreparedRequestMessages,
         estimated_tokens: u32,
         reply: MessageReply,
+        context_changed: bool,
     ) {
         let lua = self.lua.lua().clone();
         let funcs = self
@@ -425,6 +541,11 @@ impl TuiApp {
         let Some(func) = funcs.into_iter().next() else {
             let _ = reply.send(HostRequestDecision::Continue);
             return;
+        };
+        let messages = if context_changed {
+            PreparedRequestMessages::model_only(self.model_history_messages())
+        } else {
+            messages
         };
         let identity = self.active_context_token_identity();
         let current_history_len = self.session_history_len();
@@ -549,150 +670,83 @@ impl TuiApp {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrepareContextEstimateSource {
-    FullRequestEstimate,
-    ProviderSnapshot,
-    ProviderSnapshotPlusHistoryDelta,
-    CheckpointEstimate,
-    CheckpointEstimatePlusHistoryDelta,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PrepareContextEstimate {
-    total_context_tokens: u32,
-    provider_context_tokens: Option<u32>,
-    estimated_delta_tokens: u32,
-    latest_snapshot_history_len: Option<usize>,
-    current_history_len: usize,
-    source: PrepareContextEstimateSource,
-}
-
-impl PrepareContextEstimate {
-    #[cfg(test)]
-    fn from_request(
-        current_context_tokens: Option<u32>,
-        context_tokens_history_len: Option<usize>,
-        current_history: &[protocol::HistoryItem],
-        request_messages: &[Message],
-        full_request_estimate: u32,
-    ) -> Self {
-        let base_history_len = context_tokens_history_len.unwrap_or(current_history.len());
-        let history_delta = if base_history_len < current_history.len() {
-            &current_history[base_history_len..]
-        } else {
-            &[]
-        };
-        Self::from_history_delta(
-            current_context_tokens,
-            context_tokens_history_len,
-            None,
-            current_history.len(),
-            history_delta,
-            request_messages,
-            full_request_estimate,
-        )
-    }
-
-    fn from_history_delta(
-        current_context_tokens: Option<u32>,
-        context_tokens_history_len: Option<usize>,
-        checkpoint_context_tokens: Option<(u32, Option<usize>)>,
-        current_history_len: usize,
-        history_delta: &[protocol::HistoryItem],
-        _request_messages: &[Message],
-        full_request_estimate: u32,
-    ) -> Self {
-        let (base, base_history_len, exact_source, delta_source) =
-            if let Some(base) = current_context_tokens {
-                (
-                    base,
-                    context_tokens_history_len,
-                    PrepareContextEstimateSource::ProviderSnapshot,
-                    PrepareContextEstimateSource::ProviderSnapshotPlusHistoryDelta,
-                )
-            } else if let Some((base, history_len)) = checkpoint_context_tokens {
-                (
-                    base,
-                    history_len,
-                    PrepareContextEstimateSource::CheckpointEstimate,
-                    PrepareContextEstimateSource::CheckpointEstimatePlusHistoryDelta,
-                )
-            } else {
-                return Self::full_request(full_request_estimate, current_history_len);
-            };
-        let latest_snapshot_history_len = base_history_len;
-        let base_history_len = base_history_len.unwrap_or(current_history_len);
-
-        if base_history_len > current_history_len {
-            return Self::full_request(full_request_estimate, current_history_len);
-        }
-
-        if base_history_len == current_history_len {
-            return Self {
-                total_context_tokens: base,
-                provider_context_tokens: current_context_tokens,
-                estimated_delta_tokens: 0,
-                latest_snapshot_history_len,
-                current_history_len,
-                source: exact_source,
-            };
-        }
-
-        let added_messages = protocol::history_to_messages(history_delta);
-        let estimated_delta_tokens = smelt_core::session::estimate_message_tokens(&added_messages);
-        Self {
-            total_context_tokens: base.saturating_add(estimated_delta_tokens),
-            provider_context_tokens: current_context_tokens,
-            estimated_delta_tokens,
-            latest_snapshot_history_len,
-            current_history_len,
-            source: delta_source,
-        }
-    }
-
-    fn full_request(full_request_estimate: u32, current_history_len: usize) -> Self {
-        Self {
-            total_context_tokens: full_request_estimate,
-            provider_context_tokens: None,
-            estimated_delta_tokens: full_request_estimate,
-            latest_snapshot_history_len: None,
-            current_history_len,
-            source: PrepareContextEstimateSource::FullRequestEstimate,
-        }
-    }
-
-    fn into_lua_table(self, lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
-        let table = lua.create_table()?;
-        table.set("source", self.source.as_str())?;
-        table.set("total_context_tokens", self.total_context_tokens)?;
-        table.set("provider_context_tokens", self.provider_context_tokens)?;
-        table.set("estimated_delta_tokens", self.estimated_delta_tokens)?;
-        table.set(
-            "latest_snapshot_history_len",
-            self.latest_snapshot_history_len,
-        )?;
-        table.set("current_history_len", self.current_history_len)?;
-        Ok(table)
-    }
-}
-
-impl PrepareContextEstimateSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::FullRequestEstimate => "full_request_estimate",
-            Self::ProviderSnapshot => "provider_snapshot",
-            Self::ProviderSnapshotPlusHistoryDelta => "provider_snapshot_plus_history_delta",
-            Self::CheckpointEstimate => "checkpoint_estimate",
-            Self::CheckpointEstimatePlusHistoryDelta => "checkpoint_estimate_plus_history_delta",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use protocol::{AssistantStep, Content, HistoryItem, ToolInvocation, ToolOutcome};
+
+    #[test]
+    fn project_request_retries_results_when_cwd_is_renamed_during_preparation() {
+        use crate::app::test_harness::{test_environment_guard, TestApp};
+
+        for stale_error in [false, true] {
+            let environment = test_environment_guard();
+            let root = tempfile::tempdir().unwrap();
+            let root_path = std::fs::canonicalize(root.path()).unwrap();
+            let original = root_path.join("original");
+            let renamed = root_path.join("renamed");
+            std::fs::create_dir(&original).unwrap();
+            std::env::set_current_dir(&original).unwrap();
+            let mut app = TestApp::builder()
+                .with_cwd(&original)
+                .build_with_test_environment_guard(&environment);
+            app.start_turn(42);
+            app.app.lua.core_shared().hooks.prepare_request.clear();
+            let prepared = app
+                .app
+                .prepare_project_context(original.clone())
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let (reply, mut response) = oneshot::channel();
+            app.app.dispatch_host_call(HostCall::PrepareRequest {
+                turn_id: 42,
+                messages: PreparedRequestMessages::model_only(Vec::new()),
+                estimated_tokens: 0,
+                reply,
+            });
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.app
+                .host_work
+                .project_request
+                .as_mut()
+                .unwrap()
+                .preparation = rx;
+            std::fs::rename(&original, &renamed).unwrap();
+            tx.send(if stale_error {
+                Err("stale missing cwd".into())
+            } else {
+                prepared
+            })
+            .unwrap();
+            app.wait_for_project_context();
+            assert!(matches!(
+                response.try_recv().unwrap(),
+                HostRequestDecision::Continue
+            ));
+            assert_eq!(app.core_probe().env.cwd(), renamed);
+        }
+    }
+
+    #[test]
+    fn project_request_does_not_recover_missing_workspace_from_unrelated_process_cwd() {
+        let mut app = crate::app::test_harness::TestApp::builder().build();
+        let cwd = app.core_probe().env.cwd();
+        std::fs::remove_dir(&cwd).unwrap();
+        app.start_turn(42);
+        let (reply, mut response) = oneshot::channel();
+        app.dispatch_host_call(HostCall::PrepareRequest {
+            turn_id: 42,
+            messages: PreparedRequestMessages::model_only(Vec::new()),
+            estimated_tokens: 0,
+            reply,
+        });
+        assert!(
+            matches!(response.try_recv().unwrap(), HostRequestDecision::Abort(error)
+            if error.contains("resolve cwd"))
+        );
+        assert_eq!(app.core_probe().env.cwd(), cwd);
+    }
 
     #[test]
     fn retained_reply_callback_defers_without_scoped_host_access() {
@@ -784,6 +838,7 @@ mod tests {
                 history: None,
                 meta: None,
             });
+            app.wait_for_turn_persistence();
             let commands = app.drain_engine_sends();
             if cancel {
                 assert!(!app.agent_running());
@@ -905,6 +960,7 @@ mod tests {
                         history: None,
                         meta: None,
                     });
+                    app.wait_for_turn_persistence();
                     assert!(app
                         .drain_engine_sends()
                         .iter()

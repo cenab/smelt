@@ -38,6 +38,7 @@ app_story!(text_streams_via_deltas, |ctx| {
             delta: chunk.into(),
         });
     }
+    ctx.advance_time(250);
     ctx.assert_snapshot();
 });
 
@@ -78,6 +79,8 @@ app_story!(thinking_streams_table_in_tiny_deltas, |ctx| {
             title: None,
             delta: ch.to_string(),
         });
+        ctx.advance_time(16);
+        ctx.frame_text();
         ctx.run_lua("smelt.transcript.fold_all('open')");
         let frame = ctx.frame_text();
         let rows: Vec<&str> = frame.lines().collect();
@@ -88,6 +91,9 @@ app_story!(thinking_streams_table_in_tiny_deltas, |ctx| {
         assert!(!rows.iter().any(|row| row.trim() == "|"), "frame: {frame}");
     }
 
+    ctx.advance_time(250);
+    ctx.frame_text();
+    ctx.run_lua("smelt.transcript.fold_all('open')");
     let frame = ctx.frame_text();
     assert!(frame.contains("A") && frame.contains("B"), "frame: {frame}");
     assert!(frame.contains("1") && frame.contains("2"), "frame: {frame}");
@@ -101,6 +107,8 @@ app_story!(thinking_peek_suppresses_blank_only_omission, |ctx| {
         title: None,
         delta: "first paragraph\n\nsecond paragraph\nthird paragraph\nfourth paragraph".into(),
     });
+    ctx.advance_time(250);
+    ctx.frame_text();
     ctx.run_lua("smelt.transcript.fold_kind('thinking', 'peek')");
     ctx.assert_snapshot();
 });
@@ -119,6 +127,8 @@ app_story!(thinking_stream_title_sections, |ctx| {
         )
         .into(),
     });
+    ctx.advance_time(250);
+    ctx.frame_text();
     ctx.run_lua("smelt.transcript.fold_all('open')");
     ctx.assert_snapshot();
 });
@@ -402,6 +412,7 @@ app_story!(compaction_preview_streaming_summary, |ctx| {
         "- Kept the final checkpoint marker separate.\n\n",
         "# Next steps\nUpdate stories and run focused tests."
     ));
+    ctx.advance_time(250);
     ctx.assert_snapshot();
 });
 

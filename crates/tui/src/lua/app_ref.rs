@@ -28,7 +28,7 @@ pub(crate) struct SessionInfoSnapshot {
     pub(crate) ephemeral: bool,
     pub(crate) title: Option<String>,
     pub(crate) slug: Option<String>,
-    pub(crate) first_user_message: Option<String>,
+    pub(crate) first_user_message: Option<std::sync::Arc<str>>,
     pub(crate) parent_id: Option<String>,
     pub(crate) created_at_ms: u64,
     pub(crate) updated_at_ms: u64,
@@ -425,6 +425,23 @@ impl ConversationLuaHost<'_> {
         }
     }
 
+    pub(crate) fn stream_arrival_time(&self) -> std::time::Instant {
+        self.app
+            .stream_event_arrived_at
+            .unwrap_or_else(|| self.app.core.clock.instant_now())
+    }
+
+    pub(crate) fn register_transcript_stream(
+        &mut self,
+        stream: crate::lua::api::transcript::WeakTranscriptStream,
+    ) {
+        self.app.plugin_streams.push(stream);
+    }
+
+    pub(crate) fn request_stream_frame(&mut self) {
+        self.app.request_continuation_render();
+    }
+
     pub(crate) fn render_transcript_stream(
         &mut self,
         buffer_id: crate::smelt_edit::BufId,
@@ -595,12 +612,18 @@ impl AgentLuaHost<'_> {
     pub(crate) fn confirm_preview_request(
         &self,
         handle_id: u64,
-    ) -> Option<(String, std::collections::HashMap<String, serde_json::Value>)> {
-        self.app
-            .core
-            .confirms
-            .get(handle_id)
-            .map(|entry| (entry.req.tool_name.clone(), entry.req.args.clone()))
+    ) -> Option<(
+        String,
+        std::collections::HashMap<String, serde_json::Value>,
+        protocol::InvocationId,
+    )> {
+        self.app.core.confirms.get(handle_id).map(|entry| {
+            (
+                entry.req.tool_name.clone(),
+                entry.req.args.clone(),
+                entry.req.invocation_id,
+            )
+        })
     }
 
     pub(crate) fn resolve_confirm(
@@ -628,6 +651,9 @@ impl AgentLuaHost<'_> {
     }
 
     pub(crate) fn cancel_engine_work(&mut self) {
+        if self.app.cancel_session_handoff() {
+            return;
+        }
         if self.app.conversation.turn_pause().is_some() {
             self.app.cancel_turn_work();
         } else if self.app.prompt.queue_is_empty() {
@@ -647,11 +673,10 @@ impl AgentLuaHost<'_> {
 
     pub(crate) fn reload_lua_now(&mut self) {
         if self.app.prompt_input_is_busy() {
-            self.app
-                .notify_error("cannot reload while agent is working".into());
-            return;
+            self.app.notify("reload queued until agent is idle".into());
+        } else {
+            while self.app.close_active_modal() {}
         }
-        while self.app.close_active_modal() {}
         self.app.schedule_lua_reload();
     }
 
@@ -731,119 +756,59 @@ impl AgentLuaHost<'_> {
         started
     }
 
-    fn resolve_ask_reasoning_effort(
-        catalog: &protocol::ModelCatalogMetadata,
-        requested: Option<protocol::ReasoningEffort>,
-        default_effort: protocol::ReasoningEffort,
-        model: &str,
-    ) -> Result<protocol::ReasoningEffort, String> {
-        match requested {
-            Some(effort) if catalog.supports_reasoning_effort(&effort) => Ok(effort),
-            Some(effort) => Err(format!(
-                "reasoning effort '{}' is not supported by model '{}'",
-                effort.label(),
-                model
-            )),
-            None => Ok(catalog.reconcile_reasoning_effort(default_effort)),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_engine_ask(
         &mut self,
-        id: u64,
         system: String,
-        mut messages: Vec<protocol::Message>,
-        model_reference: Option<String>,
-        question: Option<String>,
-        response_format: Option<protocol::AskResponseFormat>,
-        reasoning_effort: Option<protocol::ReasoningEffort>,
-        stream: bool,
-        visible_retries: bool,
+        request: smelt_core::lua::ask::AskRequest,
     ) -> Result<(), String> {
-        if let Some(question) = question {
-            messages.push(protocol::Message::user(protocol::Content::text(&question)));
-        }
-        let Some((target, catalog)) = self.resolve_ask_target(model_reference.as_deref()) else {
-            return Err("no usable model is available".into());
-        };
-        let reasoning_effort = Self::resolve_ask_reasoning_effort(
-            &catalog,
-            reasoning_effort,
-            protocol::ReasoningEffort::Off,
-            &target.model,
-        )?;
-        let request_config = self.app.core.config.request_runtime_config();
-        let session_id = self.app.conversation.session().id.clone();
-        let persistence = self.app.conversation.persistence_scope();
-        self.app.core.engine.send(protocol::UiCommand::EngineAsk {
-            id,
+        let context = smelt_core::lua::ask::AskContext {
             system,
-            messages,
-            target: Box::new(target),
-            request_config,
-            response_format,
-            reasoning_effort,
-            fast_mode: false,
             tools: Vec::new(),
-            session_id,
-            persistence,
-            stream,
-            visible_retries,
-        });
-        Ok(())
+            reasoning_effort: protocol::ReasoningEffort::Off,
+            fast_mode: false,
+            session_id: self.app.conversation.session().id.clone(),
+            persistence: self.app.conversation.persistence_scope(),
+        };
+        self.dispatch_ask(context, request)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_inherited_engine_ask(
         &mut self,
-        id: u64,
-        mut messages: Vec<protocol::Message>,
-        model_reference: Option<String>,
-        question: Option<String>,
-        response_format: Option<protocol::AskResponseFormat>,
-        reasoning_effort: Option<protocol::ReasoningEffort>,
-        stream: bool,
-        visible_retries: bool,
+        mut request: smelt_core::lua::ask::AskRequest,
     ) -> Result<(), String> {
-        let system = self.app.assemble_system_prompt();
-        if messages.is_empty() {
-            messages = self.app.model_history_messages();
+        if request.messages.is_empty() {
+            request.messages = self.app.model_history_messages();
         }
-        if let Some(question) = question {
-            messages.push(protocol::Message::user(protocol::Content::text(&question)));
-        }
-        let Some((target, catalog)) = self.resolve_ask_target(model_reference.as_deref()) else {
-            return Err("no usable model is available".into());
-        };
-        let reasoning_effort = Self::resolve_ask_reasoning_effort(
-            &catalog,
-            reasoning_effort,
-            self.app.core.config.reasoning_effort.clone(),
-            &target.model,
-        )?;
-        let request_config = self.app.core.config.request_runtime_config();
-        let session_id = self.app.conversation.session().id.clone();
-        let persistence = self.app.conversation.persistence_scope();
-        let tools = self.app.lua.tool_defs(
-            self.app.core.config.mode.clone(),
-            smelt_core::lua::ToolVisibility::Interactive,
-        );
-        self.app.core.engine.send(protocol::UiCommand::EngineAsk {
-            id,
-            system,
-            messages,
-            target: Box::new(target),
-            request_config,
-            response_format,
-            reasoning_effort,
+        let context = smelt_core::lua::ask::AskContext {
+            system: self.app.assemble_system_prompt(),
+            tools: self.app.lua.tool_defs(
+                self.app.core.config.mode.clone(),
+                smelt_core::lua::ToolVisibility::Interactive,
+            ),
+            reasoning_effort: self.app.core.config.reasoning_effort.clone(),
             fast_mode: self.app.fast_mode(),
-            tools,
-            session_id,
-            persistence,
-            stream,
-            visible_retries,
-        });
+            session_id: self.app.conversation.session().id.clone(),
+            persistence: self.app.conversation.persistence_scope(),
+        };
+        self.dispatch_ask(context, request)
+    }
+
+    fn dispatch_ask(
+        &mut self,
+        context: smelt_core::lua::ask::AskContext,
+        request: smelt_core::lua::ask::AskRequest,
+    ) -> Result<(), String> {
+        let (target, catalog) = self
+            .resolve_ask_target(request.model.as_deref())
+            .ok_or("no usable model is available")?;
+        let command = smelt_core::lua::ask::prepare_request(
+            &self.app.core.config,
+            context,
+            request,
+            target,
+            &catalog,
+        )?;
+        self.app.core.engine.send(command);
         Ok(())
     }
 
@@ -864,19 +829,17 @@ impl AgentLuaHost<'_> {
                 .resolve_model_target()
                 .map(|target| (target, catalog));
         };
-        let resolved = match smelt_core::config::resolve_model_ref(
-            &self.app.core.config.available_models,
-            reference,
-        ) {
-            Ok(model) => model.clone(),
-            Err(error) => {
-                self.app.notify_operation_error_sticky(
-                    NotificationOperation::TurnStart,
-                    format!("smelt.engine: {error}"),
-                );
-                return None;
-            }
-        };
+        let resolved =
+            match smelt_core::lua::ask::select_model(&self.app.core.config, Some(reference)) {
+                Ok(model) => model,
+                Err(error) => {
+                    self.app.notify_operation_error_sticky(
+                        NotificationOperation::TurnStart,
+                        format!("smelt.engine: {error}"),
+                    );
+                    return None;
+                }
+            };
         let api_key = self.app.resolve_api_key_for_env(&resolved.api_key_env)?;
         let catalog = resolved.reasoning_catalog();
         Some((resolved.target(api_key), catalog))
@@ -1473,30 +1436,11 @@ impl SessionLuaHost<'_> {
         self.app.workspace.cwd().to_owned()
     }
 
-    pub(crate) fn enter_worktree(
-        &mut self,
-        name: &str,
-        base: Option<&str>,
-    ) -> Result<(smelt_core::worktree::WorktreeInfo, bool), String> {
-        let cwd = self.app.workspace.cwd_path().to_owned();
-        let worktree_root = std::path::PathBuf::from(&self.app.core.config.settings.worktree_root);
-        let info = smelt_core::worktree::enter_or_create(
-            &cwd,
-            smelt_core::worktree::WorktreeSpec {
-                name: Some(name),
-                base,
-                root: Some(&worktree_root),
-            },
-        )?;
-        let (_, pending) = self.app.change_cwd(info.path.clone())?;
-        Ok((info, pending))
-    }
-
-    pub(crate) fn managed_worktrees(
-        &self,
-    ) -> Result<Vec<smelt_core::worktree::ManagedWorktreeInfo>, String> {
-        let root = std::path::Path::new(&self.app.core.config.settings.worktree_root);
-        smelt_core::worktree::list_managed(self.app.workspace.cwd_path(), Some(root))
+    pub(crate) fn worktree_paths(&self) -> (std::path::PathBuf, std::path::PathBuf) {
+        (
+            self.app.workspace.cwd_path().to_owned(),
+            std::path::PathBuf::from(&self.app.core.config.settings.worktree_root),
+        )
     }
 
     pub(crate) fn change_cwd(
@@ -1567,14 +1511,15 @@ impl SessionLuaHost<'_> {
     }
 
     pub(crate) fn session_info(&mut self) -> Result<SessionInfoSnapshot, String> {
-        let turn_count = self.rewind_turns()?.len();
+        let has_live_session = self.app.conversation.has_live_session();
+        let turn_count = self.app.conversation.history_navigation().user_turn_count();
+        let navigation = self.app.conversation.history_navigation();
         let session = self.app.conversation.session();
         let history_count = self.app.session_history_len();
-        let has_live_session = self.app.conversation.has_live_session();
         let message_count = if has_live_session {
             history_count
         } else {
-            protocol::history_to_messages(&session.history).len()
+            navigation.materialized_message_count(history_count)
         };
         Ok(SessionInfoSnapshot {
             id: session.id.clone(),
@@ -1669,6 +1614,13 @@ impl SessionLuaHost<'_> {
 
     pub(crate) fn model_history_messages(&self) -> Vec<protocol::Message> {
         self.app.model_history_messages()
+    }
+
+    pub(crate) fn rewind_page_request(
+        &self,
+        before: Option<usize>,
+    ) -> crate::app::history::RewindPageRequest {
+        self.app.rewind_page_request(before)
     }
 
     pub(crate) fn rewind_turns(&mut self) -> Result<Vec<crate::app::history::RewindTurn>, String> {

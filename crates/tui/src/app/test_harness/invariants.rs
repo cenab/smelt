@@ -405,18 +405,13 @@ impl TestApp {
             );
         }
 
-        // Working-state coherence. The animation only spins inside a turn:
-        // `begin_agent_turn` / harness `start_turn` flip it on alongside
-        // `agent = Some(...)`, and `discard_turn` always calls
-        // `working.finish` before nulling `agent`. The reverse direction
-        // (agent.is_some() => working.is_animating) does NOT hold -
-        // host-driven recovery hooks (e.g. on_context_limit) can pause
-        // the animation while the turn keeps running - so we only assert
-        // one way.
+        // Animation belongs to an active turn or its pending durable submission.
+        // Recovery hooks can pause animation while a turn remains active, so
+        // the reverse implication does not hold.
         if self.app.working.is_animating() {
             assert!(
-                self.app.conversation.is_active(),
-                "working is animating without an active agent turn",
+                self.app.conversation.is_active() || self.app.turn_submission_is_pending(),
+                "working is animating without an active or pending agent turn",
             );
         }
 
@@ -457,7 +452,7 @@ impl TestApp {
         // Ask callbacks live in their own map keyed on the same `next_id`
         // counter as the win/overlay/paint registry - a duplicate id in
         // both means some new registration path forgot which map to write
-        // to, and `fire_ask_callback` could dispatch an unrelated handler
+        // to, and auxiliary dispatch could invoke an unrelated handler
         // with ask-shaped args.
         let shared = self.app.lua.shared();
         if let (Ok(cbs), Ok(ask)) = (shared.callbacks.lock(), shared.ask_callbacks.lock()) {
