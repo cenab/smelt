@@ -179,7 +179,7 @@ This text-chat configuration sends prompts and your API key to `api.tsubasa.sh`
 through the existing Chat Completions transport. It disables tools, reasoning
 parameters and non-text inputs. Instructions, loaded skills and conversation
 history must share the 32,768-token context with the requested output; reduce
-`max_tokens` or loaded context when needed. See the [Tsubasa API documentation](https://tsubasa.sh/docs/api).
+`max_tokens` or loaded context when needed. See the [Tsubasa API documentation](https://tsubasa.sh/docs).
 
 #### Custom reasoning models
 
